@@ -183,4 +183,6 @@ python main.py --dataset regdb --mode test \
 
 ## 📧 联系方式
 
-如有问题或建议，欢迎提交 Issue 或 Pull Request。
+如有问题或建议，欢迎通过以下方式联系：
+- Email: qlu.ykelong@gmail.com
+- GitHub Issues: 欢迎在本仓库提交 Issue 或 Pull Request
