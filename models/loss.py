@@ -51,8 +51,9 @@ class MultiPartIDLoss(nn.Module):
 
 class GraphDistillationLoss(nn.Module):
     """
-    图蒸馏损失 (核心弱监督Loss)
+    [修复版] 图蒸馏损失 (核心弱监督Loss)
     让学生网络的预测分布拟合图传播的软标签
+    使用 Soft Cross Entropy 替代 KLDiv 以避免 NaN
     支持自适应熵加权
     """
     
@@ -81,16 +82,20 @@ class GraphDistillationLoss(nn.Module):
             logits = id_logits_list[k]  # [B, N]
             soft_labels = soft_labels_list[k]  # [B, N]
             
-            # KL散度损失
+            # Log Softmax
             log_probs = F.log_softmax(logits, dim=1)
-            kl_loss = F.kl_div(log_probs, soft_labels, reduction='none').sum(dim=1)  # [B]
+            
+            # [关键修复] 使用软标签交叉熵: -sum(target * log(pred))
+            # 避免 KLDiv 在 target=0 时计算 0*log(0) 导致的 NaN
+            # 注意：soft_labels 应该是 detached 的 (不需要梯度)
+            ce_loss = -torch.sum(soft_labels * log_probs, dim=1)  # [B]
             
             # 应用自适应权重
             if self.use_adaptive_weight and entropy_weights_list is not None:
                 weights = entropy_weights_list[k]  # [B]
-                kl_loss = kl_loss * weights
+                ce_loss = ce_loss * weights
             
-            total_loss += kl_loss.mean()
+            total_loss += ce_loss.mean()
         
         # 平均
         return total_loss / self.num_parts
