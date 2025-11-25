@@ -33,8 +33,8 @@
 
 - **跨模态匹配聚合 (CMA)**: 实现了 Cross Modal Match Aggregation 机制，用于可见光和红外模态之间的特征匹配
 - **两阶段训练策略**: 
-  - Phase 1: 初始训练阶段（Stage 1）
-  - Phase 2: 跨模态协作一致性学习阶段（Stage 2）
+- Phase 1: 初始训练阶段（Stage 1）
+- Phase 2: 跨模态协作一致性学习阶段（Stage 2）
 - **记忆库机制**: 使用动量更新的记忆库存储和更新模态特征
 - **多数据集支持**: 支持 SYSU-MM01、RegDB、LLCM 三个主流数据集
 
