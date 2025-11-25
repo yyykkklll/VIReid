@@ -1,145 +1,257 @@
-import argparse
+"""
+Main Entry Point for PF-MGCD Training and Testing
+"""
+
 import os
-import warnings
+import sys
+import random
+import argparse
+import numpy as np
+import torch
 
-import setproctitle
-
-import datasets
-import models
-from task import train, test
-from utils import time_now, makedir, Logger, set_seed, save_checkpoint
-from wsl import CMA
-
-warnings.filterwarnings("ignore")
+# 添加项目路径
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 
-def main(args):
-    best_rank1 = 0
-    best_mAP = 0
-    log_path = os.path.join(args.save_path, "log/")
-    model_path = os.path.join(args.save_path, "models/")
-    makedir(log_path)
-    makedir(model_path)
-    logger = Logger(os.path.join(log_path, "log.txt"))
-    if not args.resume and args.mode == 'train':
-        logger.clear()
-    logger(args)
-    dataset = datasets.create(args)
-    model = models.create(args)
-
-    if args.mode == "train":
-        cma = CMA(args)
-        if args.resume or not args.model_path == 'default':
-            enable_phase1 = False
-            if 'wsl' in args.debug and not args.model_path == 'default':
-                model.resume_model(args.model_path)
-            else:
-                model.resume_model()
-        elif 'wsl' in args.debug:
-            enable_phase1 = True
-            model.resume_model()
-        else:
-            enable_phase1 = False
-            model.resume_model()
-
-        if enable_phase1:
-            logger('Time: {} | start phase1 from epoch 0'.format(time_now()))
-            for current_epoch in range(0, args.stage1_epoch):
-                model.scheduler_phase1.step(current_epoch)
-                _, result = train(args, model, dataset, current_epoch, cma, logger, enable_phase1)
-                cmc, mAP, mINP = test(args, model, dataset, current_epoch)
-                best_rank1 = max(cmc[0], best_rank1)
-                best_mAP = max(mAP, best_mAP)
-                logger('Time: {} | phase 1 epoch {}; Setting: {}'.format(time_now(), current_epoch + 1, args.save_path))
-                logger(f'e_lr: {model.scheduler_phase1.get_lr()[0]}')
-                logger(result)
-                logger('R1:{:.4f};   R10:{:.4f};  R20:{:.4f};  mAP:{:.4f};  mINP:{:.4f}\n\
-                       Best_R1: {:.4f};    Best mAP: {:.4f}' \
-                       .format(cmc[0], cmc[9], cmc[19], mAP, mINP, best_rank1, best_mAP))
-                logger('=================================================')
-                if current_epoch == args.stage1_epoch - 1:
-                    save_checkpoint(args, model, current_epoch + 1)
-        enable_phase1 = False
-        start_epoch = model.resume_epoch
-        logger('Time: {} | start phase2 from epoch {}'.format(time_now(), start_epoch))
-        for current_epoch in range(start_epoch, args.stage2_epoch):
-            model.scheduler_phase2.step(current_epoch)
-            _, result = train(args, model, dataset, current_epoch, cma, logger, enable_phase1)
-
-            cmc, mAP, mINP = test(args, model, dataset, current_epoch)
-            is_best_rank = (cmc[0] >= best_rank1)
-            is_best_mAP = (mAP >= best_mAP)
-            best_rank1 = max(cmc[0], best_rank1)
-            best_mAP = max(mAP, best_mAP)
-            model.save_model(current_epoch, is_best_rank)
-            logger('=================================================\nEpoch: {};Time: {};Setting: {}' \
-                   .format(current_epoch, time_now(), args.save_path))
-            logger(f'e_lr: {model.scheduler_phase2.get_lr()[0]}')
-            logger(result)
-            logger('R1:{:.4f};   R10:{:.4f};  R20:{:.4f};  mAP:{:.4f};  mINP:{:.4f}\n\
-                   Best_R1: {:.4f};    Best mAP: {:.4f}' \
-                   .format(cmc[0], cmc[9], cmc[19], mAP, mINP, best_rank1, best_mAP))
-            logger('=================================================')
-
-    if args.mode == 'test':
-        if args.model_path == 'default':
-            model.resume_model()
-        else:
-            model.resume_model(args.model_path)
-        cmc, mAP, mINP = test(args, model, dataset)
-        logger('Time: {}; Test on Dataset: {}'.format(time_now(), args.dataset))
-        logger('R1:{:.4f};   R10:{:.4f};  R20:{:.4f};  mAP:{:.4f};  mINP:{:.4f}\n\
-               Best_R1: {:.4f};    Best mAP: {:.4f}' \
-               .format(cmc[0], cmc[9], cmc[19], mAP, mINP, best_rank1, best_mAP))
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser("WSL-ReID")
-    parser.add_argument("--dataset", default="regdb", type=str, help="dataset name: sysu, llcm, regdb")
-    parser.add_argument("--arch", default="resnet", type=str, help="sysu:clip-resnet, llcm:resnet, regdb:resnet")
-    parser.add_argument('--mode', default='train', help='train or test')
-
-    parser.add_argument("--data-path", default="./datasets/", type=str, help="dataset path")
-    parser.add_argument("--save-path", default="save/", type=str, help="log and model save path")
-
-    parser.add_argument('--lr', default=0.0003, type=float,
-                        help='learning rate 0.0003 for sysu(s) and llcm(l), 0.00045 for regdb(r)')
-    parser.add_argument('--weight-decay', default=0.0005, type=float, help='weight deacy')
-    parser.add_argument('--milestones', nargs='+', type=int, default=[30, 70],
-                        help='milestones for the learning rate decay, s&l:30, 70, r:50, 70')
-    parser.add_argument('--relabel', default=1, type=int, help='relabel train dataset')
-
-    parser.add_argument('--weak-weight', default=0.25, type=float, help='weight of weak loss')
-    parser.add_argument('--tri-weight', default=0.25, type=float, help='weight of triplet loss')
-    parser.add_argument('--img-h', default=288, type=int, help='height of the input image')
-    parser.add_argument('--img-w', default=144, type=int, help='width of the input image')
-    parser.add_argument("--seed", default=1, type=int, help="random seed")
-    parser.add_argument('--num-workers', default=8, type=int, help='num workers')
-    parser.add_argument('--batch-pidnum', default=8, type=int, help='training pid in each batch, r:5')
-    parser.add_argument('--pid-numsample', default=4, type=int, help='num sample of each pid in a batch')
-    parser.add_argument('--test-batch', default=128, type=int, metavar='tb', help='testing batch size')
-
-    parser.add_argument('--sigma', default=0.8, type=float, help='momentum update factor')
-    parser.add_argument('-T', '--temperature', default=3, type=float, help='Temperature parameter of softmax')
-    parser.add_argument("--device", default=0, type=int, help="gpu")
-    parser.add_argument('--stage1-epoch', default=20, type=int, help='s:20, l:80, r:50')
-    parser.add_argument('--stage2-epoch', default=120, type=int, help='CMCL total epoch')
-    parser.add_argument('--resume', default=0, type=int, help='resume or not')
-    parser.add_argument('--debug', default='wsl', type=str, help='wsl or sl')
-    parser.add_argument('--trial', default=1, type=int, help='trial for regdb')
-    parser.add_argument('--search-mode', default='all', type=str, help='all or indoor search gallery')
-    parser.add_argument('--gall-mode', default='single', type=str, help='mutil or single shot')
-    parser.add_argument('--test-mode', default='t2v', type=str, help='regdb and llcm test_mode')
-    parser.add_argument('--model-path', default='default', type=str, help='load from checkpoint')
+def parse_args():
+    """解析命令行参数"""
+    parser = argparse.ArgumentParser(description='PF-MGCD for VI-ReID')
+    
+    # ===== 基础设置 =====
+    parser.add_argument('--dataset', type=str, default='sysu',
+                        choices=['sysu', 'regdb', 'llcm'],
+                        help='数据集选择')
+    parser.add_argument('--data-path', type=str, default='./datasets',
+                        help='数据集根路径')
+    parser.add_argument('--mode', type=str, default='train',
+                        choices=['train', 'test'],
+                        help='运行模式')
+    parser.add_argument('--resume', type=str, default='',
+                        help='恢复训练的检查点路径')
+    parser.add_argument('--gpu', type=str, default='0',
+                        help='使用的GPU编号')
+    parser.add_argument('--seed', type=int, default=42,
+                        help='随机种子')
+    
+    # ===== PF-MGCD模型参数 =====
+    parser.add_argument('--num-parts', type=int, default=6,
+                        help='部件数量 K')
+    parser.add_argument('--feature-dim', type=int, default=256,
+                        help='解耦后的特征维度')
+    parser.add_argument('--memory-momentum', type=float, default=0.9,
+                        help='记忆库动量系数')
+    parser.add_argument('--temperature', type=float, default=3.0,
+                        help='Softmax温度参数')
+    parser.add_argument('--top-k', type=int, default=5,
+                        help='图传播的Top-K邻居数量')
+    parser.add_argument('--pretrained', action='store_true',
+                        help='使用预训练的ResNet50')
+    
+    # ===== 原有数据集参数 (兼容原代码) =====
+    parser.add_argument('--num-classes', type=int, default=395,
+                        help='类别数量')
+    parser.add_argument('--num-workers', type=int, default=4,
+                        help='数据加载worker数')
+    parser.add_argument('--pid-numsample', type=int, default=4,
+                        help='每个ID的样本数')
+    parser.add_argument('--batch-pidnum', type=int, default=8,
+                        help='每batch的ID数')
+    parser.add_argument('--test-batch', type=int, default=64,
+                        help='测试batch大小')
+    parser.add_argument('--img-w', type=int, default=144,
+                        help='图像宽度')
+    parser.add_argument('--img-h', type=int, default=288,
+                        help='图像高度')
+    parser.add_argument('--relabel', action='store_true', default=True,
+                        help='是否重新标注')
+    parser.add_argument('--search-mode', type=str, default='all',
+                        choices=['all', 'indoor'],
+                        help='搜索模式')
+    parser.add_argument('--gall-mode', type=str, default='single',
+                        choices=['single', 'multi'],
+                        help='检索模式')
+    parser.add_argument('--test-mode', type=str, default='v2t',
+                        choices=['v2t', 't2v'],
+                        help='测试模式(LLCM)')
+    parser.add_argument('--trial', type=int, default=1,
+                        help='RegDB trial编号')
+    
+    # ===== 损失函数权重 =====
+    parser.add_argument('--lambda-graph', type=float, default=1.0,
+                        help='图蒸馏损失权重')
+    parser.add_argument('--lambda-orth', type=float, default=0.1,
+                        help='正交损失权重')
+    parser.add_argument('--lambda-mod', type=float, default=0.5,
+                        help='模态损失权重')
+    parser.add_argument('--label-smoothing', type=float, default=0.1,
+                        help='标签平滑系数')
+    
+    # ===== 训练参数 =====
+    parser.add_argument('--total-epoch', type=int, default=120,
+                        help='总训练轮数')
+    parser.add_argument('--warmup-epochs', type=int, default=10,
+                        help='Warmup轮数')
+    parser.add_argument('--batch-size', type=int, default=32,
+                        help='批次大小')
+    parser.add_argument('--lr', type=float, default=0.0003,
+                        help='学习率')
+    parser.add_argument('--weight-decay', type=float, default=5e-4,
+                        help='权重衰减')
+    parser.add_argument('--grad-clip', type=float, default=5.0,
+                        help='梯度裁剪阈值')
+    
+    # ===== 学习率调度 =====
+    parser.add_argument('--lr-scheduler', type=str, default='step',
+                        choices=['step', 'cosine', 'plateau'],
+                        help='学习率调度器')
+    parser.add_argument('--lr-step', type=int, default=40,
+                        help='StepLR的步长')
+    parser.add_argument('--lr-gamma', type=float, default=0.1,
+                        help='StepLR的衰减系数')
+    
+    # ===== 记忆库初始化 =====
+    parser.add_argument('--init-memory', action='store_true',
+                        help='训练前初始化记忆库')
+    
+    # ===== 保存和日志 =====
+    parser.add_argument('--save-dir', type=str, default='./checkpoints',
+                        help='模型保存目录')
+    parser.add_argument('--log-dir', type=str, default='./logs',
+                        help='日志保存目录')
+    parser.add_argument('--save-epoch', type=int, default=10,
+                        help='每隔多少epoch保存模型')
+    parser.add_argument('--eval-epoch', type=int, default=10,
+                        help='每隔多少epoch评估模型')
+    
+    # ===== 测试参数 =====
+    parser.add_argument('--test-batch-size', type=int, default=64,
+                        help='测试批次大小')
+    parser.add_argument('--model-path', type=str, default='',
+                        help='测试模型路径')
+    parser.add_argument('--pool-parts', action='store_true',
+                        help='测试时是否合并部件特征')
+    parser.add_argument('--distance-metric', type=str, default='euclidean',
+                        choices=['euclidean', 'cosine'],
+                        help='距离度量方式')
+    
     args = parser.parse_args()
-    args.save_path = '../saved_' + args.dataset + '_{}'.format(args.arch) + '/' + args.save_path
+    
+    # 根据数据集设置num_classes
     if args.dataset == 'sysu':
         args.num_classes = 395
     elif args.dataset == 'regdb':
         args.num_classes = 206
-        args.save_path += f'_{args.trial}'
     elif args.dataset == 'llcm':
         args.num_classes = 713
+    
+    return args
+
+
+def main():
+    """主函数"""
+    # 解析参数
+    args = parse_args()
+    
+    # 设置GPU
+    os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # 设置随机种子
     set_seed(args.seed)
-    setproctitle.setproctitle(args.save_path)
-    main(args)
+    
+    # 创建保存目录
+    os.makedirs(args.save_dir, exist_ok=True)
+    os.makedirs(args.log_dir, exist_ok=True)
+    
+    # 打印配置
+    print("="*70)
+    print(" "*20 + "PF-MGCD Configuration")
+    print("="*70)
+    print(f"{'Dataset':<20}: {args.dataset}")
+    print(f"{'Mode':<20}: {args.mode}")
+    print(f"{'Device':<20}: {device}")
+    print(f"{'Num Parts':<20}: {args.num_parts}")
+    print(f"{'Feature Dim':<20}: {args.feature_dim}")
+    print(f"{'Total Epochs':<20}: {args.total_epoch}")
+    print(f"{'Warmup Epochs':<20}: {args.warmup_epochs}")
+    print(f"{'Learning Rate':<20}: {args.lr}")
+    print(f"{'Lambda Graph':<20}: {args.lambda_graph}")
+    print(f"{'Lambda Orth':<20}: {args.lambda_orth}")
+    print(f"{'Lambda Mod':<20}: {args.lambda_mod}")
+    print("="*70 + "\n")
+    
+    # 创建模型
+    print("Creating PF-MGCD model...")
+    from models.pfmgcd_model import PF_MGCD
+    
+    model = PF_MGCD(
+        num_parts=args.num_parts,
+        num_identities=args.num_classes,
+        feature_dim=args.feature_dim,
+        memory_momentum=args.memory_momentum,
+        temperature=args.temperature,
+        top_k=args.top_k,
+        pretrained=args.pretrained
+    ).to(device)
+    
+    print(f"Model created successfully!")
+    print(f"Total parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M\n")
+    
+    # 训练模式
+    if args.mode == 'train':
+        # 获取数据加载器
+        from datasets.dataloader_adapter import get_dataloader
+        train_loader, val_loader = get_dataloader(args)
+        
+        # 创建优化器
+        optimizer = torch.optim.Adam(
+            model.parameters(),
+            lr=args.lr,
+            weight_decay=args.weight_decay
+        )
+        
+        # 创建学习率调度器
+        if args.lr_scheduler == 'step':
+            scheduler = torch.optim.lr_scheduler.StepLR(
+                optimizer, 
+                step_size=args.lr_step, 
+                gamma=args.lr_gamma
+            )
+        elif args.lr_scheduler == 'cosine':
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=args.total_epoch
+            )
+        else:
+            scheduler = None
+        
+        # 开始训练
+        from task.train import train
+        train(model, train_loader, val_loader, optimizer, scheduler, args, device)
+    
+    # 测试模式
+    elif args.mode == 'test':
+        if args.model_path:
+            print(f"Loading model from: {args.model_path}")
+            checkpoint = torch.load(args.model_path)
+            model.load_state_dict(checkpoint['model_state_dict'])
+            print("Model loaded successfully!\n")
+        
+        from datasets.dataloader_adapter import get_dataloader
+        _, test_loader = get_dataloader(args)
+        
+        from task.test import test
+        test(model, test_loader, args, device)
+
+
+if __name__ == '__main__':
+    main()

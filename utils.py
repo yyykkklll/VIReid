@@ -1,125 +1,257 @@
+"""
+Utility Functions for PF-MGCD
+工具函数集合
+"""
+
 import os
-import sys
 import random
-# from typing import Any
 import numpy as np
 import torch
-import time
+import torch.nn as nn
 
-def save_checkpoint(args, model, epoch):
-    if args.dataset == 'regdb':
-        path = '../saved_pretrain_{}_{}_{}_{}/'.format(args.dataset,args.arch,args.trial,args.save_path)
-    else:
-        path = '../saved_pretrain_{}_{}/'.format(args.dataset,args.arch)
-    makedir(path)
-    all_state_dict = {'backbone': model.model.state_dict(),
-                    'classifier1': model.classifier1.state_dict(), 
-                    'classifier2': model.classifier2.state_dict(),
-                    'classifier3': model.classifier3.state_dict()}
-    torch.save(all_state_dict,path+'model_{}.pth'.format(epoch))
 
-def makedir(path):
-    if not os.path.exists(path):
-        os.makedirs(path)
-        print('make dir {} successful!'.format(path))
-
-def time_now():
-    return time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
-
-def set_seed(seed):
-    seed = int(seed)
+def set_seed(seed=42):
+    """
+    设置随机种子以确保可复现性
+    Args:
+        seed: 随机种子
+    """
     random.seed(seed)
-    os.environ['PYTHONASHSEED'] = str(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    # defualt deterministic = True, benchmark = False
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-def os_walk(folder_dir):
-    for root, dirs, files in os.walk(folder_dir):
-        files = sorted(files, reverse=True)
-        dirs = sorted(dirs, reverse=True)
-        return root, dirs, files
 
-def fliplr(img):
-    '''flip horizontal'''
-    inv_idx = torch.arange(img.size(3)-1,-1,-1).long()  # N x C x H x W
-    img_flip = img.index_select(3,inv_idx)
-    return img_flip
+def create_logger(log_dir, log_name='train.log'):
+    """
+    创建日志记录器
+    Args:
+        log_dir: 日志目录
+        log_name: 日志文件名
+    Returns:
+        logger: 日志记录器
+    """
+    import logging
+    
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, log_name)
+    
+    # 创建logger
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    
+    # 创建文件handler
+    fh = logging.FileHandler(log_path, mode='a')
+    fh.setLevel(logging.INFO)
+    
+    # 创建控制台handler
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    
+    # 定义格式
+    formatter = logging.Formatter(
+        '[%(asctime)s] - %(levelname)s: %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    fh.setFormatter(formatter)
+    ch.setFormatter(formatter)
+    
+    # 添加handler
+    logger.addHandler(fh)
+    logger.addHandler(ch)
+    
+    return logger
 
-@torch.no_grad()
-def infoEntropy(input):
-    input = torch.nn.functional.softmax(input,dim=1)
-    output = -torch.mean(input*torch.log2(input))
-    return output
 
-class Logger:
-    def __init__(self, log_file):
-        self.log_file = log_file
-
-    def __call__(self, input):
-        input = str(input)
-        with open(self.log_file, 'a') as f:
-            f.writelines(input+'\n')
-        print(input)
-
-    def clear(self):
-        with open(self.log_file, 'w') as f:
-            pass
+def save_checkpoint(state, save_dir, filename='checkpoint.pth'):
+    """
+    保存检查点
+    Args:
+        state: 状态字典
+        save_dir: 保存目录
+        filename: 文件名
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    filepath = os.path.join(save_dir, filename)
+    torch.save(state, filepath)
+    print(f"Checkpoint saved to {filepath}")
 
 
-class MultiItemAverageMeter:
+def load_checkpoint(filepath, model, optimizer=None, scheduler=None):
+    """
+    加载检查点
+    Args:
+        filepath: 检查点路径
+        model: 模型
+        optimizer: 优化器（可选）
+        scheduler: 学习率调度器（可选）
+    Returns:
+        start_epoch: 起始epoch
+    """
+    if not os.path.exists(filepath):
+        raise FileNotFoundError(f"Checkpoint not found: {filepath}")
+    
+    checkpoint = torch.load(filepath)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    
+    start_epoch = checkpoint.get('epoch', 0) + 1
+    
+    if optimizer is not None and 'optimizer_state_dict' in checkpoint:
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    
+    if scheduler is not None and 'scheduler_state_dict' in checkpoint:
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+    
+    print(f"Checkpoint loaded from {filepath}")
+    print(f"Resuming from epoch {start_epoch}")
+    
+    return start_epoch
+
+
+def count_parameters(model):
+    """
+    计算模型参数量
+    Args:
+        model: 模型
+    Returns:
+        total: 总参数量
+        trainable: 可训练参数量
+    """
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return total, trainable
+
+
+def get_lr(optimizer):
+    """
+    获取当前学习率
+    Args:
+        optimizer: 优化器
+    Returns:
+        lr: 学习率
+    """
+    for param_group in optimizer.param_groups:
+        return param_group['lr']
+
+
+class AverageMeter:
+    """
+    计算并存储平均值和当前值
+    """
     def __init__(self):
-        self.content = {}
+        self.reset()
+    
+    def reset(self):
+        self.val = 0
+        self.avg = 0
+        self.sum = 0
+        self.count = 0
+    
+    def update(self, val, n=1):
+        self.val = val
+        self.sum += val * n
+        self.count += n
+        self.avg = self.sum / self.count
 
-    def update(self, val):
-        for key in list(val.keys()):
-            value = val[key]
-            if key not in list(self.content.keys()):
-                self.content[key] = {'avg': value, 'sum': value, 'count': 1.0}
-            else:
-                self.content[key]['sum'] += value
-                self.content[key]['count'] += 1.0
-                self.content[key]['avg'] = self.content[key]['sum'] / self.content[key]['count']
 
-    def get_val(self):
-        keys = list(self.content.keys())
-        values = []
+class WarmupScheduler:
+    """
+    Warmup学习率调度器
+    """
+    def __init__(self, optimizer, warmup_epochs, base_lr, after_scheduler=None):
+        """
+        Args:
+            optimizer: 优化器
+            warmup_epochs: warmup的epoch数
+            base_lr: 基础学习率
+            after_scheduler: warmup后使用的调度器
+        """
+        self.optimizer = optimizer
+        self.warmup_epochs = warmup_epochs
+        self.base_lr = base_lr
+        self.after_scheduler = after_scheduler
+        self.current_epoch = 0
+    
+    def step(self):
+        """
+        更新学习率
+        """
+        if self.current_epoch < self.warmup_epochs:
+            # Warmup阶段: 线性增长
+            lr = self.base_lr * (self.current_epoch + 1) / self.warmup_epochs
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] = lr
+        else:
+            # Warmup后使用after_scheduler
+            if self.after_scheduler is not None:
+                self.after_scheduler.step()
+        
+        self.current_epoch += 1
+
+
+def visualize_parts(images, num_parts=6):
+    """
+    可视化部件切分
+    Args:
+        images: 图像张量 [B, 3, H, W]
+        num_parts: 部件数量
+    Returns:
+        visualization: 可视化结果
+    """
+    import matplotlib.pyplot as plt
+    
+    B, C, H, W = images.shape
+    part_height = H // num_parts
+    
+    fig, axes = plt.subplots(1, num_parts + 1, figsize=(15, 3))
+    
+    # 显示原图
+    img = images[0].permute(1, 2, 0).cpu().numpy()
+    img = (img - img.min()) / (img.max() - img.min())
+    axes[0].imshow(img)
+    axes[0].set_title('Original')
+    axes[0].axis('off')
+    
+    # 显示各个部件
+    for i in range(num_parts):
+        start = i * part_height
+        end = (i + 1) * part_height
+        part = images[0, :, start:end, :].permute(1, 2, 0).cpu().numpy()
+        part = (part - part.min()) / (part.max() - part.min())
+        axes[i + 1].imshow(part)
+        axes[i + 1].set_title(f'Part {i+1}')
+        axes[i + 1].axis('off')
+    
+    plt.tight_layout()
+    return fig
+
+
+def print_config(args):
+    """
+    打印配置信息
+    Args:
+        args: 参数配置
+    """
+    print("="*70)
+    print(" "*25 + "Configuration")
+    print("="*70)
+    
+    # 按类别组织参数
+    categories = {
+        'Basic': ['dataset', 'mode', 'gpu', 'seed'],
+        'Model': ['num_parts', 'feature_dim', 'memory_momentum', 'temperature', 'top_k'],
+        'Loss': ['lambda_graph', 'lambda_orth', 'lambda_mod', 'label_smoothing'],
+        'Training': ['total_epoch', 'warmup_epochs', 'batch_size', 'lr', 'weight_decay'],
+        'Paths': ['data_path', 'save_dir', 'log_dir']
+    }
+    
+    for category, keys in categories.items():
+        print(f"\n{category}:")
         for key in keys:
-            try:
-                values.append(self.content[key]['avg'].data.cpu().numpy())
-            except:
-                values.append(self.content[key]['avg'])
-        return keys, values
-
-    def get_str(self):
-        result = ''
-        keys, values = self.get_val()
-
-        for i,(key, value) in enumerate(zip(keys, values)):
-            result += key
-            result += ': '
-            result += str(value)
-            result += ';  '
-            if i%2:
-                result += '\n'
-
-        return result
-
-def pha_unwrapping(x):
-    fft_x = torch.fft.fft2(x.clone(), dim=(-2, -1))
-    fft_x = torch.stack((fft_x.real, fft_x.imag), dim=-1)
-    pha_x = torch.atan2(fft_x[:, :, :, :, 1], fft_x[:, :, :, :, 0])
-
-    fft_clone = torch.zeros(fft_x.size(), dtype=torch.float).cuda()
-    fft_clone[:, :, :, :, 0] = torch.cos(pha_x.clone())
-    fft_clone[:, :, :, :, 1] = torch.sin(pha_x.clone())
-
-    # get the recomposed image: source content, target style
-    pha_unwrap = torch.fft.ifft2(torch.complex(fft_clone[:, :, :, :, 0], fft_clone[:, :, :, :, 1]),
-                                 dim=(-2, -1)).float()
-
-    return pha_unwrap.to(x.device)
+            if hasattr(args, key):
+                value = getattr(args, key)
+                print(f"  {key:20s}: {value}")
+    
+    print("="*70 + "\n")

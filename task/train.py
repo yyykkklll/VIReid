@@ -1,291 +1,235 @@
+"""
+Training Pipeline for PF-MGCD
+实现PF-MGCD的完整训练流程
+"""
+
+import os
+import time
 import torch
-from alive_progress import alive_bar 
-from models import Model
-from utils import MultiItemAverageMeter, infoEntropy
-from wsl import CMA
+import torch.nn as nn
+from tqdm import tqdm
+
+# 导入模型和损失
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from models.pfmgcd_model import PF_MGCD
+from models.loss import TotalLoss
 
 
-def train(args, model: Model, dataset, *arg):
-    epoch = arg[0]
-    cma: CMA = arg[1]
-    logger = arg[2]
-    enable_phase1 = arg[3]
-
-    if 'wsl' in args.debug or not enable_phase1:
-        cma.extract(args, model, dataset)
-        rgb_labeling_dict, ir_labeling_dict = \
-            dataset.train_rgb.relabel_dict, dataset.train_ir.relabel_dict
-        r2i_pair_dict, i2r_pair_dict = cma.get_label(epoch)
-        common_dict, specific_dict, remain_dict = {}, {}, {}
-        i2r_specific_dict, r2i_specific_dict, r2i_remain_dict, i2r_remain_dict = {}, {}, {}, {}
-        for r, i in r2i_pair_dict.items():
-            if i in i2r_pair_dict.keys() and i2r_pair_dict[i] == r:
-                common_dict[r] = i
-            elif r not in i2r_pair_dict.values() and i not in i2r_pair_dict.keys():
-                r2i_specific_dict[r] = i
-                specific_dict[r] = i
-            else:
-                r2i_remain_dict[r] = i
-                remain_dict[r] = i
-        for i, r in i2r_pair_dict.items():
-            if (r, i) in common_dict.items():
-                continue
-            elif r not in r2i_pair_dict.values() and i not in r2i_pair_dict.keys():
-                i2r_specific_dict[i] = r
-                specific_dict[r] = i
-            else:
-                i2r_remain_dict[i] = r
-                remain_dict[r] = i
-
-        all_rm = torch.zeros((args.num_classes, args.num_classes)).to(model.device)  # all corresponding pairs
-        common_rm = all_rm.clone()  # common corresponding pairs
-        specific_rm = all_rm.clone()  # specific corresponding pairs
-        remain_rm = all_rm.clone()  # remain corresponding pairs
-        r2i_rm = all_rm.clone()  # r2i corresponding pairs
-        i2r_rm = all_rm.clone()  # i2r corresponding pairs
-        for r, i in common_dict.items():
-            common_rm[r, i] += 1
-        for r, i in specific_dict.items():
-            specific_rm[r, i] += 1
-        for r, i in r2i_pair_dict.items():
-            r2i_rm[r, i] += 1
-        for i, r in i2r_pair_dict.items():
-            i2r_rm[i, r] += 1
-        for r, i in remain_dict.items():
-            remain_rm[r, i] += 1
-
-        specific_rm = specific_rm + common_rm
-        matched_rgb, matched_ir = list(r2i_pair_dict.keys()), list(i2r_pair_dict.keys())
-        common_matched_rgb, common_matched_ir = list(common_dict.keys()), list(common_dict.values())
-        specific_matched_rgb, specific_matched_ir = list(specific_dict.keys()), list(specific_dict.values())
-        remain_matched_rgb, remain_matched_ir = list(remain_dict.keys()), list(remain_dict.values())
-        all_matched_rgb = list(set(common_matched_rgb + specific_matched_rgb + remain_matched_rgb))
-        all_matched_ir = list(set(common_matched_ir + specific_matched_ir + remain_matched_ir))
-        matched_rgb = torch.tensor(matched_rgb).to(model.device)
-        matched_ir = torch.tensor(matched_ir).to(model.device)
-        common_matched_rgb = torch.tensor(common_matched_rgb).to(model.device)
-        common_matched_ir = torch.tensor(common_matched_ir).to(model.device)
-        specific_matched_rgb = torch.tensor(specific_matched_rgb).to(model.device)
-        specific_matched_ir = torch.tensor(specific_matched_ir).to(model.device)
-
-        remain_matched_rgb = torch.tensor(remain_matched_rgb).to(model.device)
-        remain_matched_ir = torch.tensor(remain_matched_ir).to(model.device)
-        all_matched_rgb = torch.tensor(all_matched_rgb).to(model.device)
-        all_matched_ir = torch.tensor(all_matched_ir).to(model.device)
-
-        if not model.enable_cls3:
-            model.enable_cls3 = True
-    # ======================================================
-    model.set_train()
-    meter = MultiItemAverageMeter()
-    bt = args.batch_pidnum * args.pid_numsample
-    rgb_loader, ir_loader = dataset.get_train_loader()
-
-    nan_batch_counter = 0
+def train_one_epoch(model, dataloader, criterion, optimizer, epoch, args, device):
+    """
+    训练一个epoch
+    Args:
+        model: PF_MGCD模型
+        dataloader: 训练数据加载器
+        criterion: 损失函数 (TotalLoss)
+        optimizer: 优化器
+        epoch: 当前epoch
+        args: 参数配置
+        device: 设备
+    Returns:
+        avg_loss_dict: 平均损失字典
+    """
+    model.train()
     
-    # ======================================================
-    # Modified for alive_progress (Pumpkin Theme)
-    # ======================================================
-    loader_zip = zip(rgb_loader, ir_loader)
-    # force_tty=True ensures it shows up even in some IDE terminals that buffer output
-    with alive_bar(len(rgb_loader), bar='halloween', spinner='dots', force_tty=True, title=f"Train Epoch {epoch}") as bar:
-        for (rgb_imgs, ca_imgs, color_info), (ir_imgs, aug_imgs, ir_info) in loader_zip:
-            if enable_phase1:
-                model.optimizer_phase1.zero_grad()
-            else:
-                model.optimizer_phase2.zero_grad()
-            rgb_imgs, ca_imgs = rgb_imgs.to(model.device), ca_imgs.to(model.device)
-
-            color_imgs = torch.cat((rgb_imgs, ca_imgs), dim=0)
-            rgb_gts, ir_gts = color_info[:, -1], ir_info[:, -1]
-            rgb_ids, ir_ids = color_info[:, 1], ir_info[:, 1]
-            rgb_ids = torch.cat((rgb_ids, rgb_ids)).to(model.device)
-            if args.dataset == 'regdb':
-                ir_imgs, aug_imgs = ir_imgs.to(model.device), aug_imgs.to(model.device)
-                ir_imgs = torch.cat((ir_imgs, aug_imgs), dim=0)
-                ir_ids = torch.cat((ir_ids, ir_ids)).to(model.device)
-            else:
-                ir_imgs = ir_imgs.to(model.device)
-                ir_ids = ir_ids.to(model.device)
-            gap_features, bn_features = model.model(color_imgs, ir_imgs)
-            rgbcls_out, _l2_features = model.classifier1(bn_features)
-            ircls_out, _l2_features = model.classifier2(bn_features)
-
-            rgb_features, ir_features = gap_features[:2 * bt], gap_features[2 * bt:]
-            r2r_cls, i2i_cls, r2i_cls, i2r_cls = \
-                rgbcls_out[:2 * bt], ircls_out[2 * bt:], ircls_out[:2 * bt], rgbcls_out[2 * bt:]
-            if 'wsl' in args.debug:
-                if enable_phase1:
-                    r2r_id_loss = model.pid_criterion(r2r_cls, rgb_ids)
-                    i2i_id_loss = model.pid_criterion(i2i_cls, ir_ids)
-                    r2r_tri_loss = args.tri_weight * model.tri_criterion(rgb_features, rgb_ids)
-                    i2i_tri_loss = args.tri_weight * model.tri_criterion(ir_features, ir_ids)
-                    total_loss = r2r_id_loss + i2i_id_loss + r2r_tri_loss + i2i_tri_loss
-                    meter.update({'r2r_id_loss': r2r_id_loss.data,
-                                  'i2i_id_loss': i2i_id_loss.data,
-                                  'r2r_tri_loss': r2r_tri_loss.data,
-                                  'i2i_tri_loss': i2i_tri_loss.data})
-                else:
-                    r2c_cls = model.classifier3(bn_features)[0][:2 * bt]
-                    i2c_cls = model.classifier3(bn_features)[0][2 * bt:]
-                    dtd_features = bn_features.detach()
-                    dtd_rgbcls_out = model.classifier1(dtd_features)[0]
-                    dtd_ircls_out = model.classifier2(dtd_features)[0]
-                    dtd_r2r_cls, dtd_i2r_cls = dtd_rgbcls_out[:2 * bt], dtd_rgbcls_out[2 * bt:]
-                    dtd_r2i_cls, dtd_i2i_cls = dtd_ircls_out[:2 * bt], dtd_ircls_out[2 * bt:]
-                    r2r_id_loss = model.pid_criterion(dtd_r2r_cls, rgb_ids)
-                    i2i_id_loss = model.pid_criterion(dtd_i2i_cls, ir_ids)
-                    meter.update({'r2r_id_loss': r2r_id_loss.data,
-                                  'i2i_id_loss': i2i_id_loss.data})
-                    total_loss = r2r_id_loss + i2i_id_loss
-                    common_rgb_indices = torch.isin(rgb_ids, common_matched_rgb)
-                    common_ir_indices = torch.isin(ir_ids, common_matched_ir)
-                    ###############################################################
-                    if args.debug == 'wsl':
-                        tri_rgb_indices = torch.isin(rgb_ids, common_matched_rgb)
-                        tri_ir_indices = torch.isin(ir_ids, common_matched_ir)
-                        selected_tri_rgb_ids = rgb_ids[tri_rgb_indices]
-                        selected_tri_ir_ids = ir_ids[tri_ir_indices]
-                        translated_tri_rgb_label = torch.nonzero(common_rm[selected_tri_rgb_ids])[:, -1]
-                        translated_tri_ir_label = torch.nonzero(common_rm.T[selected_tri_ir_ids])[:, -1]
-
-                        selected_tri_rgb_features = rgb_features[tri_rgb_indices]
-                        selected_tri_ir_features = ir_features[tri_ir_indices]
-                        matched_tri_rgb_features = torch.cat((selected_tri_rgb_features, ir_features), dim=0)
-                        matched_tri_ir_features = torch.cat((rgb_features, selected_tri_ir_features), dim=0)
-                        matched_tri_rgb_labels = torch.cat((translated_tri_rgb_label, ir_ids), dim=0)
-                        matched_tri_ir_labels = torch.cat((rgb_ids, translated_tri_ir_label), dim=0)
-                        tri_loss_rgb = args.tri_weight * model.tri_criterion(matched_tri_rgb_features,
-                                                                            matched_tri_rgb_labels)
-                        tri_loss_ir = args.tri_weight * model.tri_criterion(matched_tri_ir_features, matched_tri_ir_labels)
-                        meter.update({'tri_loss_rgb': tri_loss_rgb.data,
-                                      'tri_loss_ir': tri_loss_ir.data})
-                        total_loss += tri_loss_rgb + tri_loss_ir
-
-                        selected_common_rgb_ids = rgb_ids[common_rgb_indices]
-                        selected_common_ir_ids = ir_ids[common_ir_indices]
-                        translated_cmo_rgb_label = torch.nonzero(common_rm[selected_common_rgb_ids])[:, -1]
-                        translated_cmo_ir_label = torch.nonzero(common_rm.T[selected_common_ir_ids])[:, -1]
-                        cma.update(bn_features[:2 * bt], bn_features[2 * bt:], rgb_ids, ir_ids)
-                        r2i_entropy = infoEntropy(r2i_cls)
-                        i2r_entropy = infoEntropy(i2r_cls)
-                        w_r2i = r2i_entropy / (r2i_entropy + i2r_entropy)
-                        w_i2r = i2r_entropy / (r2i_entropy + i2r_entropy)
-                        selected_rgb_memory = cma.vis_memory[translated_cmo_ir_label].detach()
-                        selected_ir_memory = cma.ir_memory[translated_cmo_rgb_label].detach()
-                        mem_r2i_cls, _ = model.classifier2(selected_rgb_memory)
-                        mem_i2r_cls, _ = model.classifier1(selected_ir_memory)
-                        cmo_criterion = torch.nn.MSELoss()
-
-                        if (selected_tri_ir_ids.shape[0] != 0):
-                            r2i_cmo_loss = w_r2i * cmo_criterion(dtd_i2i_cls[common_ir_indices], mem_r2i_cls)
-                            if torch.isnan(r2i_cmo_loss).any():
-                                nan_batch_counter += 1
-                            else:
-                                meter.update({'r2i_cmo_loss': r2i_cmo_loss.data})
-                                total_loss += r2i_cmo_loss
-                        if (selected_tri_rgb_ids.shape[0] != 0):
-                            i2r_cmo_loss = w_i2r * cmo_criterion(dtd_r2r_cls[common_rgb_indices], mem_i2r_cls)
-                            if torch.isnan(i2r_cmo_loss).any():
-                                nan_batch_counter += 1
-                            else:
-                                meter.update({'i2r_cmo_loss': i2r_cmo_loss.data})
-                                total_loss += i2r_cmo_loss
-
-                    if epoch >= 30:
-                        remain_rgb_indices = torch.isin(rgb_ids, remain_matched_rgb)
-                        remain_ir_indices = torch.isin(ir_ids, remain_matched_ir)
-                        remain_rgb_ids = rgb_ids[remain_rgb_indices]
-                        remain_ir_ids = ir_ids[remain_ir_indices]
-                        remain_r2c_cls = r2c_cls[remain_rgb_indices]
-                        remain_i2c_cls = i2c_cls[remain_ir_indices]
-                        if (remain_rgb_indices.shape[0] > 0):
-                            weak_r2c_loss = args.weak_weight * model.weak_criterion(remain_r2c_cls,
-                                                                                    remain_rm[remain_rgb_ids])
-                            if torch.isnan(weak_r2c_loss).any():
-                                nan_batch_counter += 1
-                            else:
-                                meter.update({'weak_r2c_loss': weak_r2c_loss.data})
-                                total_loss += weak_r2c_loss
-            if enable_phase1:
-                total_loss.backward()
-                model.optimizer_phase1.step()
-            else:
-                if args.debug == 'wsl':  # //use modal specific pseudo labels
-                    specific_rgb_indices = torch.isin(rgb_ids, specific_matched_rgb)
-                    specific_ir_indices = torch.isin(ir_ids, specific_matched_ir)
-                    rgb_indices = specific_rgb_indices ^ common_rgb_indices
-                    ir_indices = specific_ir_indices ^ common_ir_indices
-
-                    selected_ir_ids = ir_ids[ir_indices]
-                    selected_rgb_ids = rgb_ids[rgb_indices]
-                    selected_i2c_cls = i2c_cls[ir_indices]
-                    selected_r2c_cls = r2c_cls[rgb_indices]
-
-                    if (selected_rgb_ids.shape[0] > 0):
-                        rgb_cross_loss = model.pid_criterion(selected_r2c_cls, specific_rm[selected_rgb_ids])
-                        if torch.isnan(rgb_cross_loss).any():
-                            nan_batch_counter += 1
-                        else:
-                            meter.update({'rgb_cross_loss': rgb_cross_loss.data})
-                            total_loss += rgb_cross_loss
-                    ir_cross_loss = model.pid_criterion(i2c_cls, ir_ids)
-                    meter.update({'ir_cross_loss': ir_cross_loss.data})
-                    total_loss += ir_cross_loss
-
-                elif args.debug == 'baseline':
-                    r2r_id_loss = model.pid_criterion(r2r_cls, rgb_ids)
-                    i2i_id_loss = model.pid_criterion(i2i_cls, ir_ids)
-                    r2r_tri_loss = args.tri_weight * model.tri_criterion(rgb_features, rgb_ids)
-                    i2i_tri_loss = args.tri_weight * model.tri_criterion(ir_features, ir_ids)
-                    total_loss = r2r_id_loss + i2i_id_loss + r2r_tri_loss + i2i_tri_loss
-                    meter.update({'r2r_id_loss': r2r_id_loss.data,
-                                  'i2i_id_loss': i2i_id_loss.data,
-                                  'r2r_tri_loss': r2r_tri_loss.data,
-                                  'i2i_tri_loss': i2i_tri_loss.data})
-
-                elif args.debug == 'sl':
-                    # //supervised learning
-                    rgb_gts = torch.cat((rgb_gts, rgb_gts)).to(model.device)
-                    ir_gts = torch.cat((ir_gts, ir_gts)).to(model.device)
-                    gts = torch.cat((rgb_gts, ir_gts))
-
-                    id_loss = model.pid_criterion(rgbcls_out, gts)
-                    tri_loss = model.tri_criterion(gap_features, gts)
-                    total_loss = id_loss + args.tri_weight * tri_loss
-                    meter.update({'id_loss': id_loss.data,
-                                  'tri_loss': tri_loss.data})
-
-                else:
-                    raise RuntimeError('Debug mode {} not found!'.format(args.debug))
-
-                total_loss.backward()
-                model.optimizer_phase2.step()
-            
-            # Update progress bar
-            bar()
-
-    return meter.get_val(), meter.get_str()
-
-
-def relabel(select_ids, source_labels, target_labels):
-    '''
-    Input: source_labels, target_labels
-    Output: corresponding select_ids in target modal
-    '''
-    key_to_value = torch.full((torch.max(source_labels) + 1,), -1, dtype=torch.long).to(source_labels.device)
-    key_to_value[source_labels] = target_labels
-
-    select_ids = key_to_value[select_ids]
-    return select_ids
-
-
-def hate_nan(loss, condition, logger):
-    if torch.isnan(loss):
-        if condition:
-            logger('no matched labels')
+    # 损失累加器
+    loss_accum = {
+        'loss_total': 0.0,
+        'loss_id': 0.0,
+        'loss_graph': 0.0,
+        'loss_orth': 0.0,
+        'loss_mod': 0.0
+    }
+    
+    # 进度条
+    pbar = tqdm(dataloader, desc=f'Epoch {epoch}/{args.total_epoch}')
+    
+    for batch_idx, batch_data in enumerate(pbar):
+        # 解包数据
+        if len(batch_data) == 3:
+            images, labels, cam_ids = batch_data
+            modality_labels = (cam_ids >= 3).long()  # SYSU: cam_id >= 3 为红外
         else:
-            logger('nan loss detected')
-        return torch.tensor(0.0).to(loss.device)
-    else:
-        return loss
+            images, labels = batch_data[:2]
+            modality_labels = torch.zeros(labels.size(0), dtype=torch.long)
+        
+        images = images.to(device)
+        labels = labels.to(device)
+        modality_labels = modality_labels.to(device)
+        
+        # ===== 前向传播 (不更新记忆库) =====
+        outputs = model(
+            images, 
+            labels=labels,
+            modality_labels=modality_labels,
+            update_memory=False  # 在反向传播前不更新
+        )
+        
+        # ===== 计算损失 =====
+        total_loss, loss_dict = criterion(
+            outputs, 
+            labels, 
+            modality_labels,
+            current_epoch=epoch,
+            warmup_epochs=args.warmup_epochs
+        )
+        
+        # ===== 反向传播 =====
+        optimizer.zero_grad()
+        total_loss.backward()
+        
+        # 梯度裁剪 (可选)
+        if hasattr(args, 'grad_clip') and args.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+        
+        optimizer.step()
+        
+        # ===== 更新记忆库 (在梯度计算完成后) =====
+        if epoch >= args.warmup_epochs:
+            with torch.no_grad():
+                # 提取特征（不需要梯度）
+                id_features = outputs['id_features']
+                # 确保特征已经detach
+                id_features_detached = [f.detach().clone() for f in id_features]
+                # 更新记忆库
+                model.memory_bank.update_memory(id_features_detached, labels)
+        
+        # 累加损失
+        for key in loss_accum.keys():
+            loss_accum[key] += loss_dict[key]
+        
+        # 更新进度条
+        pbar.set_postfix({
+            'Loss': f"{loss_dict['loss_total']:.4f}",
+            'ID': f"{loss_dict['loss_id']:.4f}",
+            'Graph': f"{loss_dict['loss_graph']:.4f}",
+        })
+    
+    # 计算平均损失
+    num_batches = len(dataloader)
+    avg_loss_dict = {key: value / num_batches for key, value in loss_accum.items()}
+    
+    return avg_loss_dict
+
+
+def train(model, train_loader, val_loader, optimizer, scheduler, args, device):
+    """
+    完整训练流程
+    Args:
+        model: PF_MGCD模型
+        train_loader: 训练数据加载器
+        val_loader: 验证数据加载器 (可选)
+        optimizer: 优化器
+        scheduler: 学习率调度器
+        args: 参数配置
+        device: 设备
+    """
+    # 创建损失函数
+    criterion = TotalLoss(
+        num_parts=args.num_parts,
+        lambda_graph=args.lambda_graph,
+        lambda_orth=args.lambda_orth,
+        lambda_mod=args.lambda_mod,
+        label_smoothing=args.label_smoothing,
+        use_adaptive_weight=True
+    ).to(device)
+    
+    # 初始化记忆库
+    if hasattr(args, 'init_memory') and args.init_memory:
+        print("\n" + "="*50)
+        print("Initializing Memory Bank...")
+        print("="*50)
+        model.initialize_memory(train_loader, device)
+    
+    # 最佳模型跟踪
+    best_metric = 0.0
+    best_epoch = 0
+    
+    # 训练日志
+    print("\n" + "="*50)
+    print("Start Training")
+    print("="*50)
+    print(f"Total Epochs: {args.total_epoch}")
+    print(f"Warmup Epochs: {args.warmup_epochs}")
+    print(f"Learning Rate: {args.lr}")
+    print(f"Lambda Graph: {args.lambda_graph}")
+    print(f"Lambda Orth: {args.lambda_orth}")
+    print(f"Lambda Mod: {args.lambda_mod}")
+    print("="*50 + "\n")
+    
+    # 开始训练
+    for epoch in range(1, args.total_epoch + 1):
+        epoch_start_time = time.time()
+        
+        # 训练一个epoch
+        avg_loss_dict = train_one_epoch(
+            model, train_loader, criterion, optimizer, epoch, args, device
+        )
+        
+        # 学习率调度
+        if scheduler is not None:
+            scheduler.step()
+        
+        # 打印日志
+        epoch_time = time.time() - epoch_start_time
+        current_lr = optimizer.param_groups[0]['lr']
+        
+        print(f"\nEpoch {epoch}/{args.total_epoch} - Time: {epoch_time:.2f}s - LR: {current_lr:.6f}")
+        print(f"  Total Loss: {avg_loss_dict['loss_total']:.4f}")
+        print(f"  ID Loss:    {avg_loss_dict['loss_id']:.4f}")
+        print(f"  Graph Loss: {avg_loss_dict['loss_graph']:.4f}")
+        print(f"  Orth Loss:  {avg_loss_dict['loss_orth']:.4f}")
+        print(f"  Mod Loss:   {avg_loss_dict['loss_mod']:.4f}")
+        
+        # 保存检查点
+        if epoch % args.save_epoch == 0 or epoch == args.total_epoch:
+            save_path = os.path.join(args.save_dir, f'pfmgcd_epoch{epoch}.pth')
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+                'loss_dict': avg_loss_dict,
+            }, save_path)
+            print(f"  Model saved to {save_path}")
+        
+        # 验证 (可选)
+        if val_loader is not None and epoch % args.eval_epoch == 0:
+            print("\n" + "-"*50)
+            print("Running Validation...")
+            print("-"*50)
+            
+            # 导入测试函数
+            try:
+                from task.test import test
+                rank1, mAP = test(model, val_loader, args, device)
+                
+                print(f"Validation Results: Rank-1: {rank1:.2f}%, mAP: {mAP:.2f}%")
+                print("-"*50 + "\n")
+                
+                # 保存最佳模型
+                current_metric = rank1 + mAP
+                if current_metric > best_metric:
+                    best_metric = current_metric
+                    best_epoch = epoch
+                    best_path = os.path.join(args.save_dir, 'pfmgcd_best.pth')
+                    torch.save({
+                        'epoch': epoch,
+                        'model_state_dict': model.state_dict(),
+                        'rank1': rank1,
+                        'mAP': mAP,
+                    }, best_path)
+                    print(f"  Best model updated! (Rank-1: {rank1:.2f}%, mAP: {mAP:.2f}%)")
+            except ImportError:
+                print("  Test module not found, skipping validation")
+                print("-"*50 + "\n")
+    
+    # 训练完成
+    print("\n" + "="*50)
+    print("Training Completed!")
+    print("="*50)
+    if val_loader is not None:
+        print(f"Best Epoch: {best_epoch}")
+        print(f"Best Metric: {best_metric:.2f}")
+    print("="*50 + "\n")

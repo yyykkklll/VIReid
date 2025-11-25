@@ -1,306 +1,285 @@
-import torch
+"""
+Testing Pipeline for PF-MGCD
+实现PF-MGCD的测试和评估流程
+"""
+
+import os
+import time
 import numpy as np
-from alive_progress import alive_bar # <-- Added
+import torch
+import torch.nn.functional as F
+from tqdm import tqdm
 
 
-def extract_ir_features(loader, model, num_samples):
-    ptr = 0
-    ir_feat = np.zeros((num_samples, 2048))
-    
-    # Modified for alive_progress (Pumpkin Theme)
-    with alive_bar(len(loader), bar='halloween', spinner='dots', force_tty=True, title="Test IR") as bar:
-        with torch.no_grad():
-            for batch_idx, (input, label) in enumerate(loader):
-                batch_num = input.size(0)
-                input = input.to(model.device)
-                _, feat = model.model(x2=input)
-
-                imgs_flip = (input.clone().flip(-1))
-                _, feat_flip = model.model(x2=imgs_flip)
-                feat = (feat + feat_flip) / 2
-
-                _, feat = model.classifier1(feat)
-                ir_feat[ptr:ptr + batch_num, :] = feat.detach().cpu().numpy()
-                ptr = ptr + batch_num
-                
-                bar() # Update progress bar
-    return ir_feat
-
-
-def extract_rgb_features(loader, model, num_samples):
-    ptr = 0
-    rgb_feat = np.zeros((num_samples, 2048))
-    
-    # Modified for alive_progress (Pumpkin Theme)
-    with alive_bar(len(loader), bar='halloween', spinner='dots', force_tty=True, title="Test RGB") as bar:
-        with torch.no_grad():
-            for batch_idx, (input, label) in enumerate(loader):
-                batch_num = input.size(0)
-                input = input.to(model.device)
-                _, feat = model.model(x1=input)
-
-                imgs_flip = (input.clone().flip(-1))
-                _, feat_flip = model.model(x1=imgs_flip)
-                feat = (feat + feat_flip) / 2
-
-                _, feat = model.classifier1(feat)
-                rgb_feat[ptr:ptr + batch_num, :] = feat.detach().cpu().numpy()
-                ptr = ptr + batch_num
-                
-                bar() # Update progress bar
-    return rgb_feat
-
-
-def test(args, model, dataset, *epoch):
-    model.set_eval()
-    all_cmc = 0
-    all_mAP = 0
-    all_mINP = 0
-    if args.dataset == 'sysu' or args.dataset == 'llcm':
-        query_loader = dataset.query_loader
-        query_num = dataset.n_query
-        if args.dataset == 'sysu' or args.test_mode == "t2v":
-            query_feat = extract_ir_features(query_loader, model, query_num)
-        elif args.dataset == 'llcm' and args.test_mode == "v2t":
-            query_feat = extract_rgb_features(query_loader, model, query_num)
-        query_label = dataset.query.test_label
-        query_cam = dataset.query.test_cam
-        for i in range(10):
-            gall_num = dataset.n_gallery
-            gall_loader = dataset.gallery_loaders[i]
-            if args.dataset == 'sysu' or args.test_mode == "t2v":
-                gall_feat = extract_rgb_features(gall_loader, model, gall_num)
-            elif args.dataset == 'llcm' and args.test_mode == "v2t":
-                gall_feat = extract_ir_features(gall_loader, model, gall_num)
-            gall_label = dataset.gall_info[i][0]
-            gall_cam = dataset.gall_info[i][1]
-            distmat = np.matmul(query_feat, gall_feat.T)
-            if args.dataset == 'sysu':
-                cmc, mAP, mINP = eval_sysu(-distmat, query_label, gall_label, query_cam, gall_cam)
-            elif args.dataset == 'llcm':
-                cmc, mAP, mINP = eval_llcm(-distmat, query_label, gall_label, query_cam, gall_cam)
-            all_cmc += cmc
-            all_mAP += mAP
-            all_mINP += mINP
-        all_cmc = all_cmc / 10
-        all_mAP = all_mAP / 10
-        all_mINP = all_mINP / 10
-
-    elif args.dataset == 'regdb':
-        ir_loader = dataset.query_loader
-        query_num = dataset.n_query
-        ir_feat = extract_ir_features(ir_loader, model, query_num)
-        ir_label = dataset.query.test_label
-        rgb_loader = dataset.gallery_loader
-        gall_num = dataset.n_gallery
-        rgb_feat = extract_rgb_features(rgb_loader, model, gall_num)
-        rgb_label = dataset.gallery.test_label
-        if args.test_mode == "t2v":
-            distmat = np.matmul(ir_feat, rgb_feat.T)
-            cmc, mAP, mINP = eval_regdb(-distmat, ir_label, rgb_label)
-        elif args.test_mode == "v2t":
-            distmat = np.matmul(rgb_feat, ir_feat.T)
-            cmc, mAP, mINP = eval_regdb(-distmat, rgb_label, ir_label)
-        all_cmc, all_mAP, all_mINP = cmc, mAP, mINP
-    return all_cmc, all_mAP, all_mINP
-
-
-def eval_sysu(distmat, q_pids, g_pids, q_camids, g_camids, max_rank=20):
-    num_q, num_g = distmat.shape
-    if num_g < max_rank:
-        max_rank = num_g
-        print("Note: number of gallery samples is quite small, got {}".format(num_g))
-    indices = np.argsort(distmat, axis=1)
-    pred_label = g_pids[indices]
-    matches = (g_pids[indices] == q_pids[:, np.newaxis]).astype(np.int32)
-
-    new_all_cmc = []
-    all_cmc = []
-    all_AP = []
-    all_INP = []
-    num_valid_q = 0.
-    for q_idx in range(num_q):
-        q_pid = q_pids[q_idx]
-        q_camid = q_camids[q_idx]
-
-        order = indices[q_idx]
-        remove = (q_camid == 3) & (g_camids[order] == 2)
-        keep = np.invert(remove)
-        new_cmc = pred_label[q_idx][keep]
-        new_index = np.unique(new_cmc, return_index=True)[1]
-        new_cmc = [new_cmc[index] for index in sorted(new_index)]
-
-        new_match = (new_cmc == q_pid).astype(np.int32)
-        new_cmc = new_match.cumsum()
-        new_all_cmc.append(new_cmc[:max_rank])
-
-        orig_cmc = matches[q_idx][keep]
-        if not np.any(orig_cmc):
-            continue
-
-        cmc = orig_cmc.cumsum()
-
-        pos_idx = np.where(orig_cmc == 1)
-        pos_max_idx = np.max(pos_idx)
-        inp = cmc[pos_max_idx] / (pos_max_idx + 1.0)
-        all_INP.append(inp)
-
-        cmc[cmc > 1] = 1
-
-        all_cmc.append(cmc[:max_rank])
-        num_valid_q += 1.
-
-        num_rel = orig_cmc.sum()
-        tmp_cmc = orig_cmc.cumsum()
-        tmp_cmc = [x / (i + 1.) for i, x in enumerate(tmp_cmc)]
-        tmp_cmc = np.asarray(tmp_cmc) * orig_cmc
-        AP = tmp_cmc.sum() / num_rel
-        all_AP.append(AP)
-
-    assert num_valid_q > 0, "Error: all query identities do not appear in gallery"
-
-    all_cmc = np.asarray(all_cmc).astype(np.float32)
-    all_cmc = all_cmc.sum(0) / num_valid_q  # standard CMC
-
-    new_all_cmc = np.asarray(new_all_cmc).astype(np.float32)
-    new_all_cmc = new_all_cmc.sum(0) / num_valid_q
-    mAP = np.mean(all_AP)
-    mINP = np.mean(all_INP)
-    return new_all_cmc, mAP, mINP
-
-
-def eval_llcm(distmat, q_pids, g_pids, q_camids, g_camids, max_rank=20):
-    """Evaluation with sysu metric
-    Key: for each query identity, its gallery images from the same camera view are discarded. "Following the original setting in ite dataset"
+def extract_features(model, dataloader, device, pool_parts=True):
     """
-    num_q, num_g = distmat.shape
-    if num_g < max_rank:
-        max_rank = num_g
-        print("Note: number of gallery samples is quite small, got {}".format(num_g))
-    indices = np.argsort(distmat, axis=1)
-    pred_label = g_pids[indices]
-    matches = (g_pids[indices] == q_pids[:, np.newaxis]).astype(np.int32)
+    提取所有样本的特征
+    Args:
+        model: PF_MGCD模型
+        dataloader: 数据加载器
+        device: 设备
+        pool_parts: 是否合并部件特征
+    Returns:
+        features: 特征矩阵 [N, D]
+        labels: 标签 [N]
+        cam_ids: 相机ID [N]
+    """
+    model.eval()
+    
+    features_list = []
+    labels_list = []
+    cam_ids_list = []
+    
+    print("Extracting features...")
+    with torch.no_grad():
+        for batch_data in tqdm(dataloader):
+            # 解包数据
+            if len(batch_data) == 3:
+                images, labels, cam_ids = batch_data
+            else:
+                images, labels = batch_data[:2]
+                cam_ids = torch.zeros(labels.size(0), dtype=torch.long)
+            
+            images = images.to(device)
+            
+            # 提取特征
+            batch_features = model.extract_features(images, pool_parts=pool_parts)
+            
+            features_list.append(batch_features.cpu())
+            labels_list.append(labels)
+            cam_ids_list.append(cam_ids)
+    
+    # 合并所有特征
+    features = torch.cat(features_list, dim=0)
+    labels = torch.cat(labels_list, dim=0)
+    cam_ids = torch.cat(cam_ids_list, dim=0)
+    
+    return features, labels, cam_ids
 
-    # compute cmc curve for each query
-    new_all_cmc = []
+
+def compute_distance_matrix(query_features, gallery_features, metric='euclidean'):
+    """
+    计算查询集和检索集之间的距离矩阵
+    Args:
+        query_features: 查询特征 [N_q, D]
+        gallery_features: 检索特征 [N_g, D]
+        metric: 距离度量 ('euclidean' or 'cosine')
+    Returns:
+        dist_matrix: 距离矩阵 [N_q, N_g]
+    """
+    if metric == 'euclidean':
+        # 欧氏距离
+        dist_matrix = torch.cdist(query_features, gallery_features, p=2)
+    elif metric == 'cosine':
+        # 余弦距离
+        query_features = F.normalize(query_features, p=2, dim=1)
+        gallery_features = F.normalize(gallery_features, p=2, dim=1)
+        dist_matrix = 1 - torch.mm(query_features, gallery_features.t())
+    else:
+        raise ValueError(f"Unknown metric: {metric}")
+    
+    return dist_matrix
+
+
+def evaluate_rank(dist_matrix, query_labels, gallery_labels, 
+                  query_cam_ids, gallery_cam_ids, max_rank=20):
+    """
+    计算CMC和mAP
+    Args:
+        dist_matrix: 距离矩阵 [N_q, N_g]
+        query_labels: 查询标签 [N_q]
+        gallery_labels: 检索标签 [N_g]
+        query_cam_ids: 查询相机ID [N_q]
+        gallery_cam_ids: 检索相机ID [N_g]
+        max_rank: 最大rank
+    Returns:
+        cmc: CMC曲线 [max_rank]
+        mAP: 平均精度均值
+        mINP: 平均逆负惩罚
+    """
+    num_query = dist_matrix.shape[0]
+    num_gallery = dist_matrix.shape[1]
+    
+    # 转换为numpy
+    dist_matrix = dist_matrix.numpy()
+    query_labels = query_labels.numpy()
+    gallery_labels = gallery_labels.numpy()
+    query_cam_ids = query_cam_ids.numpy()
+    gallery_cam_ids = gallery_cam_ids.numpy()
+    
+    # 初始化结果
     all_cmc = []
     all_AP = []
     all_INP = []
-    num_valid_q = 0.  # number of valid query
-    for q_idx in range(num_q):
-        # get query pid and camid
-        q_pid = q_pids[q_idx]
-        q_camid = q_camids[q_idx]
-
-        # remove gallery samples that have the same pid and camid with query
-
-        order = indices[q_idx]
-        remove = (g_pids[order] == q_pid) & (g_camids[order] == q_camid)
-        keep = np.invert(remove)
-
-        # compute cmc curve
-        # the cmc calculation is different from standard protocol
-        # we follow the protocol of the author's released code
-        new_cmc = pred_label[q_idx][keep]
-        new_index = np.unique(new_cmc, return_index=True)[1]
-
-        new_cmc = [new_cmc[index] for index in sorted(new_index)]
-
-        new_match = (new_cmc == q_pid).astype(np.int32)
-        new_cmc = new_match.cumsum()
-        new_all_cmc.append(new_cmc[:max_rank])
-
-        orig_cmc = matches[q_idx][keep]  # binary vector, positions with value 1 are correct matches
-        if not np.any(orig_cmc):
-            # this condition is true when query identity does not appear in gallery
+    
+    for i in range(num_query):
+        # 获取当前查询
+        q_label = query_labels[i]
+        q_cam = query_cam_ids[i]
+        
+        # 计算匹配
+        matches = (gallery_labels == q_label)
+        
+        # 移除同一相机下的同一身份（如果需要）
+        junk_mask = (gallery_labels == q_label) & (gallery_cam_ids == q_cam)
+        matches = matches & ~junk_mask
+        
+        if matches.sum() == 0:
             continue
-
-        cmc = orig_cmc.cumsum()
-
-        # compute mINP
-        # refernece Deep Learning for Person Re-identification: A Survey and Outlook
-        pos_idx = np.where(orig_cmc == 1)
-        pos_max_idx = np.max(pos_idx)
-        inp = cmc[pos_max_idx] / (pos_max_idx + 1.0)
-        all_INP.append(inp)
-
+        
+        # 获取排序索引
+        indices = np.argsort(dist_matrix[i])
+        matches = matches[indices]
+        
+        # 计算CMC
+        cmc = matches.cumsum()
         cmc[cmc > 1] = 1
-
         all_cmc.append(cmc[:max_rank])
-        num_valid_q += 1.
-
-        # compute average precision
-        # reference: https://en.wikipedia.org/wiki/Evaluation_measures_(information_retrieval)#Average_precision
-        num_rel = orig_cmc.sum()
-        tmp_cmc = orig_cmc.cumsum()
-        tmp_cmc = [x / (i + 1.) for i, x in enumerate(tmp_cmc)]
-        tmp_cmc = np.asarray(tmp_cmc) * orig_cmc
+        
+        # 计算AP
+        num_rel = matches.sum()
+        tmp_cmc = matches.cumsum()
+        tmp_cmc = [x / (i + 1.0) for i, x in enumerate(tmp_cmc)]
+        tmp_cmc = np.asarray(tmp_cmc) * matches
         AP = tmp_cmc.sum() / num_rel
         all_AP.append(AP)
-
-    assert num_valid_q > 0, "Error: all query identities do not appear in gallery"
-
+        
+        # 计算INP
+        pos_indices = np.where(matches)[0]
+        if len(pos_indices) > 0:
+            INP = pos_indices[0] / (2 * len(pos_indices))
+            all_INP.append(INP)
+    
+    # 计算平均值
     all_cmc = np.asarray(all_cmc).astype(np.float32)
-    all_cmc = all_cmc.sum(0) / num_valid_q  # standard CMC
-
-    new_all_cmc = np.asarray(new_all_cmc).astype(np.float32)
-    new_all_cmc = new_all_cmc.sum(0) / num_valid_q
+    cmc = all_cmc.mean(axis=0)
     mAP = np.mean(all_AP)
-    mINP = np.mean(all_INP)
-    return new_all_cmc, mAP, mINP
+    mINP = np.mean(all_INP) if len(all_INP) > 0 else 0.0
+    
+    return cmc, mAP, mINP
 
 
-def eval_regdb(distmat, q_pids, g_pids, max_rank=20):
-    num_q, num_g = distmat.shape
-    if num_g < max_rank:
-        max_rank = num_g
-        print("Note: number of gallery samples is quite small, got {}".format(num_g))
-    indices = np.argsort(distmat, axis=1)
-    matches = (g_pids[indices] == q_pids[:, np.newaxis]).astype(np.int32)
+def test(model, test_loader, args, device):
+    """
+    测试模型性能
+    Args:
+        model: PF_MGCD模型
+        test_loader: 测试数据加载器（包含query和gallery）
+        args: 参数配置
+        device: 设备
+    Returns:
+        rank1: Rank-1准确率
+        mAP: 平均精度均值
+    """
+    print("\n" + "="*50)
+    print("Starting Evaluation")
+    print("="*50)
+    
+    # 提取特征
+    pool_parts = args.pool_parts if hasattr(args, 'pool_parts') else True
+    features, labels, cam_ids = extract_features(model, test_loader, device, pool_parts)
+    
+    print(f"\nExtracted features shape: {features.shape}")
+    print(f"Number of identities: {len(labels.unique())}")
+    
+    # 分割query和gallery（这里需要根据具体数据集调整）
+    # 示例: 假设前半部分是query，后半部分是gallery
+    num_samples = features.shape[0]
+    num_query = num_samples // 2
+    
+    query_features = features[:num_query]
+    query_labels = labels[:num_query]
+    query_cam_ids = cam_ids[:num_query]
+    
+    gallery_features = features[num_query:]
+    gallery_labels = labels[num_query:]
+    gallery_cam_ids = cam_ids[num_query:]
+    
+    print(f"\nQuery samples: {num_query}")
+    print(f"Gallery samples: {num_samples - num_query}")
+    
+    # 计算距离矩阵
+    print("\nComputing distance matrix...")
+    metric = args.distance_metric if hasattr(args, 'distance_metric') else 'euclidean'
+    dist_matrix = compute_distance_matrix(query_features, gallery_features, metric)
+    
+    # 评估
+    print("\nEvaluating...")
+    cmc, mAP, mINP = evaluate_rank(
+        dist_matrix, query_labels, gallery_labels,
+        query_cam_ids, gallery_cam_ids, max_rank=20
+    )
+    
+    # 打印结果
+    print("\n" + "="*50)
+    print("Evaluation Results")
+    print("="*50)
+    print(f"mAP: {mAP*100:.2f}%")
+    print(f"mINP: {mINP*100:.2f}%")
+    print(f"CMC Scores:")
+    for r in [1, 5, 10, 20]:
+        if r <= len(cmc):
+            print(f"  Rank-{r:2d}: {cmc[r-1]*100:.2f}%")
+    print("="*50 + "\n")
+    
+    return cmc[0] * 100, mAP * 100  # 返回Rank-1和mAP
 
-    all_cmc = []
-    all_AP = []
-    all_INP = []
-    num_valid_q = 0.
 
-    q_camids = np.ones(num_q).astype(np.int32)
-    g_camids = 2 * np.ones(num_g).astype(np.int32)
-
-    for q_idx in range(num_q):
-        q_pid = q_pids[q_idx]
-        q_camid = q_camids[q_idx]
-
-        order = indices[q_idx]
-        remove = (g_pids[order] == q_pid) & (g_camids[order] == q_camid)
-        keep = np.invert(remove)
-
-        raw_cmc = matches[q_idx][keep]
-        if not np.any(raw_cmc):
-            continue
-
-        cmc = raw_cmc.cumsum()
-
-        pos_idx = np.where(raw_cmc == 1)
-        pos_max_idx = np.max(pos_idx)
-        inp = cmc[pos_max_idx] / (pos_max_idx + 1.0)
-        all_INP.append(inp)
-
-        cmc[cmc > 1] = 1
-
-        all_cmc.append(cmc[:max_rank])
-        num_valid_q += 1.
-
-        num_rel = raw_cmc.sum()
-        tmp_cmc = raw_cmc.cumsum()
-        tmp_cmc = [x / (i + 1.) for i, x in enumerate(tmp_cmc)]
-        tmp_cmc = np.asarray(tmp_cmc) * raw_cmc
-        AP = tmp_cmc.sum() / num_rel
-        all_AP.append(AP)
-
-    assert num_valid_q > 0, "Error: all query identities do not appear in gallery"
-
-    all_cmc = np.asarray(all_cmc).astype(np.float32)
-    all_cmc = all_cmc.sum(0) / num_valid_q
-    mAP = np.mean(all_AP)
-    mINP = np.mean(all_INP)
-    return all_cmc, mAP, mINP
+def test_cross_modality(model, query_loader, gallery_loader, args, device):
+    """
+    跨模态测试（可见光查询 vs 红外检索，或反之）
+    Args:
+        model: PF_MGCD模型
+        query_loader: 查询集数据加载器
+        gallery_loader: 检索集数据加载器
+        args: 参数配置
+        device: 设备
+    Returns:
+        rank1: Rank-1准确率
+        mAP: 平均精度均值
+    """
+    print("\n" + "="*50)
+    print("Starting Cross-Modality Evaluation")
+    print("="*50)
+    
+    # 提取查询特征
+    print("\n--- Extracting Query Features ---")
+    pool_parts = args.pool_parts if hasattr(args, 'pool_parts') else True
+    query_features, query_labels, query_cam_ids = extract_features(
+        model, query_loader, device, pool_parts
+    )
+    
+    # 提取检索特征
+    print("\n--- Extracting Gallery Features ---")
+    gallery_features, gallery_labels, gallery_cam_ids = extract_features(
+        model, gallery_loader, device, pool_parts
+    )
+    
+    print(f"\nQuery samples: {query_features.shape[0]}")
+    print(f"Gallery samples: {gallery_features.shape[0]}")
+    
+    # 计算距离矩阵
+    print("\nComputing distance matrix...")
+    metric = args.distance_metric if hasattr(args, 'distance_metric') else 'euclidean'
+    dist_matrix = compute_distance_matrix(query_features, gallery_features, metric)
+    
+    # 评估
+    print("\nEvaluating...")
+    cmc, mAP, mINP = evaluate_rank(
+        dist_matrix, query_labels, gallery_labels,
+        query_cam_ids, gallery_cam_ids, max_rank=20
+    )
+    
+    # 打印结果
+    print("\n" + "="*50)
+    print("Cross-Modality Evaluation Results")
+    print("="*50)
+    print(f"mAP: {mAP*100:.2f}%")
+    print(f"mINP: {mINP*100:.2f}%")
+    print(f"CMC Scores:")
+    for r in [1, 5, 10, 20]:
+        if r <= len(cmc):
+            print(f"  Rank-{r:2d}: {cmc[r-1]*100:.2f}%")
+    print("="*50 + "\n")
+    
+    return cmc[0] * 100, mAP * 100
