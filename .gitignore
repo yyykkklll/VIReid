@@ -1,5 +1,7 @@
 # Ignore datasets directory
-datasets/
+datasets/LLCM
+datasets/RegDB
+datasets/SYSU-MM01
 
 # Python cache files
 __pycache__/
