@@ -1,235 +1,310 @@
 """
-Training Pipeline for PF-MGCD
-实现PF-MGCD的完整训练流程
+Training Script for PF-MGCD
+支持混合精度训练 + 改进的loss计算 + 自动目录管理
 """
 
 import os
 import time
+import logging
 import torch
 import torch.nn as nn
+from torch.amp import autocast, GradScaler
 from tqdm import tqdm
-
-# 导入模型和损失
-import sys
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from models.pfmgcd_model import PF_MGCD
 from models.loss import TotalLoss
+from task.test import test
 
 
-def train_one_epoch(model, dataloader, criterion, optimizer, epoch, args, device):
-    """
-    训练一个epoch
-    Args:
-        model: PF_MGCD模型
-        dataloader: 训练数据加载器
-        criterion: 损失函数 (TotalLoss)
-        optimizer: 优化器
-        epoch: 当前epoch
-        args: 参数配置
-        device: 设备
-    Returns:
-        avg_loss_dict: 平均损失字典
-    """
+def setup_logger(log_dir, log_file='train.log'):
+    """设置日志 - 自动创建目录"""
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, log_file)
+    
+    # [改进] 如果日志文件存在，清空它（覆盖模式）
+    if os.path.exists(log_path):
+        open(log_path, 'w').close()
+    
+    logging.basicConfig(
+        level=logging.INFO,
+        format='[%(asctime)s] - %(levelname)s: %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+        handlers=[
+            logging.FileHandler(log_path, mode='a'),  # append模式
+            logging.StreamHandler()
+        ],
+        force=True  # 强制重新配置logging
+    )
+    return logging.getLogger(__name__)
+
+
+def train_one_epoch(model, train_loader, criterion, optimizer, scaler, device, epoch, logger, args):
+    """训练一个epoch"""
     model.train()
     
-    # 损失累加器
-    loss_accum = {
-        'loss_total': 0.0,
-        'loss_id': 0.0,
-        'loss_graph': 0.0,
-        'loss_orth': 0.0,
-        'loss_mod': 0.0
+    total_loss = 0
+    loss_items = {
+        'loss_id': 0,
+        'loss_triplet': 0,
+        'loss_graph': 0,
+        'loss_orth': 0,
+        'loss_mod': 0
     }
     
-    # 进度条
-    pbar = tqdm(dataloader, desc=f'Epoch {epoch}/{args.total_epoch}')
+    pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{args.total_epoch}')
     
     for batch_idx, batch_data in enumerate(pbar):
-        # 解包数据
+        # 解包batch数据
         if len(batch_data) == 3:
-            images, labels, cam_ids = batch_data
-            modality_labels = (cam_ids >= 3).long()  # SYSU: cam_id >= 3 为红外
+            # 标准格式: (images, labels, cams)
+            images, labels, cams = batch_data
+            images = images.to(device)
+            labels = labels.to(device)
+            cams = cams.to(device)
+            
+            # 推断模态标签（基于camera ID）
+            modality_labels = (cams >= 3).long()
+        
+        elif len(batch_data) == 6:
+            # 分离RGB和IR的格式: (rgb_imgs, ir_imgs, rgb_labels, ir_labels, rgb_cams, ir_cams)
+            rgb_imgs, ir_imgs, rgb_labels, ir_labels, rgb_cams, ir_cams = batch_data
+            
+            # 合并RGB和IR数据
+            images = torch.cat([rgb_imgs, ir_imgs], dim=0).to(device)
+            labels = torch.cat([rgb_labels, ir_labels], dim=0).to(device)
+            cams = torch.cat([rgb_cams, ir_cams], dim=0).to(device)
+            
+            # 模态标签 (0=RGB, 1=IR)
+            modality_labels = torch.cat([
+                torch.zeros(len(rgb_imgs), dtype=torch.long),
+                torch.ones(len(ir_imgs), dtype=torch.long)
+            ]).to(device)
+        
         else:
-            images, labels = batch_data[:2]
-            modality_labels = torch.zeros(labels.size(0), dtype=torch.long)
+            raise ValueError(f"Unexpected batch format with {len(batch_data)} elements")
         
-        images = images.to(device)
-        labels = labels.to(device)
-        modality_labels = modality_labels.to(device)
-        
-        # ===== 前向传播 (不更新记忆库) =====
-        outputs = model(
-            images, 
-            labels=labels,
-            modality_labels=modality_labels,
-            update_memory=False  # 在反向传播前不更新
-        )
-        
-        # ===== 计算损失 =====
-        total_loss, loss_dict = criterion(
-            outputs, 
-            labels, 
-            modality_labels,
-            current_epoch=epoch,
-            warmup_epochs=args.warmup_epochs
-        )
-        
-        # ===== 反向传播 =====
         optimizer.zero_grad()
-        total_loss.backward()
         
-        # 梯度裁剪 (可选)
-        if hasattr(args, 'grad_clip') and args.grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+        # 混合精度训练
+        if args.amp and scaler is not None:
+            with autocast(device_type='cuda'):
+                # 前向传播
+                outputs = model(images, labels=labels, modality_labels=modality_labels)
+                
+                # 计算损失
+                loss, loss_dict = criterion(
+                    outputs, 
+                    labels, 
+                    modality_labels, 
+                    current_epoch=epoch
+                )
+            
+            # 反向传播
+            scaler.scale(loss).backward()
+            
+            # 梯度裁剪
+            if args.grad_clip > 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            # 标准训练
+            outputs = model(images, labels=labels, modality_labels=modality_labels)
+            loss, loss_dict = criterion(
+                outputs, 
+                labels, 
+                modality_labels, 
+                current_epoch=epoch
+            )
+            
+            loss.backward()
+            
+            if args.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            
+            optimizer.step()
         
-        optimizer.step()
-        
-        # ===== 更新记忆库 (在梯度计算完成后) =====
-        if epoch >= args.warmup_epochs:
-            with torch.no_grad():
-                # 提取特征（不需要梯度）
-                id_features = outputs['id_features']
-                # 确保特征已经detach
-                id_features_detached = [f.detach().clone() for f in id_features]
-                # 更新记忆库
-                model.memory_bank.update_memory(id_features_detached, labels)
-        
-        # 累加损失
-        for key in loss_accum.keys():
-            loss_accum[key] += loss_dict[key]
+        # 统计损失
+        total_loss += loss.item()
+        for key in loss_items.keys():
+            if key in loss_dict:
+                loss_items[key] += loss_dict[key]
         
         # 更新进度条
         pbar.set_postfix({
-            'Loss': f"{loss_dict['loss_total']:.4f}",
-            'ID': f"{loss_dict['loss_id']:.4f}",
-            'Graph': f"{loss_dict['loss_graph']:.4f}",
+            'Loss': f'{loss.item():.4f}',
+            'ID': f'{loss_dict["loss_id"]:.4f}',
+            'Trip': f'{loss_dict["loss_triplet"]:.4f}',
+            'Graph': f'{loss_dict["loss_graph"]:.4f}'
         })
+        
+        # 更新记忆库（warmup后）
+        if epoch >= args.warmup_epochs:
+            with torch.no_grad():
+                model.memory_bank.update_memory(
+                    outputs['id_features'],
+                    labels
+                )
     
     # 计算平均损失
-    num_batches = len(dataloader)
-    avg_loss_dict = {key: value / num_batches for key, value in loss_accum.items()}
+    num_batches = len(train_loader)
+    avg_loss_dict = {
+        'loss_total': total_loss / num_batches,
+        'loss_id': loss_items['loss_id'] / num_batches,
+        'loss_triplet': loss_items['loss_triplet'] / num_batches,
+        'loss_graph': loss_items['loss_graph'] / num_batches,
+        'loss_orth': loss_items['loss_orth'] / num_batches,
+        'loss_mod': loss_items['loss_mod'] / num_batches
+    }
     
     return avg_loss_dict
 
 
-def train(model, train_loader, val_loader, optimizer, scheduler, args, device):
+def train(model, train_loader, dataset_obj, optimizer, scheduler, args, device):
     """
     完整训练流程
-    Args:
-        model: PF_MGCD模型
-        train_loader: 训练数据加载器
-        val_loader: 验证数据加载器 (可选)
-        optimizer: 优化器
-        scheduler: 学习率调度器
-        args: 参数配置
-        device: 设备
+    自动根据save_dir和log_dir创建/覆盖目录
     """
+    
+    # ===== [关键改进] 自动创建目录 =====
+    os.makedirs(args.save_dir, exist_ok=True)
+    os.makedirs(args.log_dir, exist_ok=True)
+    
+    print(f"\n{'='*70}")
+    print(f"Directory Setup:")
+    print(f"  Save Dir: {args.save_dir}")
+    print(f"  Log Dir:  {args.log_dir}")
+    print(f"{'='*70}\n")
+    
+    # 设置日志
+    logger = setup_logger(args.log_dir)
+    
+    logger.info("\n" + "="*50)
+    logger.info("Initializing Memory Bank...")
+    logger.info("="*50)
+    
+    # 初始化记忆库
+    if args.init_memory:
+        normal_rgb_loader, normal_ir_loader = dataset_obj.get_normal_loader()
+        model.initialize_memory(normal_rgb_loader, device)
+    
+    logger.info("\n" + "="*50)
+    logger.info("Start Training")
+    logger.info("="*50)
+    logger.info(f"Total Epochs: {args.total_epoch}")
+    logger.info(f"Warmup Epochs: {args.warmup_epochs}")
+    logger.info(f"Learning Rate: {args.lr}")
+    logger.info(f"Lambda Graph: {args.lambda_graph}")
+    logger.info(f"Lambda Orth: {args.lambda_orth}")
+    logger.info(f"Lambda Mod: {args.lambda_mod}")
+    logger.info(f"Lambda Triplet: {args.lambda_triplet}")
+    logger.info("="*50 + "\n")
+    
     # 创建损失函数
     criterion = TotalLoss(
         num_parts=args.num_parts,
+        label_smoothing=args.label_smoothing,
+        lambda_id=1.0,
+        lambda_triplet=args.lambda_triplet,
         lambda_graph=args.lambda_graph,
         lambda_orth=args.lambda_orth,
         lambda_mod=args.lambda_mod,
-        label_smoothing=args.label_smoothing,
-        use_adaptive_weight=True
+        use_adaptive_weight=False
     ).to(device)
     
-    # 初始化记忆库
-    if hasattr(args, 'init_memory') and args.init_memory:
-        print("\n" + "="*50)
-        print("Initializing Memory Bank...")
-        print("="*50)
-        model.initialize_memory(train_loader, device)
+    # 使用新的GradScaler API
+    scaler = GradScaler(device='cuda') if args.amp else None
     
-    # 最佳模型跟踪
-    best_metric = 0.0
+    # 最佳模型记录
+    best_rank1 = 0.0
+    best_map = 0.0
     best_epoch = 0
     
-    # 训练日志
-    print("\n" + "="*50)
-    print("Start Training")
-    print("="*50)
-    print(f"Total Epochs: {args.total_epoch}")
-    print(f"Warmup Epochs: {args.warmup_epochs}")
-    print(f"Learning Rate: {args.lr}")
-    print(f"Lambda Graph: {args.lambda_graph}")
-    print(f"Lambda Orth: {args.lambda_orth}")
-    print(f"Lambda Mod: {args.lambda_mod}")
-    print("="*50 + "\n")
-    
     # 开始训练
-    for epoch in range(1, args.total_epoch + 1):
+    for epoch in range(args.total_epoch):
         epoch_start_time = time.time()
         
         # 训练一个epoch
         avg_loss_dict = train_one_epoch(
-            model, train_loader, criterion, optimizer, epoch, args, device
+            model, train_loader, criterion, optimizer, scaler,
+            device, epoch, logger, args
         )
         
         # 学习率调度
         if scheduler is not None:
             scheduler.step()
         
-        # 打印日志
+        # 记录训练信息
         epoch_time = time.time() - epoch_start_time
         current_lr = optimizer.param_groups[0]['lr']
         
-        print(f"\nEpoch {epoch}/{args.total_epoch} - Time: {epoch_time:.2f}s - LR: {current_lr:.6f}")
-        print(f"  Total Loss: {avg_loss_dict['loss_total']:.4f}")
-        print(f"  ID Loss:    {avg_loss_dict['loss_id']:.4f}")
-        print(f"  Graph Loss: {avg_loss_dict['loss_graph']:.4f}")
-        print(f"  Orth Loss:  {avg_loss_dict['loss_orth']:.4f}")
-        print(f"  Mod Loss:   {avg_loss_dict['loss_mod']:.4f}")
+        logger.info(f"Epoch {epoch+1}/{args.total_epoch} - Time: {epoch_time:.2f}s - LR: {current_lr:.6f}")
+        logger.info(f"  Total Loss: {avg_loss_dict['loss_total']:.4f}")
+        logger.info(f"  ID Loss:    {avg_loss_dict['loss_id']:.4f}")
+        logger.info(f"  Triplet:    {avg_loss_dict['loss_triplet']:.4f}")
+        logger.info(f"  Graph Loss: {avg_loss_dict['loss_graph']:.4f}")
+        logger.info(f"  Orth Loss:  {avg_loss_dict['loss_orth']:.4f}")
+        logger.info(f"  Mod Loss:   {avg_loss_dict['loss_mod']:.4f}")
         
-        # 保存检查点
-        if epoch % args.save_epoch == 0 or epoch == args.total_epoch:
-            save_path = os.path.join(args.save_dir, f'pfmgcd_epoch{epoch}.pth')
+        # ===== [改进] 简化保存路径，直接使用save_dir =====
+        if (epoch + 1) % args.save_epoch == 0:
+            save_path = os.path.join(args.save_dir, f'epoch_{epoch+1}.pth')
             torch.save({
-                'epoch': epoch,
+                'epoch': epoch + 1,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
-                'loss_dict': avg_loss_dict,
+                'best_rank1': best_rank1,
+                'best_map': best_map,
+                'args': vars(args)  # 保存训练配置
             }, save_path)
-            print(f"  Model saved to {save_path}")
+            logger.info(f"  Model saved to {save_path}")
         
-        # 验证 (可选)
-        if val_loader is not None and epoch % args.eval_epoch == 0:
-            print("\n" + "-"*50)
-            print("Running Validation...")
-            print("-"*50)
+        # 验证
+        if (epoch + 1) % args.eval_epoch == 0:
+            logger.info("-" * 50)
+            logger.info("Running Validation...")
+            logger.info("-" * 50)
             
-            # 导入测试函数
-            try:
-                from task.test import test
-                rank1, mAP = test(model, val_loader, args, device)
+            # 测试
+            rank1, mAP, mINP = test(
+                model, 
+                dataset_obj.query_loader, 
+                dataset_obj.gallery_loaders, 
+                args, 
+                device
+            )
+            
+            logger.info(f"Validation Results: Rank-1 {rank1:.2f}, mAP {mAP:.2f}, mINP {mINP:.2f}")
+            logger.info("-" * 50 + "\n")
+            
+            # 更新最佳模型
+            if rank1 > best_rank1:
+                best_rank1 = rank1
+                best_map = mAP
+                best_epoch = epoch + 1
                 
-                print(f"Validation Results: Rank-1: {rank1:.2f}%, mAP: {mAP:.2f}%")
-                print("-"*50 + "\n")
-                
-                # 保存最佳模型
-                current_metric = rank1 + mAP
-                if current_metric > best_metric:
-                    best_metric = current_metric
-                    best_epoch = epoch
-                    best_path = os.path.join(args.save_dir, 'pfmgcd_best.pth')
-                    torch.save({
-                        'epoch': epoch,
-                        'model_state_dict': model.state_dict(),
-                        'rank1': rank1,
-                        'mAP': mAP,
-                    }, best_path)
-                    print(f"  Best model updated! (Rank-1: {rank1:.2f}%, mAP: {mAP:.2f}%)")
-            except ImportError:
-                print("  Test module not found, skipping validation")
-                print("-"*50 + "\n")
+                # ===== [改进] 简化保存路径 =====
+                best_model_path = os.path.join(args.save_dir, 'best_model.pth')
+                torch.save({
+                    'epoch': epoch + 1,
+                    'model_state_dict': model.state_dict(),
+                    'rank1': rank1,
+                    'mAP': mAP,
+                    'mINP': mINP,
+                    'args': vars(args)
+                }, best_model_path)
+                logger.info(f"✓ Best model updated! Rank-1 {rank1:.2f}, mAP {mAP:.2f}")
+                logger.info(f"  Saved to: {best_model_path}")
+            
+            # 切回训练模式
+            model.train()
     
-    # 训练完成
-    print("\n" + "="*50)
-    print("Training Completed!")
-    print("="*50)
-    if val_loader is not None:
-        print(f"Best Epoch: {best_epoch}")
-        print(f"Best Metric: {best_metric:.2f}")
-    print("="*50 + "\n")
+    # 训练结束
+    logger.info("\n" + "="*50)
+    logger.info("Training Completed!")
+    logger.info("="*50)
+    logger.info(f"Best Epoch: {best_epoch}")
+    logger.info(f"Best Rank-1: {best_rank1:.2f}%")
+    logger.info(f"Best mAP: {best_map:.2f}%")
+    logger.info(f"Model saved in: {args.save_dir}")
+    logger.info("="*50)

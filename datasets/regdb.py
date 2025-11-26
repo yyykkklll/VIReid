@@ -1,7 +1,8 @@
 import os
-
 import torch.utils.data as data
-
+import numpy as np
+from PIL import Image
+import random
 from .data_process import *  # Channel augment and transforms
 
 
@@ -31,6 +32,9 @@ class RegDB:
             self.query, self.test_batch, shuffle=False, num_workers=self.num_workers, drop_last=False)
         self.gallery_loader = data.DataLoader(
             self.gallery, self.test_batch, shuffle=False, num_workers=self.num_workers, drop_last=False)
+
+        # 添加 gallery_loaders 列表以保持与其他数据集的一致性
+        self.gallery_loaders = [self.gallery_loader]
 
     def get_train_loader(self):
         self.train_rgb.load_mode = 'train'
@@ -133,6 +137,8 @@ class RegDB_train(data.Dataset):
             idx = self.sampler_idx[index]  # sampler index
             info = self.train_info[idx]
             img = self.train_image[idx]
+
+            # [REVERTED] 恢复返回 info
             if self.modal == 'rgb':
                 color_img = self.transform_color_normal(img)
                 ca_img = self.transform_color_sa(img)
@@ -182,7 +188,8 @@ class RegDB_test(data.Dataset):
         return len(self.test_label)
 
     def __getitem__(self, index):
-        return self.transform(self.test_image[index]), self.test_label[index]
+        # [KEPT FIX]
+        return self.transform(self.test_image[index]), self.test_label[index], self.test_cam[index]
 
     def _process_test_regdb(self, trial, mode):
         if mode == "visible":

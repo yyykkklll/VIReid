@@ -1,6 +1,6 @@
 """
-ISG-DM - Instance Statistics Guided Disentanglement Module
-实例统计引导解耦模块: 将特征分离为身份特征和模态特征
+ISG-DM v2 - Enhanced Instance Statistics Guided Disentanglement Module
+改进版实例统计引导解耦模块：增强特征判别性
 """
 
 import torch
@@ -9,161 +9,97 @@ import torch.nn.functional as F
 
 
 class ISG_DM(nn.Module):
-    """
-    实例统计引导解耦模块
-    利用Instance Normalization的统计量提取模态特征
-    利用归一化后的内容提取身份特征
-    """
+    """改进版ISG-DM：多层特征提取 + 轻量级注意力"""
     
     def __init__(self, input_dim=2048, id_dim=256, mod_dim=256):
-        """
-        Args:
-            input_dim: 输入特征维度 (来自PCB的每个部件)
-            id_dim: 身份特征输出维度
-            mod_dim: 模态特征输出维度
-        """
         super(ISG_DM, self).__init__()
         self.input_dim = input_dim
         self.id_dim = id_dim
         self.mod_dim = mod_dim
         
-        # ===== 模态特征提取 (Style/Modality) =====
-        # 统计量 (均值+标准差) 的维度是 input_dim * 2
-        self.style_mlp = nn.Sequential(
-            nn.Linear(input_dim * 2, input_dim),
+        # [改进1] 多层身份特征提取（渐进式降维）
+        self.identity_fc = nn.Sequential(
+            # 第一层：2048 -> 1024
+            nn.Linear(input_dim, input_dim // 2),
+            nn.BatchNorm1d(input_dim // 2),
             nn.ReLU(inplace=True),
-            nn.Linear(input_dim, mod_dim),
+            nn.Dropout(0.3),  # 降低dropout
+            
+            # 第二层：1024 -> 512
+            nn.Linear(input_dim // 2, input_dim // 4),
+            nn.BatchNorm1d(input_dim // 4),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
+            
+            # 第三层：512 -> 256
+            nn.Linear(input_dim // 4, id_dim),
+            nn.BatchNorm1d(id_dim)
+        )
+        
+        # [改进2] 轻量级通道注意力（类似SENet但更简单）
+        self.channel_attention = nn.Sequential(
+            nn.Linear(input_dim, input_dim // 16),
+            nn.ReLU(inplace=True),
+            nn.Linear(input_dim // 16, input_dim),
+            nn.Sigmoid()
+        )
+        
+        # 模态特征提取（保持简单）
+        self.modality_fc = nn.Sequential(
+            nn.Linear(input_dim, input_dim // 2),
+            nn.BatchNorm1d(input_dim // 2),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.3),
+            nn.Linear(input_dim // 2, mod_dim),
             nn.BatchNorm1d(mod_dim)
         )
         
-        # ===== 身份特征提取 (Content/Identity) =====
-        # SE-Gate 通道注意力
-        self.se_reduce = nn.Linear(input_dim, input_dim // 16)
-        self.se_expand = nn.Linear(input_dim // 16, input_dim)
-        
-        # 身份特征降维
-        self.identity_fc = nn.Sequential(
-            nn.Linear(input_dim, id_dim),
-            nn.BatchNorm1d(id_dim),
-            nn.ReLU(inplace=True)
-        )
-        
-        # Instance Normalization的epsilon
-        self.eps = 1e-5
+        # 显式权重初始化
+        self._init_weights()
+    
+    def _init_weights(self):
+        """Kaiming初始化，确保训练稳定"""
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm1d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
     
     def forward(self, part_feature):
         """
         Args:
-            part_feature: 单个部件特征 [B, C, H, W]
+            part_feature: [B, C, H, W]
         Returns:
             f_id: 身份特征 [B, id_dim]
             f_mod: 模态特征 [B, mod_dim]
         """
         B, C, H, W = part_feature.size()
         
-        # ===== Step 1: 提取统计量 (模态特征) =====
-        f_mod = self._extract_modality_feature(part_feature)
+        # 全局平均池化
+        pooled = F.adaptive_avg_pool2d(part_feature, 1).view(B, C)  # [B, C]
         
-        # ===== Step 2: Instance Normalization (去除风格) =====
-        f_norm = self._instance_normalize(part_feature)
+        # [改进] 通道注意力加权
+        att_weights = self.channel_attention(pooled)  # [B, C]
+        pooled_weighted = pooled * att_weights
         
-        # ===== Step 3: SE-Gate通道注意力 (强化身份信息) =====
-        f_id_raw = self._apply_se_gate(f_norm)
-        
-        # ===== Step 4: 降维输出身份特征 =====
-        # 先做全局平均池化
-        f_id_pooled = F.adaptive_avg_pool2d(f_id_raw, 1).view(B, C)
-        f_id = self.identity_fc(f_id_pooled)
+        # 提取身份特征和模态特征
+        f_id = self.identity_fc(pooled_weighted)
+        f_mod = self.modality_fc(pooled)
         
         return f_id, f_mod
-    
-    def _extract_modality_feature(self, x):
-        """
-        提取模态特征: 利用IN的统计量 (均值和标准差)
-        Args:
-            x: [B, C, H, W]
-        Returns:
-            f_mod: [B, mod_dim]
-        """
-        B, C, H, W = x.size()
-        
-        # 计算每个实例的均值和标准差 (在空间维度上)
-        mu = x.view(B, C, -1).mean(dim=2)  # [B, C]
-        var = x.view(B, C, -1).var(dim=2) + self.eps  # [B, C]
-        sigma = torch.sqrt(var)  # [B, C]
-        
-        # 拼接统计量
-        style_stats = torch.cat([mu, sigma], dim=1)  # [B, 2C]
-        
-        # 通过MLP压缩
-        f_mod = self.style_mlp(style_stats)  # [B, mod_dim]
-        
-        return f_mod
-    
-    def _instance_normalize(self, x):
-        """
-        Instance Normalization: 去除风格/模态信息
-        Args:
-            x: [B, C, H, W]
-        Returns:
-            x_norm: [B, C, H, W]
-        """
-        B, C, H, W = x.size()
-        
-        # 计算均值和标准差
-        mu = x.view(B, C, -1).mean(dim=2, keepdim=True)  # [B, C, 1]
-        var = x.view(B, C, -1).var(dim=2, keepdim=True) + self.eps  # [B, C, 1]
-        sigma = torch.sqrt(var)
-        
-        # 归一化
-        x_flat = x.view(B, C, -1)
-        x_norm = (x_flat - mu) / sigma  # [B, C, H*W]
-        x_norm = x_norm.view(B, C, H, W)
-        
-        return x_norm
-    
-    def _apply_se_gate(self, x):
-        """
-        SE-Gate 通道注意力机制
-        Args:
-            x: [B, C, H, W]
-        Returns:
-            x_weighted: [B, C, H, W]
-        """
-        B, C, H, W = x.size()
-        
-        # Global Average Pooling
-        squeeze = F.adaptive_avg_pool2d(x, 1).view(B, C)  # [B, C]
-        
-        # FC layers
-        excitation = F.relu(self.se_reduce(squeeze))  # [B, C/16]
-        excitation = torch.sigmoid(self.se_expand(excitation))  # [B, C]
-        
-        # 通道加权
-        excitation = excitation.view(B, C, 1, 1)
-        x_weighted = x * excitation
-        
-        return x_weighted
 
 
 class MultiPartISG_DM(nn.Module):
-    """
-    多部件ISG-DM模块
-    对K个部件分别应用ISG-DM解耦
-    """
+    """多部件ISG-DM模块"""
     
     def __init__(self, num_parts=6, input_dim=2048, id_dim=256, mod_dim=256):
-        """
-        Args:
-            num_parts: 部件数量 K
-            input_dim: 输入特征维度
-            id_dim: 身份特征维度
-            mod_dim: 模态特征维度
-        """
         super(MultiPartISG_DM, self).__init__()
         self.num_parts = num_parts
         
-        # 为每个部件创建独立的ISG-DM模块
+        # 为每个部件创建独立的ISG-DM
         self.isg_modules = nn.ModuleList([
             ISG_DM(input_dim, id_dim, mod_dim) for _ in range(num_parts)
         ])

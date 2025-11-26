@@ -7,42 +7,25 @@ Models Package
 from .pcb_backbone import PCBBackbone, PartPooling
 
 # ISG-DM
-from .isg_dm import ISG_DM, MultiPartISG_DM
+from .isg_dm import MultiPartISG_DM
 
 # Memory Bank
 from .memory_bank import MultiPartMemoryBank, AdaptiveMemoryBank
 
 # Graph Propagation
-from .graph_propagation import (
-    GraphPropagation,
-    AdaptiveGraphPropagation,
-    GraphDistillationLoss
-)
+from .graph_propagation import AdaptiveGraphPropagation
 
 # Complete Model
 from .pfmgcd_model import PF_MGCD
 
-# Teacher Network
-from .teacher_network import (
-    TeacherNetwork,
-    DualModalityTeacher,
-    create_teacher_network
-)
-
 # Loss Functions
 from .loss import (
     MultiPartIDLoss,
+    GraphDistillationLoss,
     OrthogonalLoss,
     ModalityLoss,
-    GraphDistillationLoss,
     TotalLoss
 )
-
-# Classifiers (如果存在)
-try:
-    from .classifier import MultiPartClassifier
-except ImportError:
-    pass
 
 
 __all__ = [
@@ -51,7 +34,6 @@ __all__ = [
     'PartPooling',
     
     # ISG-DM
-    'ISG_DM',
     'MultiPartISG_DM',
     
     # Memory
@@ -59,20 +41,14 @@ __all__ = [
     'AdaptiveMemoryBank',
     
     # Graph
-    'GraphPropagation',
     'AdaptiveGraphPropagation',
-    'GraphDistillationLoss',
     
     # Complete Model
     'PF_MGCD',
     
-    # Teacher
-    'TeacherNetwork',
-    'DualModalityTeacher',
-    'create_teacher_network',
-    
     # Loss
     'MultiPartIDLoss',
+    'GraphDistillationLoss',
     'OrthogonalLoss',
     'ModalityLoss',
     'TotalLoss',

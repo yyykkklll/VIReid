@@ -1,10 +1,10 @@
 from __future__ import absolute_import
-from PIL import Image
-import numpy as np
+
 import random
+
 import math
-import torchvision.transforms as transforms
 import torch
+import torchvision.transforms as transforms
 
 normalize = transforms.Normalize(
     mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])

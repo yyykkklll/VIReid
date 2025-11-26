@@ -55,19 +55,45 @@ class MultiPartMemoryBank(nn.Module):
         K = len(part_features)
         assert K == self.num_parts, f"Expected {self.num_parts} parts, got {K}"
         
+        # [关键修复] 检查label范围
+        unique_labels = labels.unique()
+        max_label = unique_labels.max().item()
+        min_label = unique_labels.min().item()
+        
+        print(f"  Label range in batch: [{min_label}, {max_label}]")
+        print(f"  Memory bank size: [K={K}, N={self.num_identities}, D={self.feature_dim}]")
+        
+        # 如果label超出范围，抛出错误
+        if max_label >= self.num_identities:
+            raise ValueError(
+                f"\n{'='*60}\n"
+                f"ERROR: Label out of range!\n"
+                f"  Max label in data: {max_label}\n"
+                f"  Memory bank size: {self.num_identities}\n"
+                f"  This error occurs because the dataloader did not properly\n"
+                f"  map the original IDs to continuous indices [0, N-1].\n"
+                f"  Please check 'dataloader_adapter.py' to ensure label mapping.\n"
+                f"{'='*60}"
+            )
+        
         for k in range(K):
             features = part_features[k]  # [B, D]
             features = F.normalize(features, dim=1)
             
             # 按标签聚合特征 (取平均)
-            for label in labels.unique():
+            for label in unique_labels:
+                label_idx = label.item()
                 mask = (labels == label)
                 if mask.sum() > 0:
                     mean_feature = features[mask].mean(dim=0)  # [D]
                     # 使用 clone() 避免 inplace 操作
                     normalized_feature = F.normalize(mean_feature.unsqueeze(0), dim=1).squeeze(0)
-                    self.memory[k, label] = normalized_feature.clone()
-                    self.initialized[label] = True
+                    self.memory[k, label_idx] = normalized_feature.clone()
+                    self.initialized[label_idx] = True
+        
+        num_initialized = self.initialized.sum().item()
+        print(f"  Initialized: {num_initialized}/{self.num_identities} identities")
+
     
     @torch.no_grad()
     def update_memory(self, part_features, labels):

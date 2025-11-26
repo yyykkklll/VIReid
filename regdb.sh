@@ -1,44 +1,26 @@
 #!/bin/bash
 
-# RegDB Dataset Training Script for PF-MGCD
-
 python main.py \
-    --dataset regdb \
-    --data-path ./datasets \
-    --mode train \
-    --gpu 0 \
-    --seed 42 \
-    --num-parts 6 \
-    --feature-dim 256 \
-    --memory-momentum 0.9 \
-    --temperature 3.0 \
-    --top-k 5 \
-    --pretrained \
-    --num-workers 4 \
-    --pid-numsample 4 \
-    --batch-pidnum 5 \
-    --test-batch 64 \
-    --img-w 144 \
-    --img-h 288 \
-    --relabel \
-    --search-mode all \
-    --gall-mode single \
-    --trial 1 \
-    --lambda-graph 1.0 \
-    --lambda-orth 0.1 \
-    --lambda-mod 0.5 \
-    --label-smoothing 0.1 \
-    --total-epoch 120 \
-    --warmup-epochs 10 \
-    --batch-size 20 \
-    --lr 0.00045 \
-    --weight-decay 5e-4 \
-    --grad-clip 5.0 \
-    --lr-scheduler step \
-    --lr-step 40 \
-    --lr-gamma 0.1 \
-    --init-memory \
-    --save-dir ./checkpoints/regdb \
-    --log-dir ./logs/regdb \
-    --save-epoch 10 \
-    --eval-epoch 10
+  --dataset regdb \
+  --mode train \
+  --gpu 0 \
+  --data-path ./datasets \
+  --num-parts 6 \
+  --feature-dim 256 \
+  --batch-size 32 \
+  --num-workers 4 \
+  --pid-numsample 4 \
+  --batch-pidnum 8 \
+  --test-batch 64 \
+  --total-epoch 120 \
+  --warmup-epochs 10 \
+  --lr 0.00045 \
+  --lambda-graph 1.0 \
+  --lambda-orth 0.1 \
+  --lambda-mod 0.5 \
+  --save-epoch 10 \
+  --eval-epoch 10 \
+  --init-memory \
+  --pool-parts \
+  --distance-metric cosine \
+  --trial 1

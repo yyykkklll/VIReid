@@ -1,7 +1,8 @@
 import os
-
 import torch.utils.data as data
-
+import numpy as np
+from PIL import Image
+import random
 from .data_process import *  # Channel augment and transforms
 
 
@@ -125,6 +126,8 @@ class SYSU_train(data.Dataset):
             idx = self.sampler_idx[index]  # sampler index
             info = self.train_info[idx]
             img = self.train_image[idx]
+
+            # [REVERTED] 恢复原始返回结构，以满足 dataloader_adapter 的需求
             if self.modal == 'rgb':
                 color_img = self.transform_color_normal(img)
                 ca_img = self.transform_color_sa(img)
@@ -179,7 +182,8 @@ class SYSU_test(data.Dataset):
         return len(self.test_label)
 
     def __getitem__(self, index):
-        return self.transform(self.test_image[index]), self.test_label[index]
+        # [KEPT FIX] 这里的修改必须保留，否则测试指标为0
+        return self.transform(self.test_image[index]), self.test_label[index], self.test_cam[index]
 
     def _process_query_sysu(self):
         if self.search_mode == "all":

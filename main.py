@@ -1,5 +1,6 @@
 """
 Main Entry Point for PF-MGCD Training and Testing
+支持多种ResNet骨干网络 + A100优化
 """
 
 import os
@@ -54,7 +55,16 @@ def parse_args():
     parser.add_argument('--top-k', type=int, default=5,
                         help='图传播的Top-K邻居数量')
     parser.add_argument('--pretrained', action='store_true',
-                        help='使用预训练的ResNet50')
+                        help='使用预训练的ResNet')
+    
+    # [新增] 骨干网络选择
+    parser.add_argument('--backbone', type=str, default='resnet50',
+                        choices=['resnet50', 'resnet101', 'resnet152'],
+                        help='ResNet骨干网络类型')
+    
+    # [新增] 混合精度训练
+    parser.add_argument('--amp', action='store_true',
+                        help='启用自动混合精度训练(A100推荐)')
     
     # ===== 原有数据集参数 (兼容原代码) =====
     parser.add_argument('--num-classes', type=int, default=395,
@@ -92,6 +102,8 @@ def parse_args():
                         help='正交损失权重')
     parser.add_argument('--lambda-mod', type=float, default=0.5,
                         help='模态损失权重')
+    parser.add_argument('--lambda-triplet', type=float, default=0.5,
+                        help='Triplet损失权重')
     parser.add_argument('--label-smoothing', type=float, default=0.1,
                         help='标签平滑系数')
     
@@ -179,14 +191,18 @@ def main():
     print(f"{'Dataset':<20}: {args.dataset}")
     print(f"{'Mode':<20}: {args.mode}")
     print(f"{'Device':<20}: {device}")
+    print(f"{'Backbone':<20}: {args.backbone.upper()}")  # 新增
+    print(f"{'Mixed Precision':<20}: {'Enabled' if args.amp else 'Disabled'}")  # 新增
     print(f"{'Num Parts':<20}: {args.num_parts}")
     print(f"{'Feature Dim':<20}: {args.feature_dim}")
     print(f"{'Total Epochs':<20}: {args.total_epoch}")
     print(f"{'Warmup Epochs':<20}: {args.warmup_epochs}")
     print(f"{'Learning Rate':<20}: {args.lr}")
+    print(f"{'Batch Size':<20}: {args.batch_size}")
     print(f"{'Lambda Graph':<20}: {args.lambda_graph}")
     print(f"{'Lambda Orth':<20}: {args.lambda_orth}")
     print(f"{'Lambda Mod':<20}: {args.lambda_mod}")
+    print(f"{'Lambda Triplet':<20}: {args.lambda_triplet}")  # 新增
     print("="*70 + "\n")
     
     # 创建模型
@@ -200,11 +216,16 @@ def main():
         memory_momentum=args.memory_momentum,
         temperature=args.temperature,
         top_k=args.top_k,
-        pretrained=args.pretrained
+        pretrained=args.pretrained,
+        backbone=args.backbone  # 传入backbone参数
     ).to(device)
     
+    total_params = sum(p.numel() for p in model.parameters()) / 1e6
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6
+    
     print(f"Model created successfully!")
-    print(f"Total parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M\n")
+    print(f"Total parameters: {total_params:.2f}M")
+    print(f"Trainable parameters: {trainable_params:.2f}M\n")
     
     # 训练模式
     if args.mode == 'train':
@@ -234,9 +255,20 @@ def main():
         else:
             scheduler = None
         
+        # 获取 dataset_obj 用于验证
+        if args.dataset == 'sysu':
+            from datasets.sysu import SYSU
+            dataset_obj = SYSU(args)
+        elif args.dataset == 'regdb':
+            from datasets.regdb import RegDB
+            dataset_obj = RegDB(args)
+        elif args.dataset == 'llcm':
+            from datasets.llcm import LLCM
+            dataset_obj = LLCM(args)
+        
         # 开始训练
         from task.train import train
-        train(model, train_loader, val_loader, optimizer, scheduler, args, device)
+        train(model, train_loader, dataset_obj, optimizer, scheduler, args, device)
     
     # 测试模式
     elif args.mode == 'test':
@@ -246,11 +278,19 @@ def main():
             model.load_state_dict(checkpoint['model_state_dict'])
             print("Model loaded successfully!\n")
         
-        from datasets.dataloader_adapter import get_dataloader
-        _, test_loader = get_dataloader(args)
+        # 获取 dataset_obj
+        if args.dataset == 'sysu':
+            from datasets.sysu import SYSU
+            dataset_obj = SYSU(args)
+        elif args.dataset == 'regdb':
+            from datasets.regdb import RegDB
+            dataset_obj = RegDB(args)
+        elif args.dataset == 'llcm':
+            from datasets.llcm import LLCM
+            dataset_obj = LLCM(args)
         
         from task.test import test
-        test(model, test_loader, args, device)
+        test(model, dataset_obj.query_loader, dataset_obj.gallery_loaders, args, device)
 
 
 if __name__ == '__main__':
