@@ -12,7 +12,7 @@ python main.py \
   --gpu 0 \
   --data-path ./datasets \
   \
-  --backbone resnet50 \
+  --backbone resnet101 \
   --pretrained \
   --num-parts 6 \
   --feature-dim 256 \
@@ -58,7 +58,7 @@ echo "RegDB Training (3090/Standard)"
 echo "======================================"
 echo "Configuration:"
 echo "  • GPU: 3090/V100"
-echo "  • Backbone: ResNet50 (pretrained)"
+echo "  • Backbone: ResNet101 (pretrained)"
 echo "  • Epochs: 80"
 echo "  • Batch Size: 32"
 echo "  • Learning Rate: 0.0008 (step decay at epoch 40)"

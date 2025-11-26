@@ -1,6 +1,7 @@
 """
 Training Script for PF-MGCD
 支持混合精度训练 + 改进的loss计算 + 自动目录管理
+兼容 PyTorch 1.6+ (包括旧版和新版)
 """
 
 import os
@@ -8,10 +9,17 @@ import time
 import logging
 import torch
 import torch.nn as nn
-from torch.amp import autocast, GradScaler
 from tqdm import tqdm
 from models.loss import TotalLoss
 from task.test import test
+
+# [修复1] 兼容不同PyTorch版本的AMP导入
+try:
+    # PyTorch >= 1.12 (新版API)
+    from torch.amp import autocast, GradScaler
+except ImportError:
+    # PyTorch < 1.12 (旧版API)
+    from torch.cuda.amp import autocast, GradScaler
 
 
 def setup_logger(log_dir, log_file='train.log'):
@@ -85,7 +93,14 @@ def train_one_epoch(model, train_loader, criterion, optimizer, scaler, device, e
         
         # 混合精度训练
         if args.amp and scaler is not None:
-            with autocast(device_type='cuda'):
+            # [修复2] 兼容旧版autocast (不支持device_type参数)
+            try:
+                amp_context = autocast(device_type='cuda')
+            except TypeError:
+                # 旧版PyTorch不支持device_type参数
+                amp_context = autocast()
+            
+            with amp_context:
                 # 前向传播
                 outputs = model(images, labels=labels, modality_labels=modality_labels)
                 
@@ -212,8 +227,15 @@ def train(model, train_loader, dataset_obj, optimizer, scheduler, args, device):
         use_adaptive_weight=False
     ).to(device)
     
-    # 使用新的GradScaler API
-    scaler = GradScaler(device='cuda') if args.amp else None
+    # [修复3] 兼容不同版本的GradScaler初始化
+    scaler = None
+    if args.amp:
+        try:
+            # 新版API (支持device参数)
+            scaler = GradScaler(device='cuda')
+        except TypeError:
+            # 旧版API (不支持device参数)
+            scaler = GradScaler()
     
     # 最佳模型记录
     best_rank1 = 0.0
