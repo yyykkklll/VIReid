@@ -1,41 +1,42 @@
 #!/bin/bash
 
 # ====================================================================
-# SYSU-MM01 Training Script - Standard Configuration (3090/V100)
-# Expected Performance: Rank-1 ~50-60%, mAP ~45-55%
-# Training Time: ~7 hours (100 epochs on 3090)
+# LLCM Training Script - A100 Optimized
 # ====================================================================
 
+# 切换到项目根目录
+cd "$(dirname "$0")/.." || exit
+
 python main.py \
-  --dataset sysu \
+  --dataset llcm \
   --mode train \
   --gpu 0 \
   --data-path ./datasets \
   \
-  --backbone resnet50 \
+  --backbone resnet101 \
   --pretrained \
+  --amp \
   --num-parts 6 \
   --feature-dim 256 \
   \
-  --batch-size 32 \
-  --num-workers 4 \
-  --pid-numsample 4 \
+  --batch-size 48 \
+  --num-workers 8 \
+  --pid-numsample 6 \
   --batch-pidnum 8 \
-  --test-batch 64 \
+  --test-batch 128 \
   \
   --img-w 144 \
   --img-h 288 \
   --relabel \
   --search-mode all \
   --gall-mode single \
+  --test-mode v2t \
   \
-  --total-epoch 100 \
+  --total-epoch 120 \
   --warmup-epochs 10 \
   --lr 0.0006 \
   --weight-decay 5e-4 \
-  --lr-scheduler step \
-  --lr-step 50 \
-  --lr-gamma 0.1 \
+  --lr-scheduler cosine \
   \
   --lambda-graph 0.5 \
   --lambda-orth 0.1 \
@@ -51,22 +52,21 @@ python main.py \
   --pool-parts \
   --distance-metric cosine \
   \
-  --save-dir ./checkpoints/sysu_3090 \
-  --log-dir ./logs/sysu_3090
+  --save-dir ./checkpoints/llcm_a100 \
+  --log-dir ./logs/llcm_a100
 
 echo ""
 echo "======================================"
-echo "SYSU-MM01 Training (3090/Standard)"
+echo "LLCM A100 Training"
 echo "======================================"
 echo "Configuration:"
-echo "  • GPU: 3090/V100"
-echo "  • Backbone: ResNet50 (pretrained)"
-echo "  • Epochs: 100"
-echo "  • Batch Size: 32"
-echo "  • Learning Rate: 0.0006 (step decay at epoch 50)"
-echo "  • Search Mode: all-search"
+echo "  • Backbone: ResNet101 (pretrained)"
+echo "  • Mixed Precision: Enabled"
+echo "  • Epochs: 120"
+echo "  • Batch Size: 48"
+echo "  • Learning Rate: 0.0006 (cosine decay)"
 echo "  • Expected Performance:"
-echo "    - Epoch 30: Rank-1 ~25-35%"
-echo "    - Epoch 60: Rank-1 ~40-50%"
-echo "    - Epoch 100: Rank-1 ~50-60%"
+echo "    - Epoch 40: Rank-1 ~35-45%"
+echo "    - Epoch 80: Rank-1 ~50-60%"
+echo "    - Epoch 120: Rank-1 ~60-75%"
 echo "======================================"
