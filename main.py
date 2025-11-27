@@ -1,6 +1,6 @@
 """
 Main Entry Point for PF-MGCD Training and Testing
-支持多种ResNet骨干网络 + A100优化 + 兼容不同PyTorch版本
+支持多种ResNet骨干网络 + A100优化
 """
 
 import os
@@ -125,8 +125,8 @@ def parse_args():
     parser.add_argument('--lr-scheduler', type=str, default='step',
                         choices=['step', 'cosine', 'plateau'],
                         help='学习率调度器')
-    parser.add_argument('--lr-step', type=int, nargs='+', default=[40],
-                        help='StepLR的步长 (支持多个值，如: 60 90)')
+    parser.add_argument('--lr-step', type=int, default=40,
+                        help='StepLR的步长')
     parser.add_argument('--lr-gamma', type=float, default=0.1,
                         help='StepLR的衰减系数')
     
@@ -191,8 +191,8 @@ def main():
     print(f"{'Dataset':<20}: {args.dataset}")
     print(f"{'Mode':<20}: {args.mode}")
     print(f"{'Device':<20}: {device}")
-    print(f"{'Backbone':<20}: {args.backbone.upper()}")
-    print(f"{'Mixed Precision':<20}: {'Enabled' if args.amp else 'Disabled'}")
+    print(f"{'Backbone':<20}: {args.backbone.upper()}")  # 新增
+    print(f"{'Mixed Precision':<20}: {'Enabled' if args.amp else 'Disabled'}")  # 新增
     print(f"{'Num Parts':<20}: {args.num_parts}")
     print(f"{'Feature Dim':<20}: {args.feature_dim}")
     print(f"{'Total Epochs':<20}: {args.total_epoch}")
@@ -202,7 +202,7 @@ def main():
     print(f"{'Lambda Graph':<20}: {args.lambda_graph}")
     print(f"{'Lambda Orth':<20}: {args.lambda_orth}")
     print(f"{'Lambda Mod':<20}: {args.lambda_mod}")
-    print(f"{'Lambda Triplet':<20}: {args.lambda_triplet}")
+    print(f"{'Lambda Triplet':<20}: {args.lambda_triplet}")  # 新增
     print("="*70 + "\n")
     
     # 创建模型
@@ -217,7 +217,7 @@ def main():
         temperature=args.temperature,
         top_k=args.top_k,
         pretrained=args.pretrained,
-        backbone=args.backbone
+        backbone=args.backbone  # 传入backbone参数
     ).to(device)
     
     total_params = sum(p.numel() for p in model.parameters()) / 1e6
@@ -240,57 +240,20 @@ def main():
             weight_decay=args.weight_decay
         )
         
-        # ===== [关键修复] 创建学习率调度器 - 支持list和int格式 =====
+        # 创建学习率调度器
         if args.lr_scheduler == 'step':
-            # 处理lr_step参数（可能是int或list）
-            if isinstance(args.lr_step, list):
-                if len(args.lr_step) == 1:
-                    # 单步长：使用StepLR
-                    scheduler = torch.optim.lr_scheduler.StepLR(
-                        optimizer,
-                        step_size=args.lr_step[0],  # 取第一个元素
-                        gamma=args.lr_gamma
-                    )
-                    print(f"  Scheduler: StepLR (step_size={args.lr_step[0]})")
-                else:
-                    # 多步长：使用MultiStepLR
-                    scheduler = torch.optim.lr_scheduler.MultiStepLR(
-                        optimizer,
-                        milestones=args.lr_step,  # 直接传入列表
-                        gamma=args.lr_gamma
-                    )
-                    print(f"  Scheduler: MultiStepLR (milestones={args.lr_step})")
-            else:
-                # 兼容旧格式（直接是int）
-                scheduler = torch.optim.lr_scheduler.StepLR(
-                    optimizer,
-                    step_size=args.lr_step,
-                    gamma=args.lr_gamma
-                )
-                print(f"  Scheduler: StepLR (step_size={args.lr_step})")
-        
+            scheduler = torch.optim.lr_scheduler.StepLR(
+                optimizer, 
+                step_size=args.lr_step, 
+                gamma=args.lr_gamma
+            )
         elif args.lr_scheduler == 'cosine':
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                 optimizer,
-                T_max=args.total_epoch,
-                eta_min=0
+                T_max=args.total_epoch
             )
-            print("  Scheduler: CosineAnnealingLR")
-        
-        elif args.lr_scheduler == 'plateau':
-            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                optimizer,
-                mode='max',
-                factor=args.lr_gamma,
-                patience=10
-            )
-            print("  Scheduler: ReduceLROnPlateau")
-        
         else:
             scheduler = None
-            print("  Scheduler: None")
-        
-        print()  # 空行
         
         # 获取 dataset_obj 用于验证
         if args.dataset == 'sysu':

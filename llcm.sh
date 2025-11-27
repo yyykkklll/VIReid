@@ -12,7 +12,7 @@ python main.py \
   --gpu 0 \
   --data-path ./datasets \
   \
-  --backbone resnet101 \
+  --backbone resnet50 \
   --pretrained \
   --num-parts 6 \
   --feature-dim 256 \
@@ -35,7 +35,7 @@ python main.py \
   --lr 0.0005 \
   --weight-decay 5e-4 \
   --lr-scheduler step \
-  --lr-step 60 90 \
+  --lr-step 60,90 \
   --lr-gamma 0.1 \
   \
   --lambda-graph 0.5 \
@@ -61,7 +61,7 @@ echo "LLCM Training (3090/Standard)"
 echo "======================================"
 echo "Configuration:"
 echo "  • GPU: 3090/V100"
-echo "  • Backbone: ResNet101 (pretrained)"
+echo "  • Backbone: ResNet50 (pretrained)"
 echo "  • Epochs: 120"
 echo "  • Batch Size: 32"
 echo "  • Learning Rate: 0.0005 (step decay at epoch 60, 90)"
