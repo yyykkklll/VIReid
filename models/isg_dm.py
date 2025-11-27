@@ -1,6 +1,7 @@
 """
 ISG-DM v2 - Enhanced Instance Statistics Guided Disentanglement Module
-改进版实例统计引导解耦模块：增强特征判别性
+改进版实例统计引导解耦模块：基于物理统计量的解耦
+[修复版] 添加残差连接，防止特征在小分辨率下被过度归一化破坏
 """
 
 import torch
@@ -9,7 +10,11 @@ import torch.nn.functional as F
 
 
 class ISG_DM(nn.Module):
-    """改进版ISG-DM：多层特征提取 + 轻量级注意力"""
+    """
+    改进版ISG-DM (带有残差修正)
+    1. 模态/风格提取：基于Instance Norm统计量 (Mean, Std)
+    2. 身份/内容提取：Instance Norm去风格 + SE-Gate注意力补偿 + 原始特征残差
+    """
     
     def __init__(self, input_dim=2048, id_dim=256, mod_dim=256):
         super(ISG_DM, self).__init__()
@@ -17,48 +22,37 @@ class ISG_DM(nn.Module):
         self.id_dim = id_dim
         self.mod_dim = mod_dim
         
-        # [改进1] 多层身份特征提取（渐进式降维）
-        self.identity_fc = nn.Sequential(
-            # 第一层：2048 -> 1024
-            nn.Linear(input_dim, input_dim // 2),
-            nn.BatchNorm1d(input_dim // 2),
+        # A. 模态/风格特征提取器
+        # 输入：[Mean, Std] -> 2 * input_dim
+        self.style_mlp = nn.Sequential(
+            nn.Linear(input_dim * 2, input_dim),
+            nn.BatchNorm1d(input_dim),
             nn.ReLU(inplace=True),
-            nn.Dropout(0.3),  # 降低dropout
-            
-            # 第二层：1024 -> 512
-            nn.Linear(input_dim // 2, input_dim // 4),
-            nn.BatchNorm1d(input_dim // 4),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.2),
-            
-            # 第三层：512 -> 256
-            nn.Linear(input_dim // 4, id_dim),
-            nn.BatchNorm1d(id_dim)
+            nn.Linear(input_dim, mod_dim),
+            nn.BatchNorm1d(mod_dim)
         )
         
-        # [改进2] 轻量级通道注意力（类似SENet但更简单）
-        self.channel_attention = nn.Sequential(
-            nn.Linear(input_dim, input_dim // 16),
+        # B. 身份/内容特征提取器
+        # B.1 SE-Gate 注意力 (输入是GAP后的特征)
+        reduction_dim = input_dim // 16
+        self.se_gate = nn.Sequential(
+            nn.Linear(input_dim, reduction_dim),
             nn.ReLU(inplace=True),
-            nn.Linear(input_dim // 16, input_dim),
+            nn.Linear(reduction_dim, input_dim),
             nn.Sigmoid()
         )
         
-        # 模态特征提取（保持简单）
-        self.modality_fc = nn.Sequential(
-            nn.Linear(input_dim, input_dim // 2),
-            nn.BatchNorm1d(input_dim // 2),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.3),
-            nn.Linear(input_dim // 2, mod_dim),
-            nn.BatchNorm1d(mod_dim)
+        # B.2 身份特征映射 (降维)
+        self.id_fc = nn.Sequential(
+            nn.Linear(input_dim, id_dim),
+            nn.BatchNorm1d(id_dim)
         )
         
         # 显式权重初始化
         self._init_weights()
     
     def _init_weights(self):
-        """Kaiming初始化，确保训练稳定"""
+        """Kaiming初始化"""
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
@@ -77,17 +71,41 @@ class ISG_DM(nn.Module):
             f_mod: 模态特征 [B, mod_dim]
         """
         B, C, H, W = part_feature.size()
+        eps = 1e-5
         
-        # 全局平均池化
-        pooled = F.adaptive_avg_pool2d(part_feature, 1).view(B, C)  # [B, C]
+        # 1. 提取统计量 (Modality/Style Extraction)
+        # 计算每个实例每个通道的均值和方差 (在H, W维度上)
+        # x_var, x_mean: [B, C, 1, 1]
+        x_var, x_mean = torch.var_mean(part_feature, dim=(2, 3), keepdim=True, unbiased=False)
+        x_std = torch.sqrt(x_var + eps)
         
-        # [改进] 通道注意力加权
-        att_weights = self.channel_attention(pooled)  # [B, C]
-        pooled_weighted = pooled * att_weights
+        # 构建模态特征输入：拼接 Mean 和 Std
+        mean_flat = x_mean.view(B, C)
+        std_flat = x_std.view(B, C)
+        style_input = torch.cat([mean_flat, std_flat], dim=1) # [B, 2C]
         
-        # 提取身份特征和模态特征
-        f_id = self.identity_fc(pooled_weighted)
-        f_mod = self.modality_fc(pooled)
+        # 生成模态特征
+        f_mod = self.style_mlp(style_input)
+        
+        # 2. 提取身份特征 (Identity/Content Extraction)
+        # 2.1 Instance Normalization 去除风格
+        # 注意：在极小分辨率(如4x8)下，单纯的IN会破坏纹理结构
+        f_norm = (part_feature - x_mean) / x_std # [B, C, H, W]
+        
+        # 2.2 SE-Gate 通道注意力
+        # 对归一化后的特征做GAP，作为SE模块输入
+        f_norm_gap = F.adaptive_avg_pool2d(f_norm, 1).view(B, C)
+        w = self.se_gate(f_norm_gap) # [B, C]
+        
+        # 2.3 [关键修复] 残差连接 + 注意力加权
+        # 原始方案：f_id_raw = f_norm * w
+        # 修复方案：将去风格化的特征作为“修正项”加回到原始特征上，防止信息丢失
+        # 或者理解为：我们希望 f_norm 指导网络关注哪些通道(w)，但保留原始 spatial info
+        f_id_raw = part_feature + (f_norm * w.view(B, C, 1, 1))
+        
+        # 2.4 最终池化与降维
+        f_id_vec = F.adaptive_avg_pool2d(f_id_raw, 1).view(B, C)
+        f_id = self.id_fc(f_id_vec)
         
         return f_id, f_mod
 

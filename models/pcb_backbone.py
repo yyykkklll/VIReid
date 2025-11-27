@@ -1,6 +1,7 @@
 """
 PCB Backbone - Part-based Convolutional Baseline
 支持ResNet50/101/152多种骨干网络
+[修复版] 适配新版 torchvision API，消除 pretrained 参数警告
 """
 
 import torch
@@ -67,34 +68,32 @@ class PCBBackbone(nn.Module):
         print(f"  Pretrained: {pretrained}")
     
     def _load_resnet(self, backbone, pretrained):
-        """加载指定的ResNet模型"""
+        """加载指定的ResNet模型 (修复警告版)"""
         
+        # 辅助函数：根据配置获取 weights 参数
+        def get_weights(model_weights_enum):
+            if WEIGHTS_AVAILABLE:
+                return model_weights_enum if pretrained else None
+            return None
+
+        # 根据 Backbone 类型加载
         if backbone == 'resnet50':
-            if pretrained:
-                if WEIGHTS_AVAILABLE:
-                    return models.resnet50(weights=ResNet50_Weights.IMAGENET1K_V1)
-                else:
-                    return models.resnet50(pretrained=True)
+            if WEIGHTS_AVAILABLE:
+                return models.resnet50(weights=get_weights(ResNet50_Weights.IMAGENET1K_V1))
             else:
-                return models.resnet50(pretrained=False)
+                return models.resnet50(pretrained=pretrained)
         
         elif backbone == 'resnet101':
-            if pretrained:
-                if WEIGHTS_AVAILABLE:
-                    return models.resnet101(weights=ResNet101_Weights.IMAGENET1K_V1)
-                else:
-                    return models.resnet101(pretrained=True)
+            if WEIGHTS_AVAILABLE:
+                return models.resnet101(weights=get_weights(ResNet101_Weights.IMAGENET1K_V1))
             else:
-                return models.resnet101(pretrained=False)
+                return models.resnet101(pretrained=pretrained)
         
         elif backbone == 'resnet152':
-            if pretrained:
-                if WEIGHTS_AVAILABLE:
-                    return models.resnet152(weights=ResNet152_Weights.IMAGENET1K_V1)
-                else:
-                    return models.resnet152(pretrained=True)
+            if WEIGHTS_AVAILABLE:
+                return models.resnet152(weights=get_weights(ResNet152_Weights.IMAGENET1K_V1))
             else:
-                return models.resnet152(pretrained=False)
+                return models.resnet152(pretrained=pretrained)
         
         else:
             raise ValueError(f"Unsupported backbone: {backbone}. "
@@ -103,9 +102,6 @@ class PCBBackbone(nn.Module):
     def _modify_layer4_stride(self, layer4):
         """
         修改Layer4的stride，保持特征图分辨率
-        
-        对于ReID任务，保持更高的空间分辨率很重要，
-        因此将Layer4的stride从2改为1
         """
         # Layer4的第一个bottleneck
         layer4[0].conv2.stride = (1, 1)  # 原本是(2, 2)
@@ -119,15 +115,11 @@ class PCBBackbone(nn.Module):
     def forward(self, x):
         """
         前向传播
-        
         Args:
             x: 输入图像 [B, 3, H, W]
-               典型尺寸: [B, 3, 288, 144]
-        
         Returns:
-            part_features: List of K个部件特征 [B, 2048, h_k, w]
-                          对于288x144输入，每个部件约为 [B, 2048, 3, 9]
-            global_feature: 全局特征图 [B, 2048, 18, 9]
+            part_features: List of K个部件特征
+            global_feature: 全局特征图
         """
         # ResNet特征提取
         x = self.conv1(x)      # [B, 64, H/2, W/2]
@@ -151,12 +143,6 @@ class PCBBackbone(nn.Module):
     def _horizontal_split(self, feature_map):
         """
         在高度方向均匀切分特征图
-        
-        Args:
-            feature_map: [B, C, H, W]
-        
-        Returns:
-            parts: List of K个张量 [B, C, H/K, W]
         """
         B, C, H, W = feature_map.size()
         
@@ -196,17 +182,8 @@ class PCBBackbone(nn.Module):
 
 
 class PartPooling(nn.Module):
-    """
-    部件池化模块
-    对每个部件特征进行全局平均池化 + 降维
-    """
-    
+    """部件池化模块"""
     def __init__(self, input_dim=2048, output_dim=256):
-        """
-        Args:
-            input_dim: 输入特征维度 (ResNet输出2048)
-            output_dim: 输出特征维度 (降维后)
-        """
         super(PartPooling, self).__init__()
         self.gap = nn.AdaptiveAvgPool2d(1)
         
@@ -218,64 +195,12 @@ class PartPooling(nn.Module):
         )
     
     def forward(self, part_features):
-        """
-        Args:
-            part_features: List of K个部件特征 [B, C, H_k, W]
-        
-        Returns:
-            pooled_features: List of K个向量 [B, output_dim]
-        """
         pooled_features = []
-        
         for part in part_features:
             # 全局平均池化
             pooled = self.gap(part)  # [B, C, 1, 1]
             pooled = pooled.view(pooled.size(0), -1)  # [B, C]
-            
             # 降维
             pooled = self.reduction(pooled)  # [B, output_dim]
             pooled_features.append(pooled)
-        
         return pooled_features
-
-
-def test_backbone():
-    """测试不同backbone的输出"""
-    print("=" * 70)
-    print("Testing PCB Backbones")
-    print("=" * 70)
-    
-    x = torch.randn(2, 3, 288, 144)  # [B, C, H, W]
-    
-    for backbone in ['resnet50', 'resnet101', 'resnet152']:
-        print(f"\n{'='*70}")
-        print(f"Testing {backbone.upper()}")
-        print(f"{'='*70}")
-        
-        model = PCBBackbone(num_parts=6, pretrained=False, backbone=backbone)
-        
-        # 参数统计
-        params = model.get_params_count()
-        print(f"\nParameters:")
-        print(f"  Total: {params['total']/1e6:.2f}M")
-        print(f"  Trainable: {params['trainable']/1e6:.2f}M")
-        
-        # 前向传播
-        part_features, global_feature = model(x)
-        
-        print(f"\nOutput shapes:")
-        print(f"  Global feature: {global_feature.shape}")
-        print(f"  Num parts: {len(part_features)}")
-        print(f"  Each part: {part_features[0].shape}")
-        
-        # 估算FLOPs (简单估计)
-        from thop import profile
-        try:
-            flops, _ = profile(model, inputs=(x,), verbose=False)
-            print(f"  FLOPs: {flops/1e9:.2f}G")
-        except:
-            print(f"  FLOPs: N/A (install thop: pip install thop)")
-
-
-if __name__ == '__main__':
-    test_backbone()
