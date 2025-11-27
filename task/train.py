@@ -1,7 +1,9 @@
 """
-Training Script for PF-MGCD
-支持混合精度训练 + Mean Teacher EMA 更新 + 自动目录管理
-[修复] 解决 EMA 更新类型错误 + 关闭控制台 INFO 日志打印
+PF-MGCD 训练脚本
+功能：
+1. 支持混合精度训练 (AMP)，兼容 PyTorch 新旧版本 (2.0+ 至 2.5+)
+2. 实现 Mean Teacher 策略的 EMA (指数移动平均) 更新
+3. 自动管理日志记录与模型保存
 """
 
 import os
@@ -9,31 +11,51 @@ import time
 import logging
 import torch
 import torch.nn as nn
-from torch.amp import autocast, GradScaler
 from tqdm import tqdm
 from models.loss import TotalLoss
 from task.test import test
 
+# =============================================================================
+# PyTorch 版本兼容性处理 (AMP 模块)
+# PyTorch 2.4+ 将 GradScaler 移至 torch.amp
+# 旧版本 (如 2.0.1) GradScaler 位于 torch.cuda.amp
+# =============================================================================
+try:
+    # 尝试导入新版本 PyTorch (>=2.4) 的路径
+    from torch.amp import autocast, GradScaler
+except ImportError:
+    # 回退到旧版本 PyTorch (<2.4) 的路径
+    from torch.cuda.amp import GradScaler
+    from torch import autocast  # torch.autocast 支持 device_type 参数
+
 
 def setup_logger(log_dir, log_file='train.log'):
-    """配置日志记录器"""
+    """
+    配置并初始化日志记录器
+    
+    Args:
+        log_dir (str): 日志保存目录
+        log_file (str): 日志文件名
+        
+    Returns:
+        logger: 配置好的 logging 对象
+    """
     os.makedirs(log_dir, exist_ok=True)
     log_path = os.path.join(log_dir, log_file)
     
-    # 覆盖旧日志
+    # 如果日志文件已存在，清空内容以便重新记录
     if os.path.exists(log_path):
         open(log_path, 'w').close()
     
-    # 创建 logger
     logger = logging.getLogger(__name__)
     logger.setLevel(logging.INFO)
-    logger.propagate = False  # 防止重复打印
+    logger.propagate = False
     
-    # 清除已有的 handlers
+    # 清理已存在的处理器，防止重复打印
     if logger.hasHandlers():
         logger.handlers.clear()
         
-    # 1. 文件处理器：记录所有 INFO 及以上日志 (保留详细日志在文件中)
+    # 1. 文件处理器：记录 INFO 及以上级别的所有详细日志
     fh = logging.FileHandler(log_path, mode='a')
     fh.setLevel(logging.INFO)
     fh_formatter = logging.Formatter(
@@ -43,8 +65,8 @@ def setup_logger(log_dir, log_file='train.log'):
     fh.setFormatter(fh_formatter)
     logger.addHandler(fh)
     
-    # 2. 控制台处理器：[关键修改] 只输出 WARNING 及以上日志
-    # 这样控制台就不会打印 INFO 信息 (如时间和状态分割线)，只显示进度条
+    # 2. 控制台处理器：仅输出 WARNING 及以上级别的关键信息
+    # 避免在控制台打印冗余的训练状态信息，保持进度条整洁
     ch = logging.StreamHandler()
     ch.setLevel(logging.WARNING) 
     ch_formatter = logging.Formatter('%(message)s') 
@@ -56,26 +78,36 @@ def setup_logger(log_dir, log_file='train.log'):
 
 def update_ema_variables(model, ema_model, alpha, global_step):
     """
-    Mean Teacher 核心：指数移动平均 (EMA) 更新
+    更新 Mean Teacher 的 EMA 模型参数
+    
+    Args:
+        model (nn.Module): 当前训练的学生模型 (Student)
+        ema_model (nn.Module): 教师模型 (Teacher)
+        alpha (float): 动量系数 (通常为 0.999)
+        global_step (int): 当前全局步数
     """
-    # 1. 更新参数 (Parameters)
+    # 更新可训练参数 (Weights/Bias)
     for ema_param, param in zip(ema_model.parameters(), model.parameters()):
         ema_param.data.mul_(alpha).add_(param.data, alpha=1 - alpha)
     
-    # 2. 更新缓冲区 (Buffers) - [已修复类型错误]
+    # 更新缓冲区 (Buffers, 如 BatchNorm 的 running_mean/var)
     for ema_buffer, buffer in zip(ema_model.buffers(), model.buffers()):
         if buffer.dtype.is_floating_point:
             ema_buffer.data.mul_(alpha).add_(buffer.data, alpha=1 - alpha)
         else:
+            # 对于非浮点类型的 buffer (如 num_batches_tracked)，直接复制
             ema_buffer.data.copy_(buffer.data)
 
 
 def train_one_epoch(model, train_loader, criterion, optimizer, scaler, device, epoch, logger, args, teacher_model=None):
-    """训练单个Epoch"""
+    """
+    执行单个 Epoch 的训练循环
+    """
     model.train()
     if teacher_model is not None:
         teacher_model.train()
     
+    # 初始化统计指标
     total_loss = 0
     loss_items = {
         'loss_id': 0, 'loss_triplet': 0, 'loss_graph': 0, 'loss_orth': 0, 'loss_mod': 0
@@ -84,12 +116,14 @@ def train_one_epoch(model, train_loader, criterion, optimizer, scaler, device, e
     pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{args.total_epoch}')
     
     for batch_idx, batch_data in enumerate(pbar):
-        # 1. 解包数据
+        # 1. 数据解包与迁移
         if len(batch_data) == 3:
+            # 常规格式: images, labels, camera_ids
             images, labels, cams = batch_data
             images, labels, cams = images.to(device), labels.to(device), cams.to(device)
             modality_labels = (cams >= 3).long()
         elif len(batch_data) == 6:
+            # 拼接格式: rgb_imgs, ir_imgs, ...
             rgb_imgs, ir_imgs, rgb_labels, ir_labels, rgb_cams, ir_cams = batch_data
             images = torch.cat([rgb_imgs, ir_imgs], dim=0).to(device)
             labels = torch.cat([rgb_labels, ir_labels], dim=0).to(device)
@@ -102,31 +136,37 @@ def train_one_epoch(model, train_loader, criterion, optimizer, scaler, device, e
         
         optimizer.zero_grad()
         
-        # 2. 前向传播
+        # 2. 前向传播与反向传播 (支持 AMP)
         if args.amp and scaler is not None:
+            # 开启混合精度上下文
             with autocast(device_type='cuda'):
                 outputs = model(images, labels=labels, modality_labels=modality_labels)
                 loss, loss_dict = criterion(outputs, labels, modality_labels, current_epoch=epoch)
             
+            # 缩放梯度并反向传播
             scaler.scale(loss).backward()
+            
             if args.grad_clip > 0:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            
             scaler.step(optimizer)
             scaler.update()
         else:
+            # 标准精度训练
             outputs = model(images, labels=labels, modality_labels=modality_labels)
             loss, loss_dict = criterion(outputs, labels, modality_labels, current_epoch=epoch)
             loss.backward()
+            
             if args.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             optimizer.step()
         
-        # 3. EMA 更新
+        # 3. Mean Teacher EMA 更新
         if teacher_model is not None:
             update_ema_variables(model, teacher_model, alpha=0.999, global_step=epoch*len(train_loader)+batch_idx)
         
-        # 4. 统计
+        # 4. 记录损失
         total_loss += loss.item()
         for key in loss_items.keys():
             if key in loss_dict:
@@ -138,16 +178,17 @@ def train_one_epoch(model, train_loader, criterion, optimizer, scaler, device, e
             'Graph': f'{loss_dict["loss_graph"]:.4f}'
         })
         
-        # 5. 记忆库更新
+        # 5. 更新记忆库 (Warmup 之后)
         if epoch >= args.warmup_epochs:
             with torch.no_grad():
+                # 如果有 Teacher 模型，优先使用 Teacher 的特征更新记忆库 (更加稳定)
                 if teacher_model is not None:
                     teacher_outputs = teacher_model(images)
                     model.memory_bank.update_memory(teacher_outputs['id_features'], labels)
                 else:
                     model.memory_bank.update_memory(outputs['id_features'], labels)
     
-    # 返回平均损失
+    # 计算并返回 Epoch 平均损失
     num_batches = len(train_loader)
     avg_loss_dict = {k: v / num_batches for k, v in loss_items.items()}
     avg_loss_dict['loss_total'] = total_loss / num_batches
@@ -156,36 +197,43 @@ def train_one_epoch(model, train_loader, criterion, optimizer, scaler, device, e
 
 
 def train(model, train_loader, dataset_obj, optimizer, scheduler, args, device, teacher_model=None):
-    """完整训练流程"""
+    """
+    主训练流程入口
+    包含初始化、训练循环、验证和模型保存
+    """
     
-    # 准备目录和日志
+    # 目录准备
     os.makedirs(args.save_dir, exist_ok=True)
     os.makedirs(args.log_dir, exist_ok=True)
     
     logger = setup_logger(args.log_dir)
-    # 这条只会写到文件，不会打印到屏幕
     logger.info(f"Save Dir: {args.save_dir}")
     
-    # 1. 初始化记忆库
-    print("Initializing Memory Bank...") # 使用print在控制台提示进度
+    # -------------------------------------------------------------------------
+    # 1. 记忆库初始化
+    # -------------------------------------------------------------------------
+    print("Initializing Memory Bank...") 
     logger.info("\n" + "="*50)
     logger.info("Initializing Memory Bank...")
     logger.info("="*50)
     
     if args.init_memory:
         normal_rgb_loader, _ = dataset_obj.get_normal_loader()
-        # 初始化时强制使用 student 本身 (此时 teacher==student)
+        # 初始化阶段强制使用 Student 模型 (此时 Teacher 尚未完全就绪)
         model.initialize_memory(normal_rgb_loader, device, teacher_model=None)
         
         if teacher_model is not None:
             logger.info("Memory initialized. Mean Teacher is ready for EMA updates.")
     
-    # 2. 开始训练
+    # -------------------------------------------------------------------------
+    # 2. 训练循环
+    # -------------------------------------------------------------------------
     print("Start Training Loop...")
     logger.info("\n" + "="*50)
     logger.info("Start Training Loop")
     logger.info("="*50)
     
+    # 初始化损失函数
     criterion = TotalLoss(
         num_parts=args.num_parts,
         label_smoothing=args.label_smoothing,
@@ -197,6 +245,7 @@ def train(model, train_loader, dataset_obj, optimizer, scheduler, args, device, 
         use_adaptive_weight=False 
     ).to(device)
     
+    # 初始化 GradScaler (仅在开启 AMP 时)
     scaler = GradScaler(device='cuda') if args.amp else None
     
     best_rank1 = 0.0
@@ -205,22 +254,23 @@ def train(model, train_loader, dataset_obj, optimizer, scheduler, args, device, 
     for epoch in range(args.total_epoch):
         start_time = time.time()
         
-        # 训练
+        # 执行一个 Epoch 的训练
         avg_losses = train_one_epoch(
             model, train_loader, criterion, optimizer, scaler,
             device, epoch, logger, args, teacher_model
         )
         
+        # 更新学习率
         if scheduler is not None:
             scheduler.step()
             
-        # 记录日志 (仅写入文件)
+        # 记录日志到文件
         epoch_time = time.time() - start_time
         curr_lr = optimizer.param_groups[0]['lr']
         logger.info(f"Epoch {epoch+1}/{args.total_epoch} [Time: {epoch_time:.1f}s, LR: {curr_lr:.6f}]")
         logger.info(f"  Loss: {avg_losses['loss_total']:.4f} (ID: {avg_losses['loss_id']:.4f}, Graph: {avg_losses['loss_graph']:.4f})")
         
-        # 保存
+        # 保存常规 Checkpoint
         if (epoch + 1) % args.save_epoch == 0:
             save_path = os.path.join(args.save_dir, f'epoch_{epoch+1}.pth')
             torch.save({
@@ -230,9 +280,9 @@ def train(model, train_loader, dataset_obj, optimizer, scheduler, args, device, 
                 'args': vars(args)
             }, save_path)
             
-        # 验证
+        # 执行验证
         if (epoch + 1) % args.eval_epoch == 0:
-            print(f"Evaluating at Epoch {epoch+1}...") # 控制台提示
+            print(f"Evaluating at Epoch {epoch+1}...") 
             logger.info("Evaluating (Student Model)...")
             rank1, mAP, mINP = test(
                 model, 
@@ -243,6 +293,7 @@ def train(model, train_loader, dataset_obj, optimizer, scheduler, args, device, 
             
             logger.info(f"Validation: Rank-1 {rank1:.2f}%, mAP {mAP:.2f}%")
             
+            # 保存最佳模型
             if rank1 > best_rank1:
                 best_rank1 = rank1
                 best_map = mAP
@@ -251,6 +302,7 @@ def train(model, train_loader, dataset_obj, optimizer, scheduler, args, device, 
                     torch.save(teacher_model.state_dict(), os.path.join(args.save_dir, 'best_teacher_model.pth'))
                 logger.info(f"New Best Model Saved! (Rank-1: {best_rank1:.2f}%)")
             
+            # 验证结束后切回训练模式
             model.train() 
 
     logger.info("Training Finished.")

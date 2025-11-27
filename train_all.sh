@@ -1,99 +1,78 @@
 #!/bin/bash
 
 # ====================================================================
-# Train All Datasets Sequentially - 3090/V100 Standard Configuration
-# Estimated Total Time: ~19 hours (3h + 7h + 9h)
+# Train All Datasets Sequentially (Auto-Detect Mode)
+# 自动根据所在文件夹判断是 A100 模式还是 Standard 模式
 # ====================================================================
 
-echo ""
-echo "======================================================================"
-echo "        Sequential Training for All Datasets (3090/Standard)         "
-echo "======================================================================"
-echo ""
-echo "Hardware: 3090/V100"
-echo "Configuration: ResNet50 + Standard Settings"
-echo ""
-echo "Training Schedule:"
-echo "  [1/3] RegDB   - 80 epochs  (~3 hours)"
-echo "  [2/3] SYSU    - 100 epochs (~7 hours)"
-echo "  [3/3] LLCM    - 120 epochs (~9 hours)"
-echo ""
-echo "Total Estimated Time: ~19 hours"
-echo "======================================================================"
-echo ""
+# 1. 获取脚本所在的目录名称 (sh 还是 vireid)
+# BASH_SOURCE[0] 代表脚本文件本身的路径
+SCRIPT_PATH="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+CURRENT_FOLDER=$(basename "$SCRIPT_PATH")
 
-read -p "Press Enter to start training or Ctrl+C to cancel..."
+echo "======================================"
+echo "Initializing Training Pipeline..."
+echo "Script Location: $SCRIPT_PATH"
+echo "Current Folder:  $CURRENT_FOLDER"
+echo "======================================"
 
-# 记录开始时间
-START_TIME=$(date +%s)
+# 2. 根据文件夹名称决定模式和工作目录
+if [ "$CURRENT_FOLDER" == "sh" ]; then
+    # 场景 A: 脚本在 sh/ 目录下 (A100环境)
+    MODE="a100"
+    # 工作目录需要切换到上一级 (项目根目录)
+    WORK_DIR="$SCRIPT_PATH/.."
+    
+elif [ "$CURRENT_FOLDER" == "vireid" ] || [ -f "main.py" ]; then
+    # 场景 B: 脚本在项目根目录下 (3090环境)
+    # (判断依据：文件夹名叫 vireid 或者当前目录下有 main.py)
+    MODE="standard"
+    WORK_DIR="$SCRIPT_PATH"
+    
+else
+    # 兜底：如果文件夹名改了，默认作为根目录处理
+    echo "Warning: Unknown folder structure. Assuming Standard mode."
+    MODE="standard"
+    WORK_DIR="$SCRIPT_PATH"
+fi
 
-# ===== Training RegDB =====
-echo ""
-echo "======================================================================"
-echo "[1/3] Training RegDB Dataset"
-echo "======================================================================"
-REGDB_START=$(date +%s)
+# 3. 切换到工作目录 (项目根目录)
+cd "$WORK_DIR" || exit
+echo "Working Directory: $(pwd)"
+echo "Detected Mode:     $MODE"
+echo "======================================"
 
-bash regdb.sh
+# 4. 根据模式执行对应的训练脚本
+if [ "$MODE" == "a100" ]; then
+    echo ""
+    echo "[1/3] Training RegDB (A100 Config)..."
+    bash sh/regdb_train_a100.sh
+    
+    echo ""
+    echo "[2/3] Training SYSU-MM01 (A100 Config)..."
+    bash sh/sysu_train_a100.sh
+    
+    echo ""
+    echo "[3/3] Training LLCM (A100 Config)..."
+    bash sh/llcm_train_a100.sh
 
-REGDB_END=$(date +%s)
-REGDB_TIME=$((REGDB_END - REGDB_START))
-echo ""
-echo "✓ RegDB training completed in $(($REGDB_TIME / 3600))h $(($REGDB_TIME % 3600 / 60))m"
-echo ""
-
-# ===== Training SYSU =====
-echo ""
-echo "======================================================================"
-echo "[2/3] Training SYSU-MM01 Dataset"
-echo "======================================================================"
-SYSU_START=$(date +%s)
-
-bash sysu.sh
-
-SYSU_END=$(date +%s)
-SYSU_TIME=$((SYSU_END - SYSU_START))
-echo ""
-echo "✓ SYSU training completed in $(($SYSU_TIME / 3600))h $(($SYSU_TIME % 3600 / 60))m"
-echo ""
-
-# ===== Training LLCM =====
-echo ""
-echo "======================================================================"
-echo "[3/3] Training LLCM Dataset"
-echo "======================================================================"
-LLCM_START=$(date +%s)
-
-bash llcm.sh
-
-LLCM_END=$(date +%s)
-LLCM_TIME=$((LLCM_END - LLCM_START))
-echo ""
-echo "✓ LLCM training completed in $(($LLCM_TIME / 3600))h $(($LLCM_TIME % 3600 / 60))m"
-echo ""
-
-# ===== 总结 =====
-END_TIME=$(date +%s)
-TOTAL_TIME=$((END_TIME - START_TIME))
+else
+    echo ""
+    echo "[1/3] Training RegDB (Standard Config)..."
+    bash regdb.sh
+    
+    echo ""
+    echo "[2/3] Training SYSU-MM01 (Standard Config)..."
+    bash sysu.sh
+    
+    echo ""
+    echo "[3/3] Training LLCM (Standard Config)..."
+    bash llcm.sh
+fi
 
 echo ""
-echo "======================================================================"
-echo "                    All Training Completed!                          "
-echo "======================================================================"
-echo ""
-echo "Time Summary:"
-echo "  RegDB:  $(($REGDB_TIME / 3600))h $(($REGDB_TIME % 3600 / 60))m"
-echo "  SYSU:   $(($SYSU_TIME / 3600))h $(($SYSU_TIME % 3600 / 60))m"
-echo "  LLCM:   $(($LLCM_TIME / 3600))h $(($LLCM_TIME % 3600 / 60))m"
-echo "  ---------------------------------------"
-echo "  Total:  $(($TOTAL_TIME / 3600))h $(($TOTAL_TIME % 3600 / 60))m"
-echo ""
-echo "Results Locations:"
-echo "  RegDB:  ./logs/regdb_3090/  & ./checkpoints/regdb_3090/"
-echo "  SYSU:   ./logs/sysu_3090/   & ./checkpoints/sysu_3090/"
-echo "  LLCM:   ./logs/llcm_3090/   & ./checkpoints/llcm_3090/"
-echo ""
-echo "Next Steps:"
-echo "  1. Run analysis: bash analyze_results.sh"
-echo "  2. Compare with A100: bash compare_configs.sh"
-echo "======================================================================"
+echo "======================================"
+echo "All Training Completed!"
+echo "======================================"
+echo "Results Logs: ./logs/ (Check specific dataset folders)"
+echo "======================================"
