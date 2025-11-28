@@ -1,7 +1,8 @@
 #!/bin/bash
 
 # ====================================================================
-# RegDB Training Script - A100 Optimized (Stable Version)
+# RegDB Clean Baseline (Rescue Plan)
+# 目标：验证模型核心能力 (BNNeck + Bias=True)，预期 Rank-1 > 60%
 # ====================================================================
 
 # 切换到项目根目录
@@ -19,9 +20,9 @@ python main.py \
   --num-parts 6 \
   --feature-dim 256 \
   \
-  --batch-size 48 \
+  --batch-size 64 \
   --num-workers 8 \
-  --pid-numsample 6 \
+  --pid-numsample 8 \
   --batch-pidnum 8 \
   --test-batch 128 \
   \
@@ -29,17 +30,17 @@ python main.py \
   --img-h 288 \
   \
   --total-epoch 80 \
-  --warmup-epochs 10 \
+  --warmup-epochs 5 \
   --lr 0.00035 \
-  --weight-decay 1e-3 \
+  --weight-decay 5e-4 \
   --lr-scheduler step \
-  --lr-step 20,40 \
+  --lr-step 40,70 \
   --lr-gamma 0.1 \
   \
-  --lambda-graph 0.1 \
-  --lambda-orth 0.1 \
-  --lambda-mod 0.5 \
-  --lambda-triplet 0.5 \
+  --lambda-graph 0.0 \
+  --lambda-orth 0.0 \
+  --lambda-mod 0.0 \
+  --lambda-triplet 1.0 \
   --label-smoothing 0.1 \
   \
   --save-epoch 10 \
@@ -48,19 +49,18 @@ python main.py \
   \
   --init-memory \
   --pool-parts \
-  --distance-metric cosine \
+  --distance-metric euclidean \
   --trial 1 \
   \
-  --save-dir ./checkpoints/regdb_a100 \
-  --log-dir ./logs/regdb_a100
+  --save-dir ./checkpoints/regdb_clean \
+  --log-dir ./logs/regdb_clean
 
 echo ""
 echo "======================================"
-echo "RegDB A100 Training (Stable)"
+echo "RegDB Clean Baseline Training"
 echo "======================================"
-echo "Configuration:"
-echo "  • Backbone: ResNet50 + GeM + Bi-Mamba"
-echo "  • LR Strategy: StepLR (decay at 20, 40)"
-echo "  • Learning Rate: 0.00035 (Lowered for Mamba)"
-echo "  • Dropout: 0.2 (Added to Mamba)"
+echo "Changes:"
+echo "  1. Bias=True in Classifiers (Crucial)"
+echo "  2. Disabled Graph/Orth/Mod losses (Focus on ID+Tri)"
+echo "  3. Batch Size = 64"
 echo "======================================"

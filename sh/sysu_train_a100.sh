@@ -13,7 +13,7 @@ python main.py \
   --gpu 0 \
   --data-path ./datasets \
   \
-  --backbone resnet101 \
+  --backbone resnet50 \
   --pretrained \
   --amp \
   --num-parts 6 \
@@ -32,12 +32,12 @@ python main.py \
   --gall-mode single \
   \
   --total-epoch 100 \
-  --warmup-epochs 10 \
+  --warmup-epochs 20 \
   --lr 0.0008 \
-  --weight-decay 5e-4 \
+  --weight-decay 1e-3 \
   --lr-scheduler cosine \
   \
-  --lambda-graph 0.5 \
+  --lambda-graph 0.1 \
   --lambda-orth 0.1 \
   --lambda-mod 0.5 \
   --lambda-triplet 0.5 \
@@ -59,7 +59,7 @@ echo "======================================"
 echo "SYSU-MM01 A100 Training"
 echo "======================================"
 echo "Configuration:"
-echo "  • Backbone: ResNet101 (pretrained)"
+echo "  • Backbone: ResNet50 (pretrained)"
 echo "  • Mixed Precision: Enabled"
 echo "  • Epochs: 100"
 echo "  • Batch Size: 48"

@@ -1,6 +1,7 @@
 """
 Main Entry Point for PF-MGCD Training and Testing
 [优化版] 集成 Mean Teacher 策略：教师网络作为学生网络的 EMA 镜像
+[修复] 修复 lr-step 参数解析，支持 "20,40" 格式的 MultiStepLR
 """
 
 import os
@@ -81,7 +82,8 @@ def parse_args():
     
     # ===== 学习率调度 =====
     parser.add_argument('--lr-scheduler', type=str, default='step', choices=['step', 'cosine', 'plateau'])
-    parser.add_argument('--lr-step', type=int, default=40, help='StepLR的步长')
+    # [修复] 改为 str 类型，以支持 "20,40" 这样的列表输入
+    parser.add_argument('--lr-step', type=str, default='40', help='StepLR的步长 或 MultiStepLR的里程碑(逗号分隔)')
     parser.add_argument('--lr-gamma', type=float, default=0.1, help='StepLR的衰减系数')
     
     # ===== 记忆库初始化 =====
@@ -134,6 +136,7 @@ def main():
     print(f"{'Backbone':<20}: {args.backbone.upper()}")
     print(f"{'Mixed Precision':<20}: {'Enabled' if args.amp else 'Disabled'}")
     print(f"{'Num Parts':<20}: {args.num_parts}")
+    print(f"{'LR Schedule':<20}: {args.lr_scheduler} (Step: {args.lr_step})")
     print("="*70 + "\n")
     
     # 1. 创建学生模型 (PF-MGCD Student)
@@ -160,7 +163,7 @@ def main():
         from datasets.dataloader_adapter import get_dataloader
         train_loader, val_loader = get_dataloader(args)
         
-        # [关键修改] 创建 Mean Teacher 模型
+        # 创建 Mean Teacher 模型
         print("Creating Mean Teacher Network (EMA Clone)...")
         
         # Teacher 结构与 Student 完全一致，但 pretrained=False 以避免重复加载权重
@@ -191,9 +194,18 @@ def main():
             weight_decay=args.weight_decay
         )
         
-        # 学习率调度
+        # 学习率调度 [修复逻辑]
         if args.lr_scheduler == 'step':
-            scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=args.lr_step, gamma=args.lr_gamma)
+            # 判断是否为多个 milestones (例如 "20,40")
+            if ',' in args.lr_step:
+                milestones = [int(x) for x in args.lr_step.split(',')]
+                print(f"Using MultiStepLR with milestones: {milestones}")
+                scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=milestones, gamma=args.lr_gamma)
+            else:
+                step_size = int(args.lr_step)
+                print(f"Using StepLR with step_size: {step_size}")
+                scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=step_size, gamma=args.lr_gamma)
+        
         elif args.lr_scheduler == 'cosine':
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.total_epoch)
         else:

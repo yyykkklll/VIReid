@@ -1,7 +1,7 @@
 """
 PCB Backbone - Part-based Convolutional Baseline
-支持ResNet50/101/152多种骨干网络
-[修复版] 适配新版 torchvision API，消除 pretrained 参数警告
+支持 ResNet50/101/152 多种骨干网络
+[修改版] 引入 GeM Pooling (广义平均池化) 以提升特征提取能力
 """
 
 import torch
@@ -9,7 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import models
 
-# 尝试导入新版权重API
+# 尝试导入新版 torchvision 权重 API
 try:
     from torchvision.models import (
         ResNet50_Weights, 
@@ -21,42 +21,67 @@ except ImportError:
     WEIGHTS_AVAILABLE = False
 
 
+class GeMPooling(nn.Module):
+    """
+    广义平均池化 (Generalized Mean Pooling)
+    公式: f = (mean(x^p))^(1/p)
+    - p=1: 等同于 Average Pooling
+    - p=inf: 等同于 Max Pooling
+    - p 是可学习参数，通常初始化为 3.0
+    """
+    def __init__(self, p=3.0, eps=1e-6):
+        super(GeMPooling, self).__init__()
+        self.p = nn.Parameter(torch.ones(1) * p)
+        self.eps = eps
+
+    def forward(self, x):
+        # 限制最小值为 eps 防止数值不稳定
+        x = x.clamp(min=self.eps).pow(self.p)
+        # 全局平均池化
+        x = F.avg_pool2d(x, (x.size(-2), x.size(-1)))
+        # 开 p 次方
+        return x.pow(1.0 / self.p)
+    
+    def __repr__(self):
+        return self.__class__.__name__ + '(' + 'p=' + '{:.4f}'.format(self.p.data.tolist()[0]) + ', ' + 'eps=' + str(self.eps) + ')'
+
+
 class PCBBackbone(nn.Module):
     """
-    PCB特征提取器 - 支持多种ResNet骨干
+    PCB 特征提取器 - 支持多种 ResNet 骨干
     
-    支持的骨干网络:
-    - ResNet50 (默认): 25.6M params, 4.1G FLOPs
-    - ResNet101: 44.5M params, 7.8G FLOPs (推荐)
-    - ResNet152: 60.2M params, 11.5G FLOPs
+    支持架构:
+    - ResNet50 (默认): 25.6M 参数, 4.1G FLOPs
+    - ResNet101: 44.5M 参数, 7.8G FLOPs (推荐用于提升性能)
+    - ResNet152: 60.2M 参数, 11.5G FLOPs
     """
     
     def __init__(self, num_parts=6, pretrained=True, backbone='resnet50'):
         """
         Args:
             num_parts: 水平切分的部件数量 (K)
-            pretrained: 是否使用ImageNet预训练权重
+            pretrained: 是否使用 ImageNet 预训练权重
             backbone: 骨干网络类型 ['resnet50', 'resnet101', 'resnet152']
         """
         super(PCBBackbone, self).__init__()
         self.num_parts = num_parts
         self.backbone_name = backbone
         
-        # 加载对应的ResNet骨干
+        # 加载对应的 ResNet 骨干
         resnet = self._load_resnet(backbone, pretrained)
         
-        # 提取ResNet层 (去掉avgpool和fc)
+        # 提取 ResNet 层 (移除 avgpool 和 fc)
         self.conv1 = resnet.conv1
         self.bn1 = resnet.bn1
         self.relu = resnet.relu
         self.maxpool = resnet.maxpool
         
-        self.layer1 = resnet.layer1  # /4, 输出256通道
-        self.layer2 = resnet.layer2  # /8, 输出512通道
-        self.layer3 = resnet.layer3  # /16, 输出1024通道
+        self.layer1 = resnet.layer1  # /4, 输出 256 通道
+        self.layer2 = resnet.layer2  # /8, 输出 512 通道
+        self.layer3 = resnet.layer3  # /16, 输出 1024 通道
         
-        # [关键修改] 去除Layer4的stride=2，保持空间分辨率
-        self.layer4 = self._modify_layer4_stride(resnet.layer4)  # /16, 输出2048通道
+        # [关键修改] 将 Layer4 的 stride 设为 1，保持特征图空间分辨率
+        self.layer4 = self._modify_layer4_stride(resnet.layer4)  # /16, 输出 2048 通道
         
         # 输出特征维度
         self.feature_dim = 2048
@@ -68,8 +93,9 @@ class PCBBackbone(nn.Module):
         print(f"  Pretrained: {pretrained}")
     
     def _load_resnet(self, backbone, pretrained):
-        """加载指定的ResNet模型 (修复警告版)"""
-        
+        """
+        加载指定的 ResNet 模型 (兼容新旧 API)
+        """
         # 辅助函数：根据配置获取 weights 参数
         def get_weights(model_weights_enum):
             if WEIGHTS_AVAILABLE:
@@ -101,14 +127,14 @@ class PCBBackbone(nn.Module):
     
     def _modify_layer4_stride(self, layer4):
         """
-        修改Layer4的stride，保持特征图分辨率
+        修改 Layer4 的 stride 为 1，防止分辨率下降
         """
-        # Layer4的第一个bottleneck
-        layer4[0].conv2.stride = (1, 1)  # 原本是(2, 2)
+        # 修改 Layer4 第一个 bottleneck 的 stride
+        layer4[0].conv2.stride = (1, 1)
         
-        # 修改downsample的stride（如果存在）
+        # 修改 downsample 层的 stride (如果存在)
         if layer4[0].downsample is not None:
-            layer4[0].downsample[0].stride = (1, 1)  # 原本是(2, 2)
+            layer4[0].downsample[0].stride = (1, 1)
         
         return layer4
     
@@ -118,10 +144,10 @@ class PCBBackbone(nn.Module):
         Args:
             x: 输入图像 [B, 3, H, W]
         Returns:
-            part_features: List of K个部件特征
+            part_features: List of K 个部件特征
             global_feature: 全局特征图
         """
-        # ResNet特征提取
+        # ResNet 特征提取
         x = self.conv1(x)      # [B, 64, H/2, W/2]
         x = self.bn1(x)
         x = self.relu(x)
@@ -135,7 +161,7 @@ class PCBBackbone(nn.Module):
         # 保存全局特征图
         global_feature = x
         
-        # 水平切分为K个部件
+        # 水平切分为 K 个部件
         part_features = self._horizontal_split(global_feature)
         
         return part_features, global_feature
@@ -146,7 +172,7 @@ class PCBBackbone(nn.Module):
         """
         B, C, H, W = feature_map.size()
         
-        # 检查高度是否可被K整除
+        # 检查高度是否可被 K 整除
         if H % self.num_parts != 0:
             # 如果不能整除，进行插值调整
             target_h = (H // self.num_parts) * self.num_parts
@@ -182,10 +208,16 @@ class PCBBackbone(nn.Module):
 
 
 class PartPooling(nn.Module):
-    """部件池化模块"""
+    """
+    部件池化模块
+    [修改] 使用 GeM Pooling 替代普通的 GAP
+    """
     def __init__(self, input_dim=2048, output_dim=256):
         super(PartPooling, self).__init__()
-        self.gap = nn.AdaptiveAvgPool2d(1)
+        
+        # [修改] 使用可学习的 GeM Pooling (初始 p=3.0)
+        self.gap = GeMPooling(p=3.0)
+        # 原代码: self.gap = nn.AdaptiveAvgPool2d(1)
         
         # 降维层
         self.reduction = nn.Sequential(
@@ -197,7 +229,7 @@ class PartPooling(nn.Module):
     def forward(self, part_features):
         pooled_features = []
         for part in part_features:
-            # 全局平均池化
+            # 池化
             pooled = self.gap(part)  # [B, C, 1, 1]
             pooled = pooled.view(pooled.size(0), -1)  # [B, C]
             # 降维

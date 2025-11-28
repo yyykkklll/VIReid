@@ -1,13 +1,23 @@
 """
-PF-MGCD Model v2
-基于部件的细粒度多粒度跨模态蒸馏模型
-包含：PCB骨干网、ISG-DM解耦模块、记忆库、图传播模块
+PF-MGCD Model v5 (Stable Baseline)
+[关键修复]
+1. 分类器启用 Bias=True (配合 CrossEntropyLoss)
+2. 保留 BNNeck 结构 (Tri-Loss与ID-Loss特征分离)
+3. 集成 Bi-Mamba 上下文融合
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# 尝试导入 Mamba
+try:
+    from mamba_ssm import Mamba
+    MAMBA_AVAILABLE = True
+except ImportError:
+    MAMBA_AVAILABLE = False
+
+# 尝试导入子模块
 try:
     from .pcb_backbone import PCBBackbone
     from .isg_dm import MultiPartISG_DM
@@ -20,99 +30,106 @@ except ImportError:
     from graph_propagation import AdaptiveGraphPropagation
 
 
+def weights_init_kaiming(m):
+    classname = m.__class__.__name__
+    if classname.find('Linear') != -1:
+        nn.init.kaiming_normal_(m.weight, a=0, mode='fan_out')
+        if m.bias is not None:
+            nn.init.constant_(m.bias, 0.0)
+    elif classname.find('BatchNorm1d') != -1:
+        nn.init.normal_(m.weight, 1.0, 0.01)
+        nn.init.constant_(m.bias, 0.0)
+
+
+class PartContextMamba(nn.Module):
+    """双向 Mamba 部件上下文融合模块"""
+    def __init__(self, dim, d_state=16, d_conv=4, expand=2, dropout=0.1):
+        super(PartContextMamba, self).__init__()
+        if not MAMBA_AVAILABLE:
+            # 如果没有 Mamba，此模块退化为 Identity，不报错以便调试
+            print("Warning: Mamba not installed, skipping context fusion.")
+            self.mamba_ok = False
+        else:
+            self.mamba_ok = True
+            self.fwd_mamba = Mamba(d_model=dim, d_state=d_state, d_conv=d_conv, expand=expand)
+            self.bwd_mamba = Mamba(d_model=dim, d_state=d_state, d_conv=d_conv, expand=expand)
+            self.norm = nn.LayerNorm(dim)
+            self.dropout = nn.Dropout(dropout)
+
+    def forward(self, part_features_list):
+        if not self.mamba_ok:
+            return part_features_list
+            
+        x = torch.stack(part_features_list, dim=1) # [B, K, D]
+        x_fwd = self.fwd_mamba(x)
+        x_bwd = self.bwd_mamba(x.flip(1)).flip(1)
+        # 残差 + Dropout + Norm
+        x_enhanced = self.norm(x + self.dropout(x_fwd + x_bwd))
+        return [x_enhanced[:, i, :] for i in range(x.size(1))]
+
+
 class PF_MGCD(nn.Module):
-    """
-    PF-MGCD 完整模型架构
-    
-    结构:
-    1. Backbone: PCB切分的ResNet (支持 ResNet50/101/152)
-    2. ISG-DM: 实例统计引导的特征解耦
-    3. Memory: 多粒度模态无关记忆库
-    4. Graph: 自适应图传播与蒸馏
-    """
-    
-    def __init__(self, 
-                 num_parts=6,
-                 num_identities=395,
-                 feature_dim=256,
-                 memory_momentum=0.9,
-                 temperature=3.0,
-                 top_k=5,
-                 pretrained=True,
-                 backbone='resnet50'):
+    def __init__(self, num_parts=6, num_identities=395, feature_dim=256,
+                 memory_momentum=0.9, temperature=3.0, top_k=5,
+                 pretrained=True, backbone='resnet50'):
         super(PF_MGCD, self).__init__()
         self.num_parts = num_parts
-        self.num_identities = num_identities
         self.feature_dim = feature_dim
         
-        # 1. PCB 骨干网络 (支持 ResNet101 等)
-        self.backbone = PCBBackbone(
-            num_parts=num_parts, 
-            pretrained=pretrained,
-            backbone=backbone
-        )
+        # 1. Backbone
+        self.backbone = PCBBackbone(num_parts, pretrained, backbone)
         
-        # 2. ISG-DM 解耦模块 (物理统计解耦)
-        self.isg_dm = MultiPartISG_DM(
-            num_parts=num_parts,
-            input_dim=2048,
-            id_dim=feature_dim,
-            mod_dim=feature_dim
-        )
+        # 2. ISG-DM (无 BN)
+        self.isg_dm = MultiPartISG_DM(num_parts, 2048, feature_dim, feature_dim)
         
-        # 3. 多粒度记忆库
-        self.memory_bank = MultiPartMemoryBank(
-            num_parts=num_parts,
-            num_identities=num_identities,
-            feature_dim=feature_dim,
-            momentum=memory_momentum
-        )
+        # 3. Bi-Mamba (Dropout=0.2 防止 RegDB 过拟合)
+        self.part_mamba = PartContextMamba(feature_dim, dropout=0.2)
         
-        # 4. 自适应图传播模块
-        self.graph_propagation = AdaptiveGraphPropagation(
-            temperature=temperature,
-            top_k=top_k,
-            use_entropy_weight=True
-        )
+        # 4. BNNeck 层 (Bottlenecks)
+        # 将特征归一化后再送入分类器
+        self.bottlenecks = nn.ModuleList([
+            nn.BatchNorm1d(feature_dim) for _ in range(num_parts)
+        ])
+        self.bottlenecks.apply(weights_init_kaiming)
         
-        # 身份分类器 (每个部件一个)
+        # 5. Classifiers
+        # [关键修复] bias=True (配合标准 CrossEntropyLoss)
         self.id_classifiers = nn.ModuleList([
-            nn.Linear(feature_dim, num_identities) for _ in range(num_parts)
+            nn.Linear(feature_dim, num_identities, bias=True) for _ in range(num_parts)
         ])
+        self.id_classifiers.apply(weights_init_kaiming)
         
-        # 模态分类器 (每个部件一个)
         self.mod_classifiers = nn.ModuleList([
-            nn.Linear(feature_dim, 2) for _ in range(num_parts)
+            nn.Linear(feature_dim, 2, bias=True) for _ in range(num_parts)
         ])
         
-        # 可学习的部件权重 (用于测试阶段特征融合)
+        # 6. Memory & Graph
+        self.memory_bank = MultiPartMemoryBank(num_parts, num_identities, feature_dim, memory_momentum)
+        self.graph_propagation = AdaptiveGraphPropagation(temperature, top_k)
+        
         self.part_weights = nn.Parameter(torch.ones(num_parts))
-        
-        # 注册缓冲区
         self.register_buffer('temperature_scale', torch.tensor(1.0))
-        
-        # Label映射缓存 (用于Debug和记录)
-        self.train_label_mapping = None
-    
+
     def forward(self, x, labels=None, modality_labels=None, update_memory=False):
-        """
-        前向传播流程
-        Args:
-            x: 输入图像 [B, 3, H, W]
-            labels: 身份标签 [B]
-            modality_labels: 模态标签 [B]
-            update_memory: 是否更新记忆库 (通常在外部控制)
-        """
-        # 1. 骨干提取与切分
+        # 1. 提取基础特征
         part_features, global_feature = self.backbone(x)
+        id_features_raw, mod_features = self.isg_dm(part_features)
         
-        # 2. ISG-DM 解耦
-        id_features, mod_features = self.isg_dm(part_features)
+        # 2. Mamba 上下文增强
+        # 得到的 id_features 是 BN 之前的特征 (Pre-BN)
+        id_features = self.part_mamba(id_features_raw)
         
-        # 3. 计算分类 Logits
+        # 3. BNNeck & 分类
         id_logits = []
+        bn_features = [] # BN 之后的特征
+        
         for k in range(self.num_parts):
-            logit = self.id_classifiers[k](id_features[k])
+            # 通过 BNNeck
+            f_bn = self.bottlenecks[k](id_features[k])
+            bn_features.append(f_bn)
+            
+            # 分类器使用 BN 后的特征
+            logit = self.id_classifiers[k](f_bn)
             id_logits.append(logit)
         
         mod_logits = []
@@ -120,18 +137,19 @@ class PF_MGCD(nn.Module):
             logit = self.mod_classifiers[k](mod_features[k])
             mod_logits.append(logit)
         
-        # 4. 图传播与软标签生成
-        # 利用当前 batch 的特征去查询记忆库，获取软标签
+        # 4. 图传播
+        # 使用 Pre-BN 特征查询记忆库，保持几何结构一致性
         soft_labels, similarities, entropy_weights = self.graph_propagation(
             id_features, self.memory_bank
         )
         
         outputs = {
-            'id_features': id_features,      # 用于 Triplet Loss, Orth Loss
-            'mod_features': mod_features,    # 用于 Orth Loss
-            'id_logits': id_logits,          # 用于 ID Loss
-            'mod_logits': mod_logits,        # 用于 Modality Loss
-            'soft_labels': soft_labels,      # 用于 Graph Distillation Loss
+            'id_features': id_features,      # [BN 前] -> Triplet Loss & Memory
+            'bn_features': bn_features,      # [BN 后] -> (备用)
+            'mod_features': mod_features,
+            'id_logits': id_logits,          # [BN 后] -> ID Loss
+            'mod_logits': mod_logits,
+            'soft_labels': soft_labels,
             'similarities': similarities,
             'entropy_weights': entropy_weights,
             'global_feature': global_feature
@@ -140,132 +158,76 @@ class PF_MGCD(nn.Module):
         return outputs
     
     def extract_features(self, x, pool_parts=True):
-        """
-        测试阶段特征提取
-        Args:
-            pool_parts: 是否融合所有部件特征
-        """
+        """测试阶段特征提取"""
         with torch.no_grad():
             part_features, _ = self.backbone(x)
-            id_features, _ = self.isg_dm(part_features)
+            id_features_raw, _ = self.isg_dm(part_features)
             
-            # L2 归一化
+            # Mamba 增强
+            id_features = self.part_mamba(id_features_raw)
+            
+            # 通过 BNNeck (测试时必须用 BN 后的特征，这是 BNNeck 的标准用法)
+            bn_features = []
+            for k in range(self.num_parts):
+                f_bn = self.bottlenecks[k](id_features[k])
+                bn_features.append(f_bn)
+            
+            # L2 归一化并融合
             if pool_parts:
-                id_features_norm = [F.normalize(f, p=2, dim=1) for f in id_features]
-                # 使用学习到的部件权重进行加权融合
+                norm_features = [F.normalize(f, p=2, dim=1) for f in bn_features]
                 weights = F.softmax(self.part_weights, dim=0)
-                weighted_features = [f * weights[i] for i, f in enumerate(id_features_norm)]
-                features = torch.cat(weighted_features, dim=1)
-                features = F.normalize(features, p=2, dim=1)
+                weighted = [f * weights[i] for i, f in enumerate(norm_features)]
+                final = torch.cat(weighted, dim=1)
+                final = F.normalize(final, p=2, dim=1)
             else:
-                features = [F.normalize(f, p=2, dim=1) for f in id_features]
+                final = [F.normalize(f, p=2, dim=1) for f in bn_features]
             
-            return features
+            return final
     
     def initialize_memory(self, dataloader, device, teacher_model=None):
-        """
-        初始化记忆库
+        """初始化记忆库"""
+        self.eval()
+        if teacher_model: teacher_model.eval()
         
-        功能：
-        1. 遍历指定的数据加载器 (通常是 RGB 训练集)
-        2. 提取特征 (使用 Student 自己或 Teacher 网络)
-        3. 计算每个 ID 的特征中心并存入记忆库
-        
-        Args:
-            teacher_model: 可选，如果提供，则使用教师网络提取高置信度特征
-        """
-        print("Initializing memory bank...")
-        
-        # 设置模式
-        if teacher_model is not None:
-            print("  [Init Strategy] Using Teacher Network (High Confidence).")
-            teacher_model.eval()
-        else:
-            print("  [Init Strategy] Using Student Network (Self-Clustering).")
-            self.eval()
-        
-        all_id_features = [[] for _ in range(self.num_parts)]
+        all_features = [[] for _ in range(self.num_parts)]
         all_labels = []
         
+        print("Initializing memory (using pre-BN features)...")
         with torch.no_grad():
-            for batch_idx, batch_data in enumerate(dataloader):
-                # 解析 Batch 数据并推断模态
-                # 这里主要处理 SYSU/RegDB 的数据格式差异
-                modality_labels = None
-                
-                if len(batch_data) == 2:
-                    # 格式: (images, info) - 通常来自 SYSU_train 的 __getitem__
-                    images, info = batch_data
-                    images = images.to(device)
-                    
-                    if isinstance(info, torch.Tensor):
-                        labels = info[:, 1].long()
-                        cam_ids = info[:, 2].long()
-                    else:
-                        labels = torch.from_numpy(info[:, 1]).long()
-                        cam_ids = torch.from_numpy(info[:, 2]).long()
-                    
-                    # SYSU 推断: Cam 3, 6 为红外(1)，其余为可见光(0)
-                    modality_labels = (cam_ids == 3) | (cam_ids == 6)
-                    modality_labels = modality_labels.long().to(device)
-                    
-                elif len(batch_data) == 3:
-                    # 格式: (images, labels, cams) - 通用格式
-                    images, labels, cams = batch_data
-                    images = images.to(device)
-                    if not isinstance(labels, torch.Tensor):
-                        labels = torch.tensor(labels).long()
-                    
-                    # 推断模态
-                    modality_labels = ((cams == 3) | (cams == 6)).long().to(device)
-                    
+            for batch in dataloader:
+                # 适配不同的 dataloader 返回格式
+                if len(batch) == 4:
+                    imgs, _, pids, cams = batch
+                elif len(batch) == 3:
+                    imgs, pids, cams = batch
                 else:
-                    raise ValueError(f"Unexpected batch format: {len(batch_data)} elements")
+                    imgs, info = batch
+                    pids = info[:, 1]
                 
-                # 特征提取
-                if teacher_model is not None:
-                    # 使用教师网络 (需要传入模态标签以选择 T_vis 或 T_ir)
-                    # 注意：如果是单模态Loader(如只传了RGB)，modality_labels全0，会自动只用T_vis
-                    if hasattr(teacher_model, 'visible_teacher'): # 双模态教师
-                        id_features = teacher_model(images, modality_labels)
-                    else: # 单模态教师
-                        id_features = teacher_model(images)
+                imgs = imgs.to(device)
+                
+                if teacher_model:
+                    # Teacher 返回 dict, 取 id_features (Pre-BN)
+                    out = teacher_model(imgs)
+                    feats = out['id_features']
                 else:
-                    # 使用学生网络 (自己)
-                    outputs = self.forward(images)
-                    id_features = outputs['id_features']
+                    out = self.forward(imgs)
+                    feats = out['id_features']
                 
-                # 收集所有特征
                 for k in range(self.num_parts):
-                    all_id_features[k].append(id_features[k].cpu())
-                all_labels.append(labels.cpu())
+                    all_features[k].append(feats[k].cpu())
+                all_labels.append(pids)
                 
-                if (batch_idx + 1) % 100 == 0:
-                    print(f"  Processed {batch_idx + 1} batches...")
-        
-        # 拼接所有收集到的数据
+        # 拼接与映射
         for k in range(self.num_parts):
-            all_id_features[k] = torch.cat(all_id_features[k], dim=0)
-        all_labels = torch.cat(all_labels, dim=0)
+            all_features[k] = torch.cat(all_features[k], dim=0).to(device)
+        all_labels = torch.cat(all_labels, dim=0).long().to(device)
         
-        # 处理标签映射 (Original ID -> 0..N-1)
-        unique_labels = torch.unique(all_labels)
-        print(f"  Label Statistics:")
-        print(f"    Range: [{unique_labels.min().item()}, {unique_labels.max().item()}]")
-        print(f"    Unique IDs: {len(unique_labels)}")
+        uq_labels = torch.unique(all_labels)
+        mapping = {old.item(): new for new, old in enumerate(uq_labels)}
+        mapped_labels = torch.tensor([mapping[x.item()] for x in all_labels]).to(device)
         
-        label_mapping = {old_id.item(): new_id for new_id, old_id in enumerate(unique_labels)}
-        mapped_labels = torch.tensor([label_mapping[label.item()] for label in all_labels])
-        
-        # 执行初始化
-        all_id_features_device = [f.to(device) for f in all_id_features]
-        mapped_labels_device = mapped_labels.to(device)
-        
-        self.memory_bank.initialize_memory(all_id_features_device, mapped_labels_device)
-        
-        print(f"  Initialization Complete: {self.memory_bank.initialized.sum().item()} IDs updated.")
-        
-        self.train_label_mapping = label_mapping
-        
-        # 恢复训练模式
+        self.memory_bank.initialize_memory(all_features, mapped_labels)
+        print(f"Initialized {len(uq_labels)} identities.")
+        self.train_label_mapping = mapping
         self.train()

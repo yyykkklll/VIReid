@@ -13,7 +13,7 @@ python main.py \
   --gpu 0 \
   --data-path ./datasets \
   \
-  --backbone resnet101 \
+  --backbone resnet50 \
   --pretrained \
   --amp \
   --num-parts 6 \
@@ -33,12 +33,12 @@ python main.py \
   --test-mode v2t \
   \
   --total-epoch 120 \
-  --warmup-epochs 10 \
+  --warmup-epochs 20 \
   --lr 0.0006 \
-  --weight-decay 5e-4 \
+  --weight-decay 1e-3 \
   --lr-scheduler cosine \
   \
-  --lambda-graph 0.5 \
+  --lambda-graph 0.1 \
   --lambda-orth 0.1 \
   --lambda-mod 0.5 \
   --lambda-triplet 0.5 \
@@ -60,7 +60,7 @@ echo "======================================"
 echo "LLCM A100 Training"
 echo "======================================"
 echo "Configuration:"
-echo "  • Backbone: ResNet101 (pretrained)"
+echo "  • Backbone: ResNet50 (pretrained)"
 echo "  • Mixed Precision: Enabled"
 echo "  • Epochs: 120"
 echo "  • Batch Size: 48"
