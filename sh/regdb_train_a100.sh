@@ -1,10 +1,4 @@
 #!/bin/bash
-
-# ====================================================================
-# RegDB Training Script - A100 Optimized (Stable Version)
-# ====================================================================
-
-# 切换到项目根目录
 cd "$(dirname "$0")/.." || exit
 
 python main.py \
@@ -28,12 +22,12 @@ python main.py \
   --img-w 144 \
   --img-h 288 \
   \
-  --total-epoch 80 \
+  --total-epoch 100 \
   --warmup-epochs 10 \
   --lr 0.00035 \
   --weight-decay 1e-3 \
   --lr-scheduler step \
-  --lr-step 20,40 \
+  --lr-step 40,70 \
   --lr-gamma 0.1 \
   \
   --lambda-graph 0.1 \
@@ -54,13 +48,4 @@ python main.py \
   --save-dir ./checkpoints/regdb_a100 \
   --log-dir ./logs/regdb_a100
 
-echo ""
-echo "======================================"
-echo "RegDB A100 Training (Stable)"
-echo "======================================"
-echo "Configuration:"
-echo "  • Backbone: ResNet50 + GeM + Bi-Mamba"
-echo "  • LR Strategy: StepLR (decay at 20, 40)"
-echo "  • Learning Rate: 0.00035 (Lowered for Mamba)"
-echo "  • Dropout: 0.2 (Added to Mamba)"
-echo "======================================"
+echo "Optimized RegDB Training Started..."
