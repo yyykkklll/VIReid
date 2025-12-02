@@ -1,12 +1,17 @@
 #!/bin/bash
+# ====================================================================
+# RegDB Boosted Training (Performance Focused)
+# Strategy:
+#   1. High Resolution (384x128) -> Better details
+#   2. Graph Distillation (Enabled after warmup) -> Semi-supervised gain
+#   3. Modality Adversarial (Low weight) -> Alignment
+#   4. AMP Disabled -> Stability
+# ====================================================================
+
+# 自动切换到项目根目录
 cd "$(dirname "$0")/.." || exit
 
-# ====================================================================
-# RegDB Quick Experiment (Full Model)
-# Model: ISG-DM + Transformer + Graph Loss
-# ====================================================================
-
-echo "Starting RegDB Full Model Quick Exp..."
+echo "Running RegDB Boosted Training..."
 
 python main.py \
   --dataset regdb \
@@ -16,7 +21,7 @@ python main.py \
   \
   --backbone resnet50 \
   --pretrained \
-  --amp \
+  --use-ibn \
   \
   --num-parts 6 \
   --feature-dim 512 \
@@ -27,16 +32,19 @@ python main.py \
   --batch-pidnum 8 \
   --test-batch 128 \
   \
-  --img-w 144 \
-  --img-h 288 \
+  --img-w 128 \
+  --img-h 384 \
   \
-  --total-epoch 60 \
-  --warmup-epochs 5 \
+  --total-epoch 100 \
+  --warmup-epochs 10 \
   --lr 0.00035 \
-  --weight-decay 1e-3 \
+  --weight-decay 5e-4 \
   --lr-scheduler cosine \
   \
-  --lambda-graph 0.05 \
+  --use-adversarial \
+  --lambda-adv 0.02 \
+  \
+  --lambda-graph 0.1 \
   --lambda-triplet 1.0 \
   --label-smoothing 0.1 \
   \
@@ -46,9 +54,9 @@ python main.py \
   --top-k 5 \
   --trial 1 \
   \
-  --save-epoch 60 \
+  --save-epoch 10 \
   --eval-epoch 5 \
   --grad-clip 5.0 \
   \
-  --save-dir ./checkpoints/regdb_full_quick \
-  --log-dir ./logs/regdb_full_quick
+  --save-dir ./checkpoints/regdb_boost \
+  --log-dir ./logs/regdb_boost

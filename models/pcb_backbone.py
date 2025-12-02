@@ -1,7 +1,10 @@
 """
-PCB Backbone - Part-based Convolutional Baseline
-支持 ResNet50/101/152 多种骨干网络
-[修改版] 引入 GeM Pooling (广义平均池化) 以提升特征提取能力
+models/pcb_backbone.py - PCB Backbone with IBN-Net (API 修复版)
+
+修复日志:
+1. [Fixed] 修复 _load_resnet 中 torchvision 新旧 API 混用导致的 TypeError
+2. 包含 IBN (Instance-Batch Normalization) 模块
+3. 包含 GeMPooling 和 PartPooling 模块
 """
 
 import torch
@@ -21,13 +24,31 @@ except ImportError:
     WEIGHTS_AVAILABLE = False
 
 
+class IBN(nn.Module):
+    """
+    IBN-Net: Instance-Batch Normalization
+    将通道分为两半，一半用 IN (去除风格差异)，一半用 BN (保留内容特征)
+    """
+    def __init__(self, planes):
+        super(IBN, self).__init__()
+        half1 = int(planes / 2)
+        self.half = half1
+        half2 = planes - half1
+        self.IN = nn.InstanceNorm2d(half1, affine=True)
+        self.BN = nn.BatchNorm2d(half2)
+
+    def forward(self, x):
+        split = torch.split(x, self.half, 1)
+        out1 = self.IN(split[0].contiguous())
+        out2 = self.BN(split[1].contiguous())
+        out = torch.cat((out1, out2), 1)
+        return out
+
+
 class GeMPooling(nn.Module):
     """
     广义平均池化 (Generalized Mean Pooling)
     公式: f = (mean(x^p))^(1/p)
-    - p=1: 等同于 Average Pooling
-    - p=inf: 等同于 Max Pooling
-    - p 是可学习参数，通常初始化为 3.0
     """
     def __init__(self, p=3.0, eps=1e-6):
         super(GeMPooling, self).__init__()
@@ -35,11 +56,8 @@ class GeMPooling(nn.Module):
         self.eps = eps
 
     def forward(self, x):
-        # 限制最小值为 eps 防止数值不稳定
         x = x.clamp(min=self.eps).pow(self.p)
-        # 全局平均池化
         x = F.avg_pool2d(x, (x.size(-2), x.size(-1)))
-        # 开 p 次方
         return x.pow(1.0 / self.p)
     
     def __repr__(self):
@@ -48,20 +66,15 @@ class GeMPooling(nn.Module):
 
 class PCBBackbone(nn.Module):
     """
-    PCB 特征提取器 - 支持多种 ResNet 骨干
-    
-    支持架构:
-    - ResNet50 (默认): 25.6M 参数, 4.1G FLOPs
-    - ResNet101: 44.5M 参数, 7.8G FLOPs (推荐用于提升性能)
-    - ResNet152: 60.2M 参数, 11.5G FLOPs
+    PCB 特征提取器 - 支持 IBN-Net 增强
     """
-    
-    def __init__(self, num_parts=6, pretrained=True, backbone='resnet50'):
+    def __init__(self, num_parts=6, pretrained=True, backbone='resnet50', use_ibn=True):
         """
         Args:
             num_parts: 水平切分的部件数量 (K)
             pretrained: 是否使用 ImageNet 预训练权重
-            backbone: 骨干网络类型 ['resnet50', 'resnet101', 'resnet152']
+            backbone: 骨干网络类型
+            use_ibn: 是否启用 IBN-Net (默认 True)
         """
         super(PCBBackbone, self).__init__()
         self.num_parts = num_parts
@@ -70,7 +83,14 @@ class PCBBackbone(nn.Module):
         # 加载对应的 ResNet 骨干
         resnet = self._load_resnet(backbone, pretrained)
         
-        # 提取 ResNet 层 (移除 avgpool 和 fc)
+        # [策略一] IBN-Net 核心修改
+        # 将 layer1 和 layer2 中的 BN 替换为 IBN
+        if use_ibn:
+            self._replace_ibn(resnet.layer1)
+            self._replace_ibn(resnet.layer2)
+            print("✅ IBN-Net enabled: IBN blocks injected into Layer 1 & 2")
+        
+        # 提取 ResNet 层
         self.conv1 = resnet.conv1
         self.bn1 = resnet.bn1
         self.relu = resnet.relu
@@ -80,146 +100,96 @@ class PCBBackbone(nn.Module):
         self.layer2 = resnet.layer2  # /8, 输出 512 通道
         self.layer3 = resnet.layer3  # /16, 输出 1024 通道
         
-        # [关键修改] 将 Layer4 的 stride 设为 1，保持特征图空间分辨率
+        # 将 Layer4 的 stride 设为 1，保持特征图空间分辨率
         self.layer4 = self._modify_layer4_stride(resnet.layer4)  # /16, 输出 2048 通道
         
-        # 输出特征维度
         self.feature_dim = 2048
-        
-        print(f"PCB Backbone initialized:")
-        print(f"  Architecture: {backbone.upper()}")
-        print(f"  Output channels: {self.feature_dim}")
-        print(f"  Num parts: {num_parts}")
-        print(f"  Pretrained: {pretrained}")
     
+    def _replace_ibn(self, layer):
+        """将 ResNet Layer 中的 BN 替换为 IBN"""
+        for i, block in enumerate(layer):
+            if hasattr(block, 'bn1'):
+                planes = block.bn1.num_features
+                ibn = IBN(planes)
+                # 替换 bn1
+                block.bn1 = ibn
+
     def _load_resnet(self, backbone, pretrained):
         """
-        加载指定的 ResNet 模型 (兼容新旧 API)
+        加载 ResNet 模型，严格区分新旧 API
         """
-        # 辅助函数：根据配置获取 weights 参数
-        def get_weights(model_weights_enum):
-            if WEIGHTS_AVAILABLE:
-                return model_weights_enum if pretrained else None
-            return None
-
-        # 根据 Backbone 类型加载
-        if backbone == 'resnet50':
-            if WEIGHTS_AVAILABLE:
-                return models.resnet50(weights=get_weights(ResNet50_Weights.IMAGENET1K_V1))
-            else:
+        if WEIGHTS_AVAILABLE:
+            # === 新版 API (0.13+) ===
+            # 仅使用 weights 参数，严禁传递 pretrained
+            if backbone == 'resnet50':
+                weights = ResNet50_Weights.IMAGENET1K_V1 if pretrained else None
+                return models.resnet50(weights=weights)
+            elif backbone == 'resnet101':
+                weights = ResNet101_Weights.IMAGENET1K_V1 if pretrained else None
+                return models.resnet101(weights=weights)
+            elif backbone == 'resnet152':
+                weights = ResNet152_Weights.IMAGENET1K_V1 if pretrained else None
+                return models.resnet152(weights=weights)
+        else:
+            # === 旧版 API ===
+            # 使用 pretrained 参数
+            if backbone == 'resnet50':
                 return models.resnet50(pretrained=pretrained)
-        
-        elif backbone == 'resnet101':
-            if WEIGHTS_AVAILABLE:
-                return models.resnet101(weights=get_weights(ResNet101_Weights.IMAGENET1K_V1))
-            else:
+            elif backbone == 'resnet101':
                 return models.resnet101(pretrained=pretrained)
-        
-        elif backbone == 'resnet152':
-            if WEIGHTS_AVAILABLE:
-                return models.resnet152(weights=get_weights(ResNet152_Weights.IMAGENET1K_V1))
-            else:
+            elif backbone == 'resnet152':
                 return models.resnet152(pretrained=pretrained)
         
-        else:
-            raise ValueError(f"Unsupported backbone: {backbone}. "
-                           f"Choose from ['resnet50', 'resnet101', 'resnet152']")
+        raise ValueError(f"Unsupported backbone: {backbone}")
     
     def _modify_layer4_stride(self, layer4):
-        """
-        修改 Layer4 的 stride 为 1，防止分辨率下降
-        """
-        # 修改 Layer4 第一个 bottleneck 的 stride
         layer4[0].conv2.stride = (1, 1)
-        
-        # 修改 downsample 层的 stride (如果存在)
         if layer4[0].downsample is not None:
             layer4[0].downsample[0].stride = (1, 1)
-        
         return layer4
     
     def forward(self, x):
-        """
-        前向传播
-        Args:
-            x: 输入图像 [B, 3, H, W]
-        Returns:
-            part_features: List of K 个部件特征
-            global_feature: 全局特征图
-        """
-        # ResNet 特征提取
-        x = self.conv1(x)      # [B, 64, H/2, W/2]
+        x = self.conv1(x)
         x = self.bn1(x)
         x = self.relu(x)
-        x = self.maxpool(x)    # [B, 64, H/4, W/4]
+        x = self.maxpool(x)
         
-        x = self.layer1(x)     # [B, 256, H/4, W/4]
-        x = self.layer2(x)     # [B, 512, H/8, W/8]
-        x = self.layer3(x)     # [B, 1024, H/16, W/16]
-        x = self.layer4(x)     # [B, 2048, H/16, W/16]
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)  # [B, 2048, H, W]
         
-        # 保存全局特征图
+        # 返回切分后的部件特征 和 全局特征图
         global_feature = x
-        
-        # 水平切分为 K 个部件
         part_features = self._horizontal_split(global_feature)
         
         return part_features, global_feature
     
     def _horizontal_split(self, feature_map):
-        """
-        在高度方向均匀切分特征图
-        """
         B, C, H, W = feature_map.size()
-        
-        # 检查高度是否可被 K 整除
         if H % self.num_parts != 0:
-            # 如果不能整除，进行插值调整
             target_h = (H // self.num_parts) * self.num_parts
-            feature_map = F.interpolate(
-                feature_map, 
-                size=(target_h, W), 
-                mode='bilinear', 
-                align_corners=True
-            )
+            feature_map = F.interpolate(feature_map, size=(target_h, W), mode='bilinear', align_corners=True)
             H = target_h
         
         part_height = H // self.num_parts
         parts = []
-        
         for i in range(self.num_parts):
             start = i * part_height
             end = (i + 1) * part_height
-            part = feature_map[:, :, start:end, :]  # [B, C, H/K, W]
+            part = feature_map[:, :, start:end, :]
             parts.append(part)
-        
         return parts
-    
-    def get_params_count(self):
-        """获取参数量统计"""
-        total_params = sum(p.numel() for p in self.parameters())
-        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        
-        return {
-            'total': total_params,
-            'trainable': trainable_params,
-            'frozen': total_params - trainable_params
-        }
 
 
 class PartPooling(nn.Module):
     """
     部件池化模块
-    [修改] 使用 GeM Pooling 替代普通的 GAP
+    使用 GeM Pooling 替代普通的 GAP
     """
     def __init__(self, input_dim=2048, output_dim=256):
         super(PartPooling, self).__init__()
-        
-        # [修改] 使用可学习的 GeM Pooling (初始 p=3.0)
         self.gap = GeMPooling(p=3.0)
-        # 原代码: self.gap = nn.AdaptiveAvgPool2d(1)
-        
-        # 降维层
         self.reduction = nn.Sequential(
             nn.Linear(input_dim, output_dim),
             nn.BatchNorm1d(output_dim),
@@ -229,10 +199,8 @@ class PartPooling(nn.Module):
     def forward(self, part_features):
         pooled_features = []
         for part in part_features:
-            # 池化
-            pooled = self.gap(part)  # [B, C, 1, 1]
-            pooled = pooled.view(pooled.size(0), -1)  # [B, C]
-            # 降维
-            pooled = self.reduction(pooled)  # [B, output_dim]
+            pooled = self.gap(part)
+            pooled = pooled.view(pooled.size(0), -1)
+            pooled = self.reduction(pooled)
             pooled_features.append(pooled)
         return pooled_features

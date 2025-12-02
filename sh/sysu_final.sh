@@ -1,15 +1,10 @@
 #!/bin/bash
+# ====================================================================
+# SYSU-MM01 Ultimate Training (All Features Enabled)
+# Config: IBN + GeM + Adversarial + Graph Reasoning + AMP
+# ====================================================================
+
 cd "$(dirname "$0")/.." || exit
-
-# ====================================================================
-# SYSU-MM01 Final Training Script
-# Features: PCB + Transformer + Graph Loss (Lambda=0.5)
-# ====================================================================
-
-echo "Starting SYSU-MM01 Final Training (Transformer Enabled)..."
-
-# 清理日志
-rm -rf logs/sysu_final
 
 python main.py \
   --dataset sysu \
@@ -19,6 +14,7 @@ python main.py \
   \
   --backbone resnet50 \
   --pretrained \
+  --use-ibn \
   --amp \
   \
   --num-parts 6 \
@@ -36,13 +32,17 @@ python main.py \
   --search-mode all \
   --gall-mode single \
   \
-  --total-epoch 100 \
+  --use-adversarial \
+  --use-graph-reasoning \
+  \
+  --total-epoch 120 \
   --warmup-epochs 10 \
   --lr 0.00035 \
   --weight-decay 5e-4 \
   --lr-scheduler cosine \
   \
-  --lambda-graph 0.5 \
+  --lambda-graph 0.2 \
+  --lambda-adv 0.1 \
   --lambda-triplet 1.0 \
   --label-smoothing 0.1 \
   \
@@ -55,5 +55,5 @@ python main.py \
   --eval-epoch 5 \
   --grad-clip 5.0 \
   \
-  --save-dir ./checkpoints/sysu_final \
-  --log-dir ./logs/sysu_final
+  --save-dir ./checkpoints/sysu_ultimate \
+  --log-dir ./logs/sysu_ultimate

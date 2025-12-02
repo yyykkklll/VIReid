@@ -1,12 +1,10 @@
 #!/bin/bash
+# ====================================================================
+# LLCM Ultimate Training (All Features Enabled)
+# Config: IBN + GeM + Adversarial + Graph Reasoning + AMP
+# ====================================================================
+
 cd "$(dirname "$0")/.." || exit
-
-# ====================================================================
-# LLCM Quick Experiment (Full Model)
-# Model: ISG-DM + Transformer + Graph Loss
-# ====================================================================
-
-echo "Starting LLCM Full Model Quick Exp..."
 
 python main.py \
   --dataset llcm \
@@ -16,6 +14,7 @@ python main.py \
   \
   --backbone resnet50 \
   --pretrained \
+  --use-ibn \
   --amp \
   \
   --num-parts 6 \
@@ -32,13 +31,17 @@ python main.py \
   --relabel \
   --test-mode v2t \
   \
-  --total-epoch 60 \
-  --warmup-epochs 5 \
+  --use-adversarial \
+  --use-graph-reasoning \
+  \
+  --total-epoch 120 \
+  --warmup-epochs 10 \
   --lr 0.00035 \
   --weight-decay 5e-4 \
   --lr-scheduler cosine \
   \
-  --lambda-graph 0.5 \
+  --lambda-graph 0.2 \
+  --lambda-adv 0.1 \
   --lambda-triplet 1.0 \
   --label-smoothing 0.1 \
   \
@@ -47,9 +50,9 @@ python main.py \
   --temperature 3.0 \
   --top-k 5 \
   \
-  --save-epoch 60 \
+  --save-epoch 10 \
   --eval-epoch 5 \
   --grad-clip 5.0 \
   \
-  --save-dir ./checkpoints/llcm_full_quick \
-  --log-dir ./logs/llcm_full_quick
+  --save-dir ./checkpoints/llcm_ultimate \
+  --log-dir ./logs/llcm_ultimate
