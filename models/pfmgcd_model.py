@@ -1,10 +1,6 @@
 """
 models/pfmgcd_model.py - Unified MTRL-Gated Framework
 兼容: RegDB (Small), SYSU/LLCM (Large)
-核心机制:
-1. MTRL: 内部动态生成灰度图，构建 RGB-Gray-IR 三元组约束。
-2. Gated GCN: 带有零初始化门控残差的图推理，防止初期噪声破坏特征。
-3. Stable Adv: 数值稳定的对抗训练模块。
 """
 
 import torch
@@ -13,7 +9,7 @@ import torch.nn.functional as F
 import torchvision.transforms as T
 from torch.autograd import Function
 
-from .pcb_backbone import PCBBackbone, GeMPooling
+from .pcb_backbone import PCBBackbone
 from .isg_dm import MultiPartISG_DM
 from .memory_bank import MultiPartMemoryBank
 from .graph_propagation import AdaptiveGraphPropagation
@@ -42,68 +38,57 @@ class GradientReversalFunction(Function):
 class GatedGraphReasoning(nn.Module):
     """
     [策略四升级版] 门控图推理 (Gated GCN)
-    核心: 引入 alpha 参数，初始化为0。
-    out = x + alpha * GCN(x)
-    效果: 初始阶段等同于无GCN，随着训练自动寻找最佳推理强度。
     """
     def __init__(self, feature_dim, top_k=5):
         super(GatedGraphReasoning, self).__init__()
         self.top_k = top_k
-        # 简单的 GCN 变换
         self.gcn_fc = nn.Linear(feature_dim, feature_dim, bias=False)
         self.relu = nn.ReLU(inplace=True)
-        # 零初始化门控因子
         self.alpha = nn.Parameter(torch.zeros(1))
         
         self.gcn_fc.apply(weights_init_kaiming)
 
     def forward(self, x, memory):
-        """
-        x: [B, D]
-        memory: [N, D]
-        """
         if memory is None or memory.size(0) == 0:
             return x
             
         B, D = x.size()
-        # 1. 相似度计算 (AMP Safe)
-        with torch.cuda.amp.autocast(enabled=False):
+        # [修复] 替换过时的 torch.cuda.amp.autocast
+        # 使用 torch.amp.autocast 并指定 device_type
+        try:
+            from torch.amp import autocast
+            autocast_ctx = autocast('cuda', enabled=False)
+        except ImportError:
+            # 兼容旧版本 torch
+            from torch.cuda.amp import autocast
+            autocast_ctx = autocast(enabled=False)
+
+        with autocast_ctx:
             x_fp32 = F.normalize(x.float(), p=2, dim=1)
             mem_fp32 = F.normalize(memory.float(), p=2, dim=1)
             sim = torch.mm(x_fp32, mem_fp32.t()) # [B, N]
         
         # 2. Top-K 检索
-        # 限制 K 不能超过 memory 大小
         k = min(self.top_k, sim.size(1))
         topk_val, topk_idx = torch.topk(sim, k=k, dim=1)
         
         # 3. 聚合邻居
         neighbor_feats = F.embedding(topk_idx, memory) # [B, K, D]
-        
-        # Attention score
         attn = F.softmax(topk_val * 10, dim=1).unsqueeze(2) # [B, K, 1]
-        
-        # Weighted Sum
         context = (neighbor_feats * attn).sum(dim=1) # [B, D]
         
-        # 4. GCN Transform
+        # 4. GCN Transform & Residual
         out = self.relu(self.gcn_fc(context))
-        
-        # 5. Gated Residual (关键!)
-        # 初期 alpha=0，相当于 identity mapping，不干扰训练
         return x + self.alpha * out
 
 class ModalityDiscriminator(nn.Module):
-    """
-    [策略三] 模态判别器
-    """
     def __init__(self, input_dim):
         super(ModalityDiscriminator, self).__init__()
         self.net = nn.Sequential(
             nn.Linear(input_dim, input_dim // 4),
             nn.BatchNorm1d(input_dim // 4),
             nn.ReLU(inplace=True),
-            nn.Linear(input_dim // 4, 2) # RGB vs IR
+            nn.Linear(input_dim // 4, 2)
         )
         self.net.apply(weights_init_kaiming)
 
@@ -124,22 +109,15 @@ class PF_MGCD(nn.Module):
         self.use_adversarial = use_adversarial
         self.use_graph_reasoning = use_graph_reasoning
         
-        # 1. Backbone (IBN)
         self.backbone = PCBBackbone(num_parts, pretrained, backbone, use_ibn)
-        
-        # 2. ISG-DM
         self.isg_dm = MultiPartISG_DM(num_parts, 2048, feature_dim, feature_dim)
-        
-        # 3. MTRL Gray Transform
         self.grayscale = T.Grayscale(num_output_channels=3)
         
-        # 4. Modules
         self.bottlenecks = nn.ModuleList()
         self.classifiers = nn.ModuleList()
         
         if self.use_graph_reasoning:
             self.gcns = nn.ModuleList()
-            
         if self.use_adversarial:
             self.discriminators = nn.ModuleList()
             
@@ -149,7 +127,6 @@ class PF_MGCD(nn.Module):
             
             if self.use_graph_reasoning:
                 self.gcns.append(GatedGraphReasoning(feature_dim, top_k=top_k))
-                
             if self.use_adversarial:
                 self.discriminators.append(ModalityDiscriminator(feature_dim))
                 
@@ -157,21 +134,19 @@ class PF_MGCD(nn.Module):
         self.classifiers.apply(weights_init_kaiming)
         self.dropout = nn.Dropout(p=0.5)
         
-        # 5. Memory Bank & Graph Propagation (Loss)
         self.memory_bank = MultiPartMemoryBank(num_parts, num_identities, feature_dim, memory_momentum)
-        self.graph_loss_module = AdaptiveGraphPropagation(temperature, top_k, True, 30.0)
+        
+        # 注意: scale 参数在 graph_propagation.py 中定义，这里传入默认值即可
+        # 实际使用的是 loss.py 和 graph_propagation.py 中的逻辑
+        self.graph_loss_module = AdaptiveGraphPropagation(temperature, top_k, True)
 
     def forward(self, x, labels=None, current_epoch=0, **kwargs):
-        # MTRL 逻辑：训练时生成灰度图
         if self.training:
             x_gray = self.grayscale(x)
-            x_all = torch.cat([x, x_gray], dim=0) # [2B, 3, H, W]
-            
-            # Backbone Forward
+            x_all = torch.cat([x, x_gray], dim=0)
             out_all = self.backbone(x_all)
             part_feats_all = out_all[0] if isinstance(out_all, tuple) else out_all
             
-            # Split back
             batch_size = x.size(0)
             part_feats_orig = [f[:batch_size] for f in part_feats_all]
             part_feats_gray = [f[batch_size:] for f in part_feats_all]
@@ -180,49 +155,37 @@ class PF_MGCD(nn.Module):
             part_feats_orig = out[0] if isinstance(out, tuple) else out
             part_feats_gray = None
 
-        # ISG-DM
         id_feats_orig, _ = self.isg_dm(part_feats_orig)
         if part_feats_gray:
             id_feats_gray, _ = self.isg_dm(part_feats_gray)
         
-        # Main Flow
         final_logits = []
-        final_feats = []     # For Triplet
-        gray_feats_out = []  # For MTRL Triplet
+        final_feats = []
+        gray_feats_out = []
         adv_logits = []
         
         for k in range(self.num_parts):
             feat = id_feats_orig[k]
             
-            # [策略四] Gated GCN
-            # 只在 memory 初始化后启用，并且不仅依赖 epoch，还依赖 memory 状态
             if self.use_graph_reasoning and self.memory_bank.initialized.sum() > 0:
                 mem_k = self.memory_bank.get_part_memory(k).detach()
                 feat = self.gcns[k](feat, mem_k)
             
-            final_feats.append(feat) # BN前特征用于Triplet
+            final_feats.append(feat)
             
-            # [策略三] Adversarial
             if self.training and self.use_adversarial:
-                # 动态 lambda: 前20 epoch 权重极小，之后增加
                 lambda_adv = 0.0 if current_epoch < 5 else 0.1
                 adv_logits.append(self.discriminators[k](feat, lambda_adv))
             
-            # BNNeck + Classifier
             feat_bn = self.bottlenecks[k](feat)
             
             if self.training:
                 final_logits.append(self.classifiers[k](self.dropout(feat_bn)))
-                
-                # Gray Stream processing (Backbone -> ISG -> (No GCN) -> BN -> Output)
-                # Gray流不走GCN，保持作为"纯净"的中间模态锚点
                 if part_feats_gray:
-                    gray_f = id_feats_gray[k]
-                    gray_feats_out.append(gray_f)
+                    gray_feats_out.append(id_feats_gray[k])
             else:
                 final_logits.append(self.classifiers[k](feat_bn))
 
-        # Graph Soft Labels
         soft_labels, entropy_weights = None, None
         if self.training and self.memory_bank.initialized.sum() > 0:
             soft_labels, _, entropy_weights = self.graph_loss_module(final_feats, self.memory_bank)
@@ -244,11 +207,6 @@ class PF_MGCD(nn.Module):
             
             bn_feats = []
             for k in range(self.num_parts):
-                # 测试时启用GCN吗？
-                # 科学的做法：如果训练时GCN学得好，测试时应该用。
-                # 但需要加载Memory Bank。为简单稳健，通常ReID测试只用Backbone特征。
-                # 如果要极致性能，可以开启，但需确保 Memory Bank 是最新的。
-                # 这里我们保持 Strong Baseline 逻辑：只用特征。
                 bn_feats.append(self.bottlenecks[k](id_feats[k]))
             
             norm_feats = [F.normalize(f, p=2, dim=1) for f in bn_feats]
@@ -263,6 +221,11 @@ class PF_MGCD(nn.Module):
         with torch.no_grad():
             for batch in dataloader:
                 imgs, pids = batch[0], batch[1]
+                
+                # [关键修复] 如果 pids 是 info 张量 [B, 3]，提取第1列 (label)
+                if pids.dim() > 1 and pids.size(1) >= 2:
+                    pids = pids[:, 1]
+                
                 imgs = imgs.to(device)
                 
                 out = self.backbone(imgs)
@@ -276,5 +239,9 @@ class PF_MGCD(nn.Module):
         for k in range(self.num_parts):
             all_feats[k] = torch.cat(all_feats[k], dim=0).to(device)
         all_pids = torch.cat(all_pids, dim=0).to(device)
+        
+        print(f"  📊 Features shape: {all_feats[0].shape}")
+        print(f"  📊 Labels range: [{all_pids.min().item()}, {all_pids.max().item()}]")
+        
         self.memory_bank.initialize_memory(all_feats, all_pids)
         self.train()

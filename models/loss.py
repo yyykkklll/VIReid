@@ -1,5 +1,5 @@
 """
-models/loss.py - Unified Loss with MTRL Support
+models/loss.py - Unified Loss with Stability Fix
 """
 import torch
 import torch.nn as nn
@@ -45,14 +45,26 @@ class TripletLoss(nn.Module):
 class GraphDistillationLoss(nn.Module):
     def __init__(self, temperature=3.0):
         super(GraphDistillationLoss, self).__init__()
-        self.kl = nn.KLDivLoss(reduction='batchmean')
+        # [关键] 使用 reduction='none' 以便后续进行 clamp 和加权
+        self.kl = nn.KLDivLoss(reduction='none')
         self.T = temperature
+
     def forward(self, logits_list, soft_labels_list, weights=None):
         loss = 0
         for k, (logit, label) in enumerate(zip(logits_list, soft_labels_list)):
             log_prob = F.log_softmax(logit / self.T, dim=1)
-            l = self.kl(log_prob, label)
-            if weights: l = (l * weights[k]).mean()
+            
+            # 计算逐样本 KL 散度 [B]
+            l = self.kl(log_prob, label).sum(dim=1)
+            
+            # [关键急救] 截断 Loss，防止脏数据或极端分布导致梯度爆炸
+            l = torch.clamp(l, max=5.0)
+            
+            if weights is not None: 
+                l = (l * weights[k]).mean()
+            else:
+                l = l.mean()
+                
             loss += l * (self.T**2)
         return loss / len(logits_list)
 
@@ -79,17 +91,17 @@ class TotalLoss(nn.Module):
         L_trans = torch.tensor(0., device=labels.device)
         if outputs['gray_features']:
             feat_gray = F.normalize(torch.cat(outputs['gray_features'], dim=1), p=2, dim=1)
-            # 拉近 (Original <-> Gray)
             L_trans = self.tri_loss(feat, labels, feat_gray)
-            L_tri += 0.5 * L_trans # 融合 MTRL 约束
+            L_tri += 0.5 * L_trans
             
-        # 3. Graph Loss (Curriculum)
+        # 3. Graph Loss (Safe Mode)
         L_graph = torch.tensor(0., device=labels.device)
         if current_epoch >= self.start_epoch and outputs['soft_labels']:
-            logits = outputs.get('graph_logits', outputs['id_logits'])
+            # 使用 id_logits 而非 graph_logits (如果模型没有独立 graph head)
+            logits = outputs.get('id_logits', [])
             L_graph = self.graph_loss(logits, outputs['soft_labels'], outputs['entropy_weights'])
             
-        # 4. Adv Loss (Curriculum handled in model forward via lambda_adv)
+        # 4. Adv Loss
         L_adv = torch.tensor(0., device=labels.device)
         if outputs['adv_logits'] and modality_labels is not None:
             for l in outputs['adv_logits']: L_adv += self.adv_loss(l, modality_labels)
@@ -104,7 +116,6 @@ class TotalLoss(nn.Module):
             'loss_total': total.item(),
             'loss_id': L_id.item(),
             'loss_triplet': L_tri.item(),
-            'loss_trans': L_trans.item(),
             'loss_graph': L_graph.item(),
             'loss_adv': L_adv.item()
         }
