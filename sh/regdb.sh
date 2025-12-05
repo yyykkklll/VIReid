@@ -1,62 +1,51 @@
 #!/bin/bash
-# ====================================================================
-# RegDB Boosted Training (Performance Focused)
-# Strategy:
-#   1. High Resolution (384x128) -> Better details
-#   2. Graph Distillation (Enabled after warmup) -> Semi-supervised gain
-#   3. Modality Adversarial (Low weight) -> Alignment
-#   4. AMP Disabled -> Stability
-# ====================================================================
+# RegDB Simple Baseline - 60 Epochs 快速验证
+# 目标: 验证简化模型的性能
+
 
 # 自动切换到项目根目录
 cd "$(dirname "$0")/.." || exit
 
-echo "Running RegDB Boosted Training..."
+echo "🚀 RegDB Baseline V3 (60 Epochs)"
 
 python main.py \
-  --dataset regdb \
-  --mode train \
-  --gpu 0 \
-  --data-path ./datasets \
-  \
-  --backbone resnet50 \
-  --pretrained \
-  --use-ibn \
-  \
-  --num-parts 6 \
-  --feature-dim 512 \
-  \
-  --batch-size 64 \
-  --num-workers 8 \
-  --pid-numsample 8 \
-  --batch-pidnum 8 \
-  --test-batch 128 \
-  \
-  --img-w 128 \
-  --img-h 384 \
-  \
-  --total-epoch 100 \
-  --warmup-epochs 10 \
-  --lr 0.00035 \
-  --weight-decay 5e-4 \
-  --lr-scheduler cosine \
-  \
-  --use-adversarial \
-  --lambda-adv 0.02 \
-  \
-  --lambda-graph 0.1 \
-  --lambda-triplet 1.0 \
-  --label-smoothing 0.1 \
-  \
-  --init-memory \
-  --memory-momentum 0.9 \
-  --temperature 3.0 \
-  --top-k 5 \
-  --trial 1 \
-  \
-  --save-epoch 10 \
-  --eval-epoch 5 \
-  --grad-clip 5.0 \
-  \
-  --save-dir ./checkpoints/regdb_boost \
-  --log-dir ./logs/regdb_boost
+    --dataset regdb \
+    --data-path ./datasets \
+    --mode train \
+    --gpu 0 \
+    --seed 42 \
+    \
+    --num-parts 6 \
+    --feature-dim 512 \
+    --pretrained \
+    --backbone resnet50 \
+    --amp \
+    \
+    --use-ibn \
+    \
+    --num-classes 206 \
+    --num-workers 4 \
+    --pid-numsample 8 \
+    --batch-pidnum 8 \
+    --test-batch 128 \
+    --img-w 144 \
+    --img-h 288 \
+    --relabel \
+    --trial 1 \
+    \
+    --lambda-triplet 1.0 \
+    --label-smoothing 0.1 \
+    \
+    --total-epoch 60 \
+    --warmup-epochs 5 \
+    --batch-size 64 \
+    --lr 0.0007 \
+    --weight-decay 5e-4 \
+    --grad-clip 5.0 \
+    \
+    --save-dir ./checkpoints/regdb_baseline_v3 \
+    --log-dir ./logs/regdb_baseline_v3 \
+    --save-epoch 20 \
+    --eval-epoch 5
+
+echo "✅ Training Complete!"

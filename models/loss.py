@@ -1,121 +1,91 @@
 """
-models/loss.py - Unified Loss with Stability Fix
+models/loss.py - Simple & Effective Baseline Loss
+回归简单有效的设计
 """
 import torch
-import torch.nn as nn
+import torch. nn as nn
 import torch.nn.functional as F
 
-class MultiPartIDLoss(nn.Module):
+
+class MultiPartIDLoss(nn. Module):
+    """多部件交叉熵损失"""
     def __init__(self, label_smoothing=0.1):
-        super(MultiPartIDLoss, self).__init__()
+        super().__init__()
         self.criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+    
     def forward(self, logits_list, labels):
-        loss = 0
-        for logits in logits_list:
-            loss += self.criterion(logits, labels)
+        loss = sum(self.criterion(logits, labels) for logits in logits_list)
         return loss / len(logits_list)
 
-class TripletLoss(nn.Module):
+
+class TripletLossHardMining(nn. Module):
+    """
+    简单有效的 Batch Hard Triplet Loss
+    - 使用 Soft Margin 避免 loss 归零
+    - 不使用复杂的加权策略
+    """
     def __init__(self, margin=0.3):
-        super(TripletLoss, self).__init__()
-        self.ranking_loss = nn.MarginRankingLoss(margin=margin)
+        super().__init__()
+        self.margin = margin
     
-    def forward(self, feat, labels, target_feat=None):
-        if target_feat is None: target_feat = feat
-        dist = torch.cdist(feat, target_feat)
-        N = dist.size(0)
+    def forward(self, feat, labels):
+        # L2 归一化
+        feat = F.normalize(feat, p=2, dim=1)
         
-        is_pos = labels.expand(N, N).eq(labels.expand(N, N).t())
+        # 欧氏距离矩阵
+        dist = torch.cdist(feat, feat, p=2)
+        
+        N = dist.size(0)
+        is_pos = labels.unsqueeze(0).eq(labels. unsqueeze(1))
         is_neg = ~is_pos
         
-        if target_feat is feat:
-            mask_diag = torch.eye(N, dtype=torch.bool, device=feat.device)
-            is_pos = is_pos & ~mask_diag
-            
-        dist_ap, dist_an = [], []
-        for i in range(N):
-            dist_ap.append(dist[i][is_pos[i]].max() if is_pos[i].any() else torch.tensor(0., device=feat.device))
-            dist_an.append(dist[i][is_neg[i]].min() if is_neg[i].any() else torch.tensor(1e6, device=feat.device))
-            
-        dist_ap = torch.stack(dist_ap)
-        dist_an = torch.stack(dist_an)
-        y = torch.ones_like(dist_an)
-        return self.ranking_loss(dist_an, dist_ap, y)
+        # 排除对角线
+        mask_diag = torch.eye(N, dtype=torch.bool, device=feat.device)
+        is_pos = is_pos & ~mask_diag
+        
+        # Batch Hard Mining
+        # 最难正样本: 同类中最远的
+        dist_ap = torch.where(is_pos, dist, torch.zeros_like(dist)). max(dim=1)[0]
+        # 最难负样本: 异类中最近的
+        dist_an = torch.where(is_neg, dist, torch.full_like(dist, float('inf'))).min(dim=1)[0]
+        
+        # Soft Margin Loss: log(1 + exp(ap - an + margin))
+        loss = F.softplus(dist_ap - dist_an + self.margin).mean()
+        
+        return loss
 
-class GraphDistillationLoss(nn.Module):
-    def __init__(self, temperature=3.0):
-        super(GraphDistillationLoss, self).__init__()
-        # [关键] 使用 reduction='none' 以便后续进行 clamp 和加权
-        self.kl = nn.KLDivLoss(reduction='none')
-        self.T = temperature
 
-    def forward(self, logits_list, soft_labels_list, weights=None):
-        loss = 0
-        for k, (logit, label) in enumerate(zip(logits_list, soft_labels_list)):
-            log_prob = F.log_softmax(logit / self.T, dim=1)
-            
-            # 计算逐样本 KL 散度 [B]
-            l = self.kl(log_prob, label).sum(dim=1)
-            
-            # [关键急救] 截断 Loss，防止脏数据或极端分布导致梯度爆炸
-            l = torch.clamp(l, max=5.0)
-            
-            if weights is not None: 
-                l = (l * weights[k]).mean()
-            else:
-                l = l.mean()
-                
-            loss += l * (self.T**2)
-        return loss / len(logits_list)
-
-class TotalLoss(nn.Module):
-    def __init__(self, num_parts=6, lambda_graph=0.1, lambda_triplet=1.0, lambda_adv=0.1,
-                 label_smoothing=0.1, start_epoch=20):
-        super(TotalLoss, self).__init__()
+class TotalLoss(nn. Module):
+    """
+    简洁版总损失 = ID Loss + Triplet Loss
+    不使用复杂的跨模态损失
+    """
+    def __init__(self, num_parts=6, num_classes=206, feature_dim=512,
+                 lambda_triplet=1.0, label_smoothing=0.1, **kwargs):
+        super().__init__()
+        
         self.id_loss = MultiPartIDLoss(label_smoothing)
-        self.tri_loss = TripletLoss(margin=0.3)
-        self.graph_loss = GraphDistillationLoss(temperature=3.0)
-        self.adv_loss = nn.CrossEntropyLoss()
-        
-        self.lambdas = {'graph': lambda_graph, 'triplet': lambda_triplet, 'adv': lambda_adv}
-        self.start_epoch = start_epoch
+        self.tri_loss = TripletLossHardMining(margin=0.3)
+        self.lambda_triplet = lambda_triplet
 
-    def forward(self, outputs, labels, current_epoch=0, modality_labels=None, **kwargs):
+    def forward(self, outputs, labels, current_epoch=0, **kwargs):
         # 1. ID Loss
-        L_id = self.id_loss(outputs['id_logits'], labels)
+        L_id = self. id_loss(outputs['id_logits'], labels)
         
-        # 2. MTRL Triplet Loss
-        feat = F.normalize(torch.cat(outputs['id_features'], dim=1), p=2, dim=1)
+        # 2.  Triplet Loss
+        feat = torch.cat(outputs['id_features'], dim=1)
         L_tri = self.tri_loss(feat, labels)
         
-        L_trans = torch.tensor(0., device=labels.device)
-        if outputs['gray_features']:
-            feat_gray = F.normalize(torch.cat(outputs['gray_features'], dim=1), p=2, dim=1)
-            L_trans = self.tri_loss(feat, labels, feat_gray)
-            L_tri += 0.5 * L_trans
-            
-        # 3. Graph Loss (Safe Mode)
-        L_graph = torch.tensor(0., device=labels.device)
-        if current_epoch >= self.start_epoch and outputs['soft_labels']:
-            # 使用 id_logits 而非 graph_logits (如果模型没有独立 graph head)
-            logits = outputs.get('id_logits', [])
-            L_graph = self.graph_loss(logits, outputs['soft_labels'], outputs['entropy_weights'])
-            
-        # 4. Adv Loss
-        L_adv = torch.tensor(0., device=labels.device)
-        if outputs['adv_logits'] and modality_labels is not None:
-            for l in outputs['adv_logits']: L_adv += self.adv_loss(l, modality_labels)
-            L_adv /= len(outputs['adv_logits'])
-
-        total = L_id + \
-                self.lambdas['triplet'] * L_tri + \
-                self.lambdas['graph'] * L_graph + \
-                self.lambdas['adv'] * L_adv
-                
+        # 总损失
+        total = L_id + self.lambda_triplet * L_tri
+        
         return total, {
-            'loss_total': total.item(),
+            'loss_total': total. item(),
             'loss_id': L_id.item(),
             'loss_triplet': L_tri.item(),
-            'loss_graph': L_graph.item(),
-            'loss_adv': L_adv.item()
         }
+
+
+# 兼容别名
+TripletLoss = TripletLossHardMining
+WeightedRegularizationTriplet = TripletLossHardMining

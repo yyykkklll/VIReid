@@ -58,11 +58,13 @@ def parse_args():
     parser.add_argument('--trial', type=int, default=1)
     
     # ==================== 损失函数权重 ====================
-    parser.add_argument('--lambda-graph', type=float, default=0.1, help='图蒸馏损失权重')
-    parser.add_argument('--lambda-triplet', type=float, default=1.0, help='三元组损失权重')
+    parser.add_argument('--lambda-graph', type=float, default=0.3, help='图蒸馏损失权重')
+    parser. add_argument('--lambda-triplet', type=float, default=1.5, help='三元组损失权重')
     parser.add_argument('--lambda-adv', type=float, default=0.1, help='对抗损失权重')
+    parser.add_argument('--lambda-center', type=float, default=0.005, help='Center Loss权重')  # 新增
+    parser.add_argument('--graph-start-epoch', type=int, default=10, help='Graph Loss启用epoch')  # 新增
     parser.add_argument('--label-smoothing', type=float, default=0.1)
-    
+    parser.add_argument('--lambda-xmodal', type=float, default=0.5, help='跨模态损失权重')
     #保留旧参数接口防止报错 (实际已移除逻辑)
     parser.add_argument('--lambda-orth', type=float, default=0.0)
     parser.add_argument('--lambda-mod', type=float, default=0.0)

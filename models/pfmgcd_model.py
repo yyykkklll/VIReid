@@ -1,18 +1,14 @@
 """
-models/pfmgcd_model.py - Unified MTRL-Gated Framework
-兼容: RegDB (Small), SYSU/LLCM (Large)
+models/pfmgcd_model.py - Simple Strong Baseline
+减少 Dropout，保持简洁
 """
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import torchvision.transforms as T
-from torch.autograd import Function
+import torch.nn. functional as F
 
 from .pcb_backbone import PCBBackbone
-from .isg_dm import MultiPartISG_DM
-from .memory_bank import MultiPartMemoryBank
-from .graph_propagation import AdaptiveGraphPropagation
+
 
 def weights_init_kaiming(m):
     classname = m.__class__.__name__
@@ -20,228 +16,105 @@ def weights_init_kaiming(m):
         nn.init.kaiming_normal_(m.weight, a=0, mode='fan_out')
         if m.bias is not None:
             nn.init.constant_(m.bias, 0.0)
-    elif classname.find('BatchNorm1d') != -1:
+    elif classname. find('BatchNorm') != -1:
         nn.init.normal_(m.weight, 1.0, 0.01)
-        nn.init.constant_(m.bias, 0.0)
+        nn. init.constant_(m.bias, 0.0)
 
-# ==================== 基础组件 ====================
-
-class GradientReversalFunction(Function):
-    @staticmethod
-    def forward(ctx, x, lambda_):
-        ctx.lambda_ = lambda_
-        return x.view_as(x)
-    @staticmethod
-    def backward(ctx, grad_output):
-        return grad_output.neg() * ctx.lambda_, None
-
-class GatedGraphReasoning(nn.Module):
-    """
-    [策略四升级版] 门控图推理 (Gated GCN)
-    """
-    def __init__(self, feature_dim, top_k=5):
-        super(GatedGraphReasoning, self).__init__()
-        self.top_k = top_k
-        self.gcn_fc = nn.Linear(feature_dim, feature_dim, bias=False)
-        self.relu = nn.ReLU(inplace=True)
-        self.alpha = nn.Parameter(torch.zeros(1))
-        
-        self.gcn_fc.apply(weights_init_kaiming)
-
-    def forward(self, x, memory):
-        if memory is None or memory.size(0) == 0:
-            return x
-            
-        B, D = x.size()
-        # [修复] 替换过时的 torch.cuda.amp.autocast
-        # 使用 torch.amp.autocast 并指定 device_type
-        try:
-            from torch.amp import autocast
-            autocast_ctx = autocast('cuda', enabled=False)
-        except ImportError:
-            # 兼容旧版本 torch
-            from torch.cuda.amp import autocast
-            autocast_ctx = autocast(enabled=False)
-
-        with autocast_ctx:
-            x_fp32 = F.normalize(x.float(), p=2, dim=1)
-            mem_fp32 = F.normalize(memory.float(), p=2, dim=1)
-            sim = torch.mm(x_fp32, mem_fp32.t()) # [B, N]
-        
-        # 2. Top-K 检索
-        k = min(self.top_k, sim.size(1))
-        topk_val, topk_idx = torch.topk(sim, k=k, dim=1)
-        
-        # 3. 聚合邻居
-        neighbor_feats = F.embedding(topk_idx, memory) # [B, K, D]
-        attn = F.softmax(topk_val * 10, dim=1).unsqueeze(2) # [B, K, 1]
-        context = (neighbor_feats * attn).sum(dim=1) # [B, D]
-        
-        # 4. GCN Transform & Residual
-        out = self.relu(self.gcn_fc(context))
-        return x + self.alpha * out
-
-class ModalityDiscriminator(nn.Module):
-    def __init__(self, input_dim):
-        super(ModalityDiscriminator, self).__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, input_dim // 4),
-            nn.BatchNorm1d(input_dim // 4),
-            nn.ReLU(inplace=True),
-            nn.Linear(input_dim // 4, 2)
-        )
-        self.net.apply(weights_init_kaiming)
-
-    def forward(self, x, lambda_adv=0.1):
-        x = GradientReversalFunction.apply(x, lambda_adv)
-        return self.net(x)
-
-# ==================== 主模型 ====================
 
 class PF_MGCD(nn.Module):
+    """
+    Simple Strong Baseline
+    - PCB + IBN Backbone
+    - 6 部件 + BNNeck
+    - 单层 Dropout
+    """
     def __init__(self, num_parts=6, num_identities=395, feature_dim=512,
-                 memory_momentum=0.9, temperature=3.0, top_k=5, 
                  pretrained=True, backbone='resnet50', use_ibn=True,
-                 use_adversarial=True, use_graph_reasoning=True):
-        super(PF_MGCD, self).__init__()
+                 dropout=0.5, **kwargs):
+        super().__init__()
+        
         self.num_parts = num_parts
-        self.feature_dim = feature_dim
-        self.use_adversarial = use_adversarial
-        self.use_graph_reasoning = use_graph_reasoning
+        self. feature_dim = feature_dim
+        self. num_identities = num_identities
         
+        # 1.  Backbone
         self.backbone = PCBBackbone(num_parts, pretrained, backbone, use_ibn)
-        self.isg_dm = MultiPartISG_DM(num_parts, 2048, feature_dim, feature_dim)
-        self.grayscale = T.Grayscale(num_output_channels=3)
         
-        self.bottlenecks = nn.ModuleList()
-        self.classifiers = nn.ModuleList()
-        
-        if self.use_graph_reasoning:
-            self.gcns = nn.ModuleList()
-        if self.use_adversarial:
-            self.discriminators = nn.ModuleList()
-            
+        # 2. 部件降维 (无 Dropout)
+        self.reducers = nn.ModuleList()
         for _ in range(num_parts):
-            self.bottlenecks.append(nn.BatchNorm1d(feature_dim))
-            self.classifiers.append(nn.Linear(feature_dim, num_identities, bias=False))
-            
-            if self.use_graph_reasoning:
-                self.gcns.append(GatedGraphReasoning(feature_dim, top_k=top_k))
-            if self.use_adversarial:
-                self.discriminators.append(ModalityDiscriminator(feature_dim))
-                
+            self.reducers.append(nn.Sequential(
+                nn. Conv2d(2048, feature_dim, 1, bias=False),
+                nn.BatchNorm2d(feature_dim),
+                nn.ReLU(inplace=True)
+            ))
+        
+        # 3. BNNeck
+        self.bottlenecks = nn.ModuleList()
+        for _ in range(num_parts):
+            bn = nn.BatchNorm1d(feature_dim)
+            bn.bias.requires_grad_(False)
+            self.bottlenecks.append(bn)
+        
+        # 4. 分类器
+        self.classifiers = nn.ModuleList()
+        for _ in range(num_parts):
+            self. classifiers.append(nn.Linear(feature_dim, num_identities, bias=False))
+        
+        # 5. 单层 Dropout (仅分类器前)
+        self. dropout = nn. Dropout(p=dropout)
+        
+        # 初始化
+        self.reducers. apply(weights_init_kaiming)
         self.bottlenecks.apply(weights_init_kaiming)
         self.classifiers.apply(weights_init_kaiming)
-        self.dropout = nn.Dropout(p=0.5)
         
-        self.memory_bank = MultiPartMemoryBank(num_parts, num_identities, feature_dim, memory_momentum)
-        
-        # 注意: scale 参数在 graph_propagation.py 中定义，这里传入默认值即可
-        # 实际使用的是 loss.py 和 graph_propagation.py 中的逻辑
-        self.graph_loss_module = AdaptiveGraphPropagation(temperature, top_k, True)
+        # 占位
+        self.memory_bank = None
 
-    def forward(self, x, labels=None, current_epoch=0, **kwargs):
-        if self.training:
-            x_gray = self.grayscale(x)
-            x_all = torch.cat([x, x_gray], dim=0)
-            out_all = self.backbone(x_all)
-            part_feats_all = out_all[0] if isinstance(out_all, tuple) else out_all
-            
-            batch_size = x.size(0)
-            part_feats_orig = [f[:batch_size] for f in part_feats_all]
-            part_feats_gray = [f[batch_size:] for f in part_feats_all]
-        else:
-            out = self.backbone(x)
-            part_feats_orig = out[0] if isinstance(out, tuple) else out
-            part_feats_gray = None
-
-        id_feats_orig, _ = self.isg_dm(part_feats_orig)
-        if part_feats_gray:
-            id_feats_gray, _ = self.isg_dm(part_feats_gray)
+    def forward(self, x, labels=None, **kwargs):
+        # 1.  Backbone
+        part_features_raw, _ = self.backbone(x)
         
-        final_logits = []
-        final_feats = []
-        gray_feats_out = []
-        adv_logits = []
-        
+        # 2.  降维 + 池化
+        id_features = []
         for k in range(self.num_parts):
-            feat = id_feats_orig[k]
-            
-            if self.use_graph_reasoning and self.memory_bank.initialized.sum() > 0:
-                mem_k = self.memory_bank.get_part_memory(k).detach()
-                feat = self.gcns[k](feat, mem_k)
-            
-            final_feats.append(feat)
-            
-            if self.training and self.use_adversarial:
-                lambda_adv = 0.0 if current_epoch < 5 else 0.1
-                adv_logits.append(self.discriminators[k](feat, lambda_adv))
-            
-            feat_bn = self.bottlenecks[k](feat)
+            feat = self.reducers[k](part_features_raw[k])
+            feat = F.adaptive_avg_pool2d(feat, 1). flatten(1)
+            id_features.append(feat)
+        
+        # 3. BNNeck + 分类
+        logits = []
+        bn_features = []
+        for k in range(self.num_parts):
+            feat_bn = self.bottlenecks[k](id_features[k])
+            bn_features.append(feat_bn)
             
             if self.training:
-                final_logits.append(self.classifiers[k](self.dropout(feat_bn)))
-                if part_feats_gray:
-                    gray_feats_out.append(id_feats_gray[k])
+                logits.append(self.classifiers[k](self.dropout(feat_bn)))
             else:
-                final_logits.append(self.classifiers[k](feat_bn))
-
-        soft_labels, entropy_weights = None, None
-        if self.training and self.memory_bank.initialized.sum() > 0:
-            soft_labels, _, entropy_weights = self.graph_loss_module(final_feats, self.memory_bank)
-
+                logits.append(self.classifiers[k](feat_bn))
+        
         return {
-            'id_logits': final_logits,
-            'id_features': final_feats,
-            'gray_features': gray_feats_out if self.training else None,
-            'adv_logits': adv_logits if self.training and self.use_adversarial else None,
-            'soft_labels': soft_labels,
-            'entropy_weights': entropy_weights
+            'id_logits': logits,
+            'id_features': id_features,
+            'bn_features': bn_features,
+            'gray_features': None,
+            'adv_logits': None,
+            'soft_labels': None,
+            'entropy_weights': None
         }
 
     def extract_features(self, x, pool_parts=True):
         with torch.no_grad():
-            out = self.backbone(x)
-            part_feats = out[0] if isinstance(out, tuple) else out
-            id_feats, _ = self.isg_dm(part_feats)
+            outputs = self.forward(x)
+            bn_features = outputs['bn_features']
+            norm_feats = [F.normalize(f, p=2, dim=1) for f in bn_features]
             
-            bn_feats = []
-            for k in range(self.num_parts):
-                bn_feats.append(self.bottlenecks[k](id_feats[k]))
-            
-            norm_feats = [F.normalize(f, p=2, dim=1) for f in bn_feats]
-            if pool_parts: return torch.cat(norm_feats, dim=1)
-            else: return torch.stack(norm_feats, dim=1).mean(dim=1)
+            if pool_parts:
+                return torch.cat(norm_feats, dim=1)
+            else:
+                return torch.stack(norm_feats, dim=1). mean(dim=1)
 
-    def initialize_memory(self, dataloader, device, teacher_model=None):
-        self.eval()
-        print("🔄 正在初始化记忆库...")
-        all_feats = [[] for _ in range(self.num_parts)]
-        all_pids = []
-        with torch.no_grad():
-            for batch in dataloader:
-                imgs, pids = batch[0], batch[1]
-                
-                # [关键修复] 如果 pids 是 info 张量 [B, 3]，提取第1列 (label)
-                if pids.dim() > 1 and pids.size(1) >= 2:
-                    pids = pids[:, 1]
-                
-                imgs = imgs.to(device)
-                
-                out = self.backbone(imgs)
-                part_feats = out[0] if isinstance(out, tuple) else out
-                id_feats, _ = self.isg_dm(part_feats)
-                
-                for k in range(self.num_parts):
-                    all_feats[k].append(id_feats[k].cpu())
-                all_pids.append(pids)
-        
-        for k in range(self.num_parts):
-            all_feats[k] = torch.cat(all_feats[k], dim=0).to(device)
-        all_pids = torch.cat(all_pids, dim=0).to(device)
-        
-        print(f"  📊 Features shape: {all_feats[0].shape}")
-        print(f"  📊 Labels range: [{all_pids.min().item()}, {all_pids.max().item()}]")
-        
-        self.memory_bank.initialize_memory(all_feats, all_pids)
-        self.train()
+    def initialize_memory(self, *args, **kwargs):
+        pass
