@@ -1,274 +1,244 @@
-"""
-datasets/regdb.py - RegDB 数据集加载模块 (Strict Version)
-"""
-
 import os
 import numpy as np
 import torch.utils.data as data
 from PIL import Image
-from .data_process import *
+import random
+from .data_process import get_train_transforms, get_test_transformer
 
 class RegDB:
-    """
-    RegDB 数据集控制器
-    """
     def __init__(self, args):
         self.args = args
         self.trial = args.trial
         self.path = os.path.join(args.data_path, "RegDB/")
-        
-        # 参数校验
-        assert os.path.exists(self.path), f"RegDB path does not exist: {self.path}"
-        
         self.num_workers = args.num_workers
-        self.pid_numsample = args.pid_numsample
-        self.batch_pidnum = args.batch_pidnum
-        self.batch_size = self.pid_numsample * self.batch_pidnum
+        self.batch_size = args.pid_numsample * args.batch_pidnum
         self.test_batch = args.test_batch
 
-        # 初始化数据集
-        print(f"Dataset: Loading RegDB (Trial {self.trial})...")
+        # [修改] Train Set
         self.train_rgb = RegDB_train(args, self.path, self.trial, modal='rgb')
         self.train_ir = RegDB_train(args, self.path, self.trial, modal='ir')
 
-        # 确保 RGB 和 IR 的 ID 数量一致，否则采样器会出错
-        assert self.train_rgb.num_classes == self.train_ir.num_classes, \
-            f"ID mismatch: RGB({self.train_rgb.num_classes}) vs IR({self.train_ir.num_classes})"
+        self.rgb_relabel_dict = self.train_rgb.relabel_dict
+        self.ir_relabel_dict = self.train_ir.relabel_dict
 
-        # 初始化测试集
+        # [修改] Test Set
         self.query = RegDB_test(args, self.path, mode="thermal", trial=self.trial)
         self.gallery = RegDB_test(args, self.path, mode="visible", trial=self.trial)
         
+        self.n_query = len(self.query)
+        self.n_gallery = len(self.gallery)
+        
         self.query_loader = data.DataLoader(
-            self.query, self.test_batch, shuffle=False, num_workers=self.num_workers
-        )
+            self.query, self.test_batch, shuffle=False, num_workers=self.num_workers, drop_last=False)
         self.gallery_loader = data.DataLoader(
-            self.gallery, self.test_batch, shuffle=False, num_workers=self.num_workers
-        )
-        self.gallery_loaders = [self.gallery_loader]
-
+            self.gallery, self.test_batch, shuffle=False, num_workers=self.num_workers, drop_last=False)
+    
+    def get_train_loader(self):
+        self.train_rgb.load_mode = 'train'
+        self.train_ir.load_mode = 'train'
+        sampler = RegDB_Sampler(self.args, self.train_rgb.label, self.train_ir.label)
+        
+        self.train_rgb.sampler_idx = sampler.rgb_index
+        self.train_ir.sampler_idx = sampler.ir_index
+        
+        train_rgb_loader = data.DataLoader(self.train_rgb, batch_size=self.batch_size,
+                                           sampler=sampler, num_workers=self.num_workers, drop_last=True)
+        train_ir_loader = data.DataLoader(self.train_ir, batch_size=self.batch_size,
+                                          sampler=sampler, num_workers=self.num_workers, drop_last=True)
+        return train_rgb_loader, train_ir_loader
+    
     def get_normal_loader(self):
-        """获取用于初始化记忆库的普通 DataLoader (仅 RGB)"""
         self.train_rgb.load_mode = 'test'
-        loader = data.DataLoader(
-            self.train_rgb, batch_size=self.test_batch, 
-            num_workers=self.num_workers, shuffle=False
-        )
-        return loader, None
-
+        self.train_ir.load_mode = 'test'
+        normal_rgb_loader = data.DataLoader(self.train_rgb, batch_size=self.test_batch,
+                                       num_workers=self.num_workers, drop_last=False)
+        normal_ir_loader = data.DataLoader(self.train_ir, batch_size=self.test_batch,
+                                       num_workers=self.num_workers, drop_last=False)
+        return normal_rgb_loader, normal_ir_loader
 
 class RegDB_train(data.Dataset):
-    """
-    RegDB 训练数据集
-    """
     def __init__(self, args, data_path, trial, modal=None):
-        self.num_classes = 0 # 将在 _init_data 中更新
+        self.num_classes = args.num_classes
         self.relabel = args.relabel
         self.data_path = data_path
-        
-        # 确定的 Transform 接口
-        self.transform_color = transform_color_normal
-        self.transform_ir = transform_infrared_normal
-        self.transform_test = transform_test
-        
-        # 输入校验
-        if modal not in ['rgb', 'ir']:
-            raise ValueError(f"Invalid modal type: {modal}. Must be 'rgb' or 'ir'.")
         self.modal = modal
-        self.trial = trial
         self.sampler_idx = None
-        self.load_mode = 'train'
+        self.load_mode = None
+        self.trial = trial
         
+        # [修改] 动态获取 Transform
+        self.img_h = args.img_h
+        self.img_w = args.img_w
+        
+        if modal == 'rgb':
+            self.transform_normal, self.transform_aug = get_train_transforms(self.img_h, self.img_w, 'rgb')
+        else:
+            self.transform_normal, self.transform_aug = get_train_transforms(self.img_h, self.img_w, 'ir')
+            
+        self.transform_test = get_test_transformer(self.img_h, self.img_w)
+
         self._init_data()
 
     def _init_data(self):
-        # 1. 路径构建
         if self.modal == 'rgb':
-            idx_file = os.path.join(self.data_path, f'idx/train_visible_{self.trial}.txt')
+            train_list = self.data_path + 'idx/train_visible_{}'.format(self.trial) + '.txt'
         else:
-            idx_file = os.path.join(self.data_path, f'idx/train_thermal_{self.trial}.txt')
+            train_list = self.data_path + 'idx/train_thermal_{}'.format(self.trial) + '.txt'
             
-        if not os.path.exists(idx_file):
-            raise FileNotFoundError(f"Index file not found: {idx_file}")
+        img_file, train_label = self._load_data(train_list)
+        train_image = []
+        for i in range(len(img_file)):
+            img = Image.open(self.data_path + img_file[i])
+            # [修改] Resize 使用 args
+            img = img.resize((self.img_w, self.img_h), Image.LANCZOS)
+            pix_array = np.array(img)
+            train_image.append(pix_array)
 
-        # 2. 数据加载
-        img_paths, labels = self._load_data_file(idx_file)
+        train_image = np.array(train_image)
+        length = len(train_label)
+        train_label = np.array(train_label).reshape(length,1)
+        train_idx = np.array([i for i in range(length)]).reshape(length,1)
+        train_cam = np.array([0 for i in range(length)]).reshape(length,1)
+        train_info = np.concatenate((train_idx,train_label,train_cam),axis=1)
         
-        # 3. 预加载图片到内存
-        self.train_image = []
-        for path in img_paths:
-            full_path = os.path.join(self.data_path, path)
-            if not os.path.exists(full_path):
-                raise FileNotFoundError(f"Image not found: {full_path}")
-            
-            # 统一转为 RGB 并 Resize，存储为 ndarray
-            img = Image.open(full_path).convert('RGB')
-            img = img.resize((144, 288), Image.LANCZOS)
-            self.train_image.append(np.array(img))
+        self.train_info, self.relabel_dict = self._relabel(train_info)
+        self.train_image = train_image
+        self.label = self.train_info[:,1]
 
-        self.train_image = np.array(self.train_image)
-        
-        # 4. 构建 Info 矩阵
-        length = len(labels)
-        train_idx = np.arange(length).reshape(-1, 1)
-        train_label = np.array(labels).reshape(-1, 1)
-        
-        # 显式设置 Camera ID (RGB=0, IR=1)
-        cam_val = 0 if self.modal == 'rgb' else 1
-        train_cam = np.full((length, 1), cam_val)
-        
-        train_info = np.concatenate((train_idx, train_label, train_cam), axis=1)
-        
-        # 5. ID 重映射
-        self.train_info, self.pid2label = self._relabel(train_info)
-        self.label = self.train_info[:, 1]
-        self.num_classes = len(self.pid2label)
-
-    def _load_data_file(self, file_path):
-        with open(file_path, 'r') as f:
-            lines = f.read().splitlines()
-        paths = [x.split(' ')[0] for x in lines]
-        labels = [int(x.split(' ')[1]) for x in lines]
-        return paths, labels
-
+    def _load_data(self, input_data_path):
+        with open(input_data_path) as f:
+            data_file_list = open(input_data_path, 'rt').read().splitlines()
+            file_image = [s.split(' ')[0] for s in data_file_list]
+            file_label = [int(s.split(' ')[1]) for s in data_file_list]
+        return file_image, file_label
+    
     def _relabel(self, info):
-        """严格的 ID 重映射：确保映射到 [0, N-1]"""
-        raw_labels = info[:, 1]
-        unique_pids = sorted(list(set(raw_labels)))
-        
-        pid2label = {pid: i for i, pid in enumerate(unique_pids)}
-        
-        # 执行重映射
-        for i in range(len(info)):
-            info[i, 1] = pid2label[raw_labels[i]]
-            
-        return info, pid2label
-
+        label = info[:,1]
+        gt = label.reshape(label.shape[0],-1)
+        info = np.concatenate((info,gt),axis=1)
+        pid_set = set(label)
+        random_pid = list(range(len(pid_set)))
+        random.shuffle(random_pid)
+        pid2label = {pid:idx for idx, pid in enumerate(pid_set)}
+        pid2random_label = {pid:idx for idx, pid in enumerate(random_pid)}
+        for i in range(len(label)):
+            labeled_id = pid2label[label[i]]
+            info[:,-1][i] = labeled_id
+            if self.relabel:
+                info[:,1][i]= pid2random_label[labeled_id]
+            else:
+                info[:,1][i]= labeled_id
+        return info, pid2random_label
+    
     def __len__(self):
         return len(self.train_image)
-
+    
     def __getitem__(self, index):
-        # 索引映射
-        if self.load_mode == 'train' and self.sampler_idx is not None:
-            real_index = self.sampler_idx[index]
-        else:
-            real_index = index
-
-        info = self.train_info[real_index]
-        img_arr = self.train_image[real_index] # Type: numpy.ndarray (H, W, C)
-        
-        if self.load_mode == 'train':
-            # 应用增强
-            # data_process.py 中的 transforms.Compose 第一个操作是 ToPILImage()
-            # 它明确支持 numpy.ndarray 输入，无需转换
-            if self.modal == 'rgb':
-                img = self.transform_color(img_arr)
-                aug_img = self.transform_color(img_arr)
-            else:
-                img = self.transform_ir(img_arr)
-                aug_img = self.transform_ir(img_arr)
+        if self.load_mode == 'train': 
+            idx = self.sampler_idx[index]
+            info = self.train_info[idx]
+            img_np = self.train_image[idx]
             
-            return img, aug_img, info
-        else:
-            # 测试模式
-            img = self.transform_test(img_arr)
-            return img, info
-
+            # [修改] 关键修复：将 numpy 数组转回 PIL Image
+            img = Image.fromarray(img_np)
+            
+            return self.transform_normal(img), self.transform_aug(img), info
+            
+        else: # extract features
+            img_np = self.train_image[index]
+            
+            # [修改] 关键修复：extract feature 也要转
+            img = Image.fromarray(img_np)
+            
+            return self.transform_test(img), self.train_info[index]
 
 class RegDB_test(data.Dataset):
-    """
-    RegDB 测试数据集
-    """
     def __init__(self, args, data_path, mode, trial):
         self.data_path = data_path
-        self.transform = transform_test
+        self.mode = mode
         
-        if mode == "visible":
-            idx_file = os.path.join(data_path, f'idx/test_visible_{trial}.txt')
-            cam_val = 0
-        else:
-            idx_file = os.path.join(data_path, f'idx/test_thermal_{trial}.txt')
-            cam_val = 1
+        # [修改] 动态获取 Transform
+        self.transform = get_test_transformer(args.img_h, args.img_w)
+        self.img_h = args.img_h
+        self.img_w = args.img_w
+        
+        test_img_file, test_label, test_cam = self._process_test_regdb(trial, mode)
+        test_image = []
+        for i in range(len(test_img_file)):
+            img = Image.open(test_img_file[i])
+            # [修改] Resize 使用 args
+            img = img.resize((self.img_w, self.img_h), Image.LANCZOS)
+            pix_array = np.array(img)
+            test_image.append(pix_array)
+        test_image = np.array(test_image)
 
-        if not os.path.exists(idx_file):
-            raise FileNotFoundError(f"Test index file not found: {idx_file}")
-
-        with open(idx_file, 'r') as f:
-            lines = f.read().splitlines()
-            
-        self.img_paths = [os.path.join(data_path, x.split(' ')[0]) for x in lines]
-        self.labels = np.array([int(x.split(' ')[1]) for x in lines])
-        self.cams = np.full(len(self.labels), cam_val)
+        self.test_image = test_image
+        self.test_label = test_label
+        self.test_cam = test_cam
 
     def __len__(self):
-        return len(self.labels)
+        return len(self.test_label)
 
     def __getitem__(self, index):
-        path = self.img_paths[index]
-        # 测试集读取必须健壮
-        if not os.path.exists(path):
-             raise FileNotFoundError(f"Test image not found: {path}")
+        img_np = self.test_image[index]
+        
+        # [修改] 关键修复：转为 PIL Image
+        img = Image.fromarray(img_np)
+        
+        return self.transform(img), self.test_label[index]
 
-        img = Image.open(path).convert('RGB')
-        img = img.resize((144, 288), Image.LANCZOS)
-        img = np.array(img)
-        img = self.transform(img)
-            
-        return img, self.labels[index], self.cams[index]
+    def _process_test_regdb(self, trial, mode):
+        if mode == "visible":
+            file_path = os.path.join(self.data_path, 'idx/test_visible_{}'.format(trial) + '.txt')
+        elif mode == "thermal":
+            file_path = os.path.join(self.data_path, 'idx/test_thermal_{}'.format(trial) + '.txt')
 
+        with open(file_path) as f:
+            data_file_list = open(file_path, 'rt').read().splitlines()
+            file_image = [self.data_path + '/' + s.split(' ')[0] for s in data_file_list]
+            file_label = [int(s.split(' ')[1]) for s in data_file_list]
+            file_cam = [0 for i in range(len(file_label))]
+        return file_image, np.array(file_label), np.array(file_cam)
 
 class RegDB_Sampler(data.Sampler):
-    """
-    RegDB 专用采样器
-    """
-    def __init__(self, args, rgb_labels, ir_labels):
-        self.rgb_labels = rgb_labels
-        self.ir_labels = ir_labels
+    # 保持不变
+    def __init__(self, args, rgb, ir):
+        self.rgb = rgb
+        self.ir = ir
+        self.len=max(len(rgb),len(ir))*5 # RegDB 比较小，这里扩大 epoch 长度
+        self.num_classes = args.num_classes
         self.batch_pidnum = args.batch_pidnum
         self.pid_numsample = args.pid_numsample
-        self.length = max(len(rgb_labels), len(ir_labels))
         
-        self.rgb_dict = self._build_dict(rgb_labels)
-        self.ir_dict = self._build_dict(ir_labels)
-        
-        self.pids = sorted(list(set(rgb_labels)))
-        self.rgb_index = []
-        self.ir_index = []
-        self._generate_indices()
+        self.rgb_dict = {k:[] for k in range(self.num_classes)}
+        self.ir_dict  = {k:[] for k in range(self.num_classes)}
+        for i in range(len(rgb)):
+            self.rgb_dict[int(rgb[i])].append(i)
+            if i < len(ir):
+                self.ir_dict[int(ir[i])].append(i)
 
-    def _build_dict(self, labels):
-        d = {}
-        for idx, label in enumerate(labels):
-            if label not in d:
-                d[label] = []
-            d[label].append(idx)
-        return d
-
-    def _generate_indices(self):
-        self.rgb_index = []
-        self.ir_index = []
+        self._sampler()
         
-        num_batches = self.length // (self.batch_pidnum * self.pid_numsample) + 1
-        
-        for _ in range(num_batches):
-            batch_pids = np.random.choice(self.pids, self.batch_pidnum, replace=False)
-            
-            for pid in batch_pids:
-                # RGB Sampling
-                rgb_idxs = self.rgb_dict[pid]
-                replace_rgb = len(rgb_idxs) < self.pid_numsample
-                sel_rgb = np.random.choice(rgb_idxs, self.pid_numsample, replace=replace_rgb)
-                self.rgb_index.extend(sel_rgb)
-                
-                # IR Sampling
-                ir_idxs = self.ir_dict[pid]
-                replace_ir = len(ir_idxs) < self.pid_numsample
-                sel_ir = np.random.choice(ir_idxs, self.pid_numsample, replace=replace_ir)
-                self.ir_index.extend(sel_ir)
+    def _sampler(self):
+        rgb_index = []
+        ir_index = []
+        batch_num = int(1+self.len/(self.batch_pidnum*self.pid_numsample))
+        for i in range(batch_num):
+            selected_id = random.sample(list(range(self.num_classes)),self.batch_pidnum)
+            for each_id in selected_id:
+                if min(len(self.rgb_dict[each_id]),len(self.ir_dict[each_id])) < self.pid_numsample:
+                    selected_rgb = random.choices(self.rgb_dict[each_id],k=self.pid_numsample)
+                    selected_ir = random.choices(self.ir_dict[each_id],k=self.pid_numsample)
+                else:
+                    selected_rgb = random.sample(self.rgb_dict[each_id],self.pid_numsample)
+                    selected_ir = random.sample(self.ir_dict[each_id],self.pid_numsample)
+                rgb_index.extend(selected_rgb)
+                ir_index.extend(selected_ir)
+        self.rgb_index = rgb_index
+        self.ir_index = ir_index
 
     def __iter__(self):
-        self._generate_indices()
-        return iter(range(len(self.rgb_index)))
-
+        return iter(range(self.len))
+            
     def __len__(self):
-        return len(self.rgb_index)
+        return self.len

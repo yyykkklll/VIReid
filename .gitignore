@@ -2,6 +2,7 @@
 datasets/LLCM
 datasets/RegDB
 datasets/SYSU-MM01
+pretrained/vit_base_patch16_224.bin
 
 # Python cache files
 __pycache__/

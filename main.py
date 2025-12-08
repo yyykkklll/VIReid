@@ -1,196 +1,170 @@
-"""
-main.py - PF-MGCD 主入口程序 (Modular Ultimate Version)
-
-功能:
-- 支持基础 Strong Baseline (IBN+GeM)
-- 支持高级特性开关 (Adversarial, Graph Reasoning)
-- 自动适配不同数据集的训练策略
-"""
-
 import os
-import sys
 import argparse
+import setproctitle
 import torch
+import warnings
+import time
+import copy # [新增]
 
-# 添加项目路径到系统路径
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+import datasets
+import models
+from task import train, test
+from models.sg_module import SGM 
+from utils import time_now, makedir, Logger, set_seed, save_checkpoint
 
-from utils import set_seed
+warnings.filterwarnings("ignore")
 
-def parse_args():
-    parser = argparse.ArgumentParser(description='PF-MGCD for Visible-Infrared Person Re-Identification')
+def main(args):
+    best_rank1 = 0
+    best_mAP = 0
     
-    # ==================== 基础设置 ====================
-    parser.add_argument('--dataset', type=str, default='sysu', choices=['sysu', 'regdb', 'llcm'])
-    parser.add_argument('--data-path', type=str, default='./datasets')
-    parser.add_argument('--mode', type=str, default='train', choices=['train', 'test'])
-    parser.add_argument('--resume', type=str, default='')
-    parser.add_argument('--gpu', type=str, default='0')
-    parser.add_argument('--seed', type=int, default=42)
+    log_path = os.path.join(args.save_path, "log/")
+    model_path = os.path.join(args.save_path, "models/")
+    makedir(log_path)
+    makedir(model_path)
     
-    # ==================== 模型参数 ====================
-    parser.add_argument('--num-parts', type=int, default=6)
-    parser.add_argument('--feature-dim', type=int, default=512)
-    parser.add_argument('--memory-momentum', type=float, default=0.9)
-    parser.add_argument('--temperature', type=float, default=3.0)
-    parser.add_argument('--top-k', type=int, default=5)
-    parser.add_argument('--pretrained', action='store_true')
-    parser.add_argument('--backbone', type=str, default='resnet50')
-    parser.add_argument('--amp', action='store_true', help='启用混合精度训练')
+    logger = Logger(os.path.join(log_path, "log.txt"))
+    if not args.resume and args.mode == 'train' and args.model_path == 'default':
+        logger.clear()
+        
+    logger(args)
     
-    # [核心策略开关]
-    parser.add_argument('--use-ibn', action='store_true', default=True, help='开启 IBN-Net (默认开启)')
-    parser.add_argument('--use-adversarial', action='store_true', help='开启模态对抗训练 (策略三)')
-    parser.add_argument('--use-graph-reasoning', action='store_true', help='开启图推理 GCN (策略四)')
+    dataset = datasets.create(args)
+    model = models.create(args)
+
+    if args.mode == "train":
+        sgm = SGM(args).to(model.device)
+        
+        enable_phase1 = False
+        if args.resume or args.model_path != 'default':
+            model.resume_model(args.model_path)
+            if 'wsl' in args.debug and args.model_path == 'default' and model.resume_epoch == 0:
+                 enable_phase1 = True
+        elif 'wsl' in args.debug:
+            enable_phase1 = True
+        
+        # ======================================================
+        # Phase 1: 单模态预热
+        # ======================================================
+        if enable_phase1:
+            logger('Time: {} | [Phase 1] Intra-modal Warmup Start'.format(time_now()))
+            for current_epoch in range(0, args.stage1_epoch):
+                model.scheduler_phase1.step(current_epoch)
+                
+                _, result = train(args, model, dataset, current_epoch, sgm, logger, enable_phase1=True)
+                
+                cmc, mAP, mINP = test(args, model, dataset, current_epoch) 
+                best_rank1 = max(cmc[0], best_rank1)
+                best_mAP = max(mAP, best_mAP)
+                
+                logger('Time: {} | Phase 1 Epoch {}; Setting: {}'.format(time_now(), current_epoch+1, args.save_path))
+                logger(f'LR: {model.scheduler_phase1.get_lr()[0]}')
+                logger(result)
+                logger('R1:{:.2f} | R10:{:.2f} | mAP:{:.2f} | Best R1:{:.2f}'.format(
+                    cmc[0]*100, cmc[9]*100, mAP*100, best_rank1*100))
+                logger('=' * 50)
+                
+                if current_epoch == args.stage1_epoch - 1:
+                    save_checkpoint(args, model, current_epoch + 1)
+
+        # ======================================================
+        # Phase 2: 结构感知对齐
+        # ======================================================
+        enable_phase1 = False
+        start_epoch = model.resume_epoch
+        if start_epoch < args.stage1_epoch and 'wsl' in args.debug and not args.resume:
+             start_epoch = args.stage1_epoch
+
+        logger('Time: {} | [Phase 2] Structure-Aware Alignment Start from Epoch {}'.format(time_now(), start_epoch))
+        
+        # [核心创新点实现]：专家权重继承 (Expert Inheritance)
+        # 在进入 Phase 2 之前，将 Classifier1 (RGB Expert) 的权重复制给 Classifier3 (Shared)
+        # 避免 Classifier3 冷启动导致的崩塌
+        if model.classifier3 is not None and model.classifier1 is not None:
+            logger('>>> [Init] Initializing Shared Classifier from RGB Expert...')
+            model.classifier3.load_state_dict(model.classifier1.state_dict())
+            
+            # 由于优化器已经初始化过了，我们需要确保优化器状态也是健康的
+            # 这里简单起见，我们让 classifier3 继承权重，然后在后续训练中微调
+        
+        for current_epoch in range(start_epoch, args.stage2_epoch):
+            model.scheduler_phase2.step(current_epoch)
+            
+            _, result = train(args, model, dataset, current_epoch, sgm, logger, enable_phase1=False)
+
+            cmc, mAP, mINP = test(args, model, dataset, current_epoch) 
+            
+            is_best_rank = (cmc[0] >= best_rank1)
+            best_rank1 = max(cmc[0], best_rank1)
+            best_mAP = max(mAP, best_mAP)
+            
+            model.save_model(current_epoch + 1, is_best_rank)
+            
+            logger('=' * 50)
+            logger('Epoch: {} | Time: {}'.format(current_epoch + 1, time_now()))
+            logger(f'LR: {model.scheduler_phase2.get_lr()[0]}')
+            logger(result)
+            logger('R1:{:.2f} | R10:{:.2f} | mAP:{:.2f} | Best R1:{:.2f}'.format(
+                    cmc[0]*100, cmc[9]*100, mAP*100, best_rank1*100))
+            logger('=' * 50)
+        
+    if args.mode == 'test':
+        model.resume_model(args.model_path)
+        cmc, mAP, mINP = test(args, model, dataset)
+        logger('Time: {}; Test on Dataset: {}'.format(time_now(), args.dataset))
+        logger('R1:{:.2f} | R10:{:.2f} | mAP:{:.2f}'.format(
+               cmc[0]*100, cmc[9]*100, mAP*100))
+        
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser("SG-WSL: Semantic-Graph Weakly Supervised ReID")
+    parser.add_argument("--dataset", default="regdb", type=str, help="dataset name")
+    parser.add_argument("--data-path", default="/root/vireid/datasets", type=str)
+    parser.add_argument("--arch", default="vit", type=str, help="backbone architecture")
+    parser.add_argument('--feat-dim', default=768, type=int, help='feature dimension')
+    parser.add_argument('--img-h', default=256, type=int)
+    parser.add_argument('--img-w', default=128, type=int)
+    parser.add_argument('--mode', default='train', help='train or test')
+    parser.add_argument("--save-path", default="save/", type=str)
+    parser.add_argument("--device", default=0, type=int)
+    parser.add_argument("--seed", default=1, type=int)
+    parser.add_argument('--num-workers', default=8, type=int)
     
-    # ==================== 数据集参数 ====================
-    parser.add_argument('--num-classes', type=int, default=395)
-    parser.add_argument('--num-workers', type=int, default=4)
-    parser.add_argument('--pid-numsample', type=int, default=8)
-    parser.add_argument('--batch-pidnum', type=int, default=8)
-    parser.add_argument('--test-batch', type=int, default=128)
-    parser.add_argument('--img-w', type=int, default=144)
-    parser.add_argument('--img-h', type=int, default=288)
-    parser.add_argument('--relabel', action='store_true', default=True)
-    parser.add_argument('--search-mode', type=str, default='all', choices=['all', 'indoor'])
-    parser.add_argument('--gall-mode', type=str, default='single', choices=['single', 'multi'])
-    parser.add_argument('--test-mode', type=str, default='v2t', choices=['v2t', 't2v'])
-    parser.add_argument('--trial', type=int, default=1)
+    parser.add_argument('--lr', default=0.0003, type=float)
+    parser.add_argument('--weight-decay', default=0.05, type=float)
+    parser.add_argument('--milestones', nargs='+', type=int, default=[30, 70])
+    parser.add_argument('--sigma', default=0.8, type=float)
+    parser.add_argument('-T', '--temperature', default=3, type=float)
     
-    # ==================== 损失函数权重 ====================
-    parser.add_argument('--lambda-graph', type=float, default=0.3, help='图蒸馏损失权重')
-    parser. add_argument('--lambda-triplet', type=float, default=1.5, help='三元组损失权重')
-    parser.add_argument('--lambda-adv', type=float, default=0.1, help='对抗损失权重')
-    parser.add_argument('--lambda-center', type=float, default=0.005, help='Center Loss权重')  # 新增
-    parser.add_argument('--graph-start-epoch', type=int, default=10, help='Graph Loss启用epoch')  # 新增
-    parser.add_argument('--label-smoothing', type=float, default=0.1)
-    parser.add_argument('--lambda-xmodal', type=float, default=0.5, help='跨模态损失权重')
-    #保留旧参数接口防止报错 (实际已移除逻辑)
-    parser.add_argument('--lambda-orth', type=float, default=0.0)
-    parser.add_argument('--lambda-mod', type=float, default=0.0)
+    parser.add_argument('--batch-pidnum', default=8, type=int)
+    parser.add_argument('--pid-numsample', default=4, type=int)
+    parser.add_argument('--test-batch', default=128, type=int)
+    parser.add_argument('--stage1-epoch', default=20, type=int)
+    parser.add_argument('--stage2-epoch', default=120, type=int)
     
-    # ==================== 训练参数 ====================
-    parser.add_argument('--total-epoch', type=int, default=120)
-    parser.add_argument('--warmup-epochs', type=int, default=10)
-    parser.add_argument('--batch-size', type=int, default=64)
-    parser.add_argument('--lr', type=float, default=0.00035)
-    parser.add_argument('--weight-decay', type=float, default=5e-4)
-    parser.add_argument('--grad-clip', type=float, default=5.0)
-    parser.add_argument('--lr-scheduler', type=str, default='cosine')
-    parser.add_argument('--lr-step', type=str, default='40,70')
-    parser.add_argument('--lr-gamma', type=float, default=0.1)
-    parser.add_argument('--init-memory', action='store_true')
+    parser.add_argument('--relabel', default=1, type=int)
+    parser.add_argument('--weak-weight', default=0.25, type=float)
+    parser.add_argument('--tri-weight', default=0.25, type=float)
+    parser.add_argument('--debug', default='wsl', type=str)
     
-    # ==================== 保存和日志 ====================
-    parser.add_argument('--save-dir', type=str, default='./checkpoints')
-    parser.add_argument('--log-dir', type=str, default='./logs')
-    parser.add_argument('--save-epoch', type=int, default=10)
-    parser.add_argument('--eval-epoch', type=int, default=5)
+    parser.add_argument('--trial', default=1, type=int)
+    parser.add_argument('--search-mode', default='all', type=str)
+    parser.add_argument('--gall-mode', default='single', type=str)
+    parser.add_argument('--test-mode', default='t2v', type=str)
     
-    # ==================== 测试参数 ====================
-    parser.add_argument('--model-path', type=str, default='')
-    parser.add_argument('--pool-parts', action='store_true')
-    parser.add_argument('--distance-metric', type=str, default='euclidean')
+    parser.add_argument('--resume', default=0, type=int)
+    parser.add_argument('--model-path', default='default', type=str)
     
     args = parser.parse_args()
+    args.save_path = './saved_' + args.dataset + '_' + args.arch + '/' + args.save_path
     
-    # 自动设置类别数
-    if args.dataset == 'sysu': args.num_classes = 395
-    elif args.dataset == 'regdb': args.num_classes = 206
-    elif args.dataset == 'llcm': args.num_classes = 713
-    
-    return args
-
-def main():
-    args = parse_args()
-    os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if args.dataset =='sysu':
+        args.num_classes = 395
+    elif args.dataset =='regdb':
+        args.num_classes = 206
+        args.save_path += f'_{args.trial}'
+    elif args.dataset == 'llcm':
+        args.num_classes = 713
+        
     set_seed(args.seed)
-    
-    os.makedirs(args.save_dir, exist_ok=True)
-    os.makedirs(args.log_dir, exist_ok=True)
-    
-    print("="*70)
-    print(f"Dataset: {args.dataset.upper()} | Mode: {args.mode.upper()}")
-    print(f"Strategies: IBN={args.use_ibn}, Adv={args.use_adversarial}, GCN={args.use_graph_reasoning}")
-    print("="*70)
-    
-    # 创建模型
-    print("🔧 Creating Student Model...")
-    from models.pfmgcd_model import PF_MGCD
-    
-    model = PF_MGCD(
-        num_parts=args.num_parts,
-        num_identities=args.num_classes,
-        feature_dim=args.feature_dim,
-        memory_momentum=args.memory_momentum,
-        temperature=args.temperature,
-        top_k=args.top_k,
-        pretrained=args.pretrained,
-        backbone=args.backbone,
-        use_ibn=args.use_ibn,
-        use_adversarial=args.use_adversarial,      # [新增]
-        use_graph_reasoning=args.use_graph_reasoning # [新增]
-    ).to(device)
-    
-    if args.mode == 'train':
-        from datasets.dataloader_adapter import get_dataloader
-        train_loader, _ = get_dataloader(args)
-        
-        print("🔧 Creating Teacher Model...")
-        teacher_model = PF_MGCD(
-            num_parts=args.num_parts,
-            num_identities=args.num_classes,
-            feature_dim=args.feature_dim,
-            memory_momentum=args.memory_momentum,
-            temperature=args.temperature,
-            top_k=args.top_k,
-            pretrained=False,
-            backbone=args.backbone,
-            use_ibn=args.use_ibn,
-            use_adversarial=args.use_adversarial,
-            use_graph_reasoning=args.use_graph_reasoning
-        ).to(device)
-        
-        teacher_model.load_state_dict(model.state_dict())
-        for param in teacher_model.parameters(): param.requires_grad = False
-        
-        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-        
-        # 简单断点恢复逻辑 (仅权重)
-        start_epoch = 0
-        if args.resume and os.path.isfile(args.resume):
-            print(f"📂 Loading checkpoint: {args.resume}")
-            checkpoint = torch.load(args.resume, map_location=device)
-            start_epoch = checkpoint.get('epoch', 0)
-            model.load_state_dict(checkpoint['model'])
-            if 'teacher' in checkpoint and checkpoint['teacher']:
-                teacher_model.load_state_dict(checkpoint['teacher'])
-            if 'optim' in checkpoint: optimizer.load_state_dict(checkpoint['optim'])
-            print(f"✅ Resuming from epoch {start_epoch+1}")
-
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.total_epoch, last_epoch=-1)
-        # 如果需要恢复 scheduler 状态可在此添加
-        
-        if args.dataset == 'sysu': from datasets.sysu import SYSU; dataset_obj = SYSU(args)
-        elif args.dataset == 'regdb': from datasets.regdb import RegDB; dataset_obj = RegDB(args)
-        elif args.dataset == 'llcm': from datasets.llcm import LLCM; dataset_obj = LLCM(args)
-        
-        from task.train import train
-        train(model, train_loader, dataset_obj, optimizer, scheduler, args, device, teacher_model, start_epoch)
-        
-    elif args.mode == 'test':
-        print(f"📂 Loading test model: {args.model_path}")
-        checkpoint = torch.load(args.model_path, map_location=device)
-        if 'model' in checkpoint: model.load_state_dict(checkpoint['model'])
-        elif 'model_state_dict' in checkpoint: model.load_state_dict(checkpoint['model_state_dict'])
-        
-        if args.dataset == 'sysu': from datasets.sysu import SYSU; dataset_obj = SYSU(args)
-        elif args.dataset == 'regdb': from datasets.regdb import RegDB; dataset_obj = RegDB(args)
-        elif args.dataset == 'llcm': from datasets.llcm import LLCM; dataset_obj = LLCM(args)
-        
-        from task.test import test
-        test(model, dataset_obj.query_loader, dataset_obj.gallery_loaders, args, device)
-
-if __name__ == '__main__':
-    main()
+    setproctitle.setproctitle(args.save_path)
+    main(args)

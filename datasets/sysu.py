@@ -1,251 +1,213 @@
-"""
-datasets/sysu.py - SYSU-MM01 数据集加载模块 (Strict Version)
-
-包含:
-1. SYSU (控制器)
-2. SYSU_train (训练集 Dataset，基于预处理的 .npy 文件)
-3. SYSU_test (测试集 Dataset)
-4. SYSU_Sampler (自定义采样器)
-"""
-
 import os
-import random
 import numpy as np
 import torch.utils.data as data
 from PIL import Image
-from .data_process import *
+import random
+from .data_process import get_train_transforms, get_test_transformer
 
 class SYSU:
-    """
-    SYSU-MM01 数据集控制器
-    注意：SYSU 训练通常依赖预处理好的 .npy 文件 (由 pre_process_sysu.py 生成)
-    """
     def __init__(self, args):
         self.args = args
         self.path = os.path.join(args.data_path, "SYSU-MM01/")
-        
-        # 路径校验
-        assert os.path.exists(self.path), f"SYSU dataset path not found: {self.path}"
-        
         self.num_workers = args.num_workers
-        self.pid_numsample = args.pid_numsample
-        self.batch_pidnum = args.batch_pidnum
-        self.batch_size = self.pid_numsample * self.batch_pidnum
+        self.batch_size = args.pid_numsample * args.batch_pidnum
         self.test_batch = args.test_batch
 
-        print("Dataset: Loading SYSU-MM01...")
-        
-        # 初始化训练集
+        # [修改] 传入 args
         self.train_rgb = SYSU_train(args, self.path, modal='rgb')
         self.train_ir = SYSU_train(args, self.path, modal='ir')
 
-        # 确保 RGB 和 IR ID 一致
-        assert self.train_rgb.num_classes == self.train_ir.num_classes, \
-            f"SYSU ID mismatch: RGB({self.train_rgb.num_classes}) vs IR({self.train_ir.num_classes})"
+        self.rgb_relabel_dict = self.train_rgb.relabel_dict
+        self.ir_relabel_dict = self.train_ir.relabel_dict
 
-        # 初始化 Query (Query 只有 1 个)
+        # [修改] 传入 args
         self.query = SYSU_test(args, self.path, mode="query")
-        self.query_loader = data.DataLoader(
-            self.query, self.test_batch, shuffle=False, num_workers=self.num_workers
-        )
-
-        # 初始化 Gallery (SYSU 协议包含 10 次随机划分)
+        self.n_query = len(self.query)
+        self.n_gallery = None
         self.gallery_list = []
-        self.gallery_loaders = []
-        self.n_gallery = 0
-        
-        print("Dataset: Building SYSU Gallery (10 trials)...")
         for i in range(10):
             gallery = SYSU_test(args, self.path, mode="gallery", trial=i)
+            if self.n_gallery == None:
+                self.n_gallery = len(gallery) 
             self.gallery_list.append(gallery)
             
-            g_loader = data.DataLoader(
-                gallery, self.test_batch, shuffle=False, num_workers=self.num_workers
-            )
-            self.gallery_loaders.append(g_loader)
-            
-            if i == 0:
-                self.n_gallery = len(gallery)
-
+        self._get_query_loader()
+        self._get_gallery_loader()
+    
+    def get_train_loader(self):
+        self.train_rgb.load_mode = 'train'
+        self.train_ir.load_mode = 'train'
+        sampler = SYSU_Sampler(self.args, self.train_rgb.label, self.train_ir.label)
+        self.train_rgb.sampler_idx = sampler.rgb_index
+        self.train_ir.sampler_idx = sampler.ir_index
+        train_rgb_loader = data.DataLoader(self.train_rgb, batch_size=self.batch_size,
+                                           sampler=sampler, num_workers=self.num_workers, drop_last=True)
+        train_ir_loader = data.DataLoader(self.train_ir, batch_size=self.batch_size,
+                                          sampler=sampler, num_workers=self.num_workers, drop_last=True)
+        return train_rgb_loader, train_ir_loader
+    
     def get_normal_loader(self):
-        """获取用于初始化记忆库的普通 DataLoader (仅 RGB)"""
         self.train_rgb.load_mode = 'test'
-        loader = data.DataLoader(
-            self.train_rgb, batch_size=self.test_batch,
-            num_workers=self.num_workers, shuffle=False
-        )
-        return loader, None
-
+        self.train_ir.load_mode = 'test'
+        normal_rgb_loader = data.DataLoader(self.train_rgb, batch_size=self.test_batch,
+                                       num_workers=self.num_workers, drop_last=False)
+        normal_ir_loader = data.DataLoader(self.train_ir, batch_size=self.test_batch,
+                                       num_workers=self.num_workers, drop_last=False)
+        return normal_rgb_loader, normal_ir_loader
+    
+    def _get_query_loader(self):
+        self.query_loader = data.DataLoader(
+            self.query, self.test_batch, shuffle=False, num_workers=self.num_workers, drop_last=False)
+            
+    def _get_gallery_loader(self):
+        self.gall_info = []
+        self.gallery_loaders = []
+        for i in range(10):
+            self.gall_info.append((self.gallery_list[i].test_label, self.gallery_list[i].test_cam))
+            gallery_loader = data.DataLoader(
+                self.gallery_list[i], self.test_batch, shuffle=False, num_workers=self.num_workers, drop_last=False)
+            self.gallery_loaders.append(gallery_loader)
 
 class SYSU_train(data.Dataset):
-    """
-    SYSU 训练数据集
-    依赖 pre_process_sysu.py 生成的 .npy 文件
-    """
     def __init__(self, args, data_path, modal=None):
-        self.num_classes = 0
+        self.num_classes = args.num_classes
         self.relabel = args.relabel
         self.data_path = data_path
-        
-        self.transform_color = transform_color_normal
-        self.transform_ir = transform_infrared_normal
-        self.transform_test = transform_test
-        
-        if modal not in ['rgb', 'ir']:
-            raise ValueError(f"Invalid modal: {modal}")
         self.modal = modal
-        
         self.sampler_idx = None
-        self.load_mode = 'train'
+        self.load_mode = None
+        
+        # [修改] 动态获取 Transform
+        self.img_h = args.img_h
+        self.img_w = args.img_w
+        
+        if modal == 'rgb':
+            self.transform_normal, self.transform_aug = get_train_transforms(self.img_h, self.img_w, 'rgb')
+        else:
+            self.transform_normal, self.transform_aug = get_train_transforms(self.img_h, self.img_w, 'ir')
+            
+        self.transform_test = get_test_transformer(self.img_h, self.img_w)
 
         self._init_data()
 
     def _init_data(self):
-        # 1. 加载预处理的 .npy 文件
+        # 加载 .npy 文件 (注意：这里加载的是预处理后的数据，可能是 288x144)
         if self.modal == 'rgb':
-            img_path = os.path.join(self.data_path, "train_rgb_modified_img.npy")
-            info_path = os.path.join(self.data_path, "train_rgb_info.npy")
+            self.train_image = np.load(self.data_path + "train_rgb_modified_img.npy")
+            train_info = np.load(self.data_path + "train_rgb_info.npy")
+        elif self.modal == 'ir':
+            self.train_image = np.load(self.data_path + "train_ir_modified_img.npy")
+            train_info = np.load(self.data_path + "train_ir_info.npy")
         else:
-            img_path = os.path.join(self.data_path, "train_ir_modified_img.npy")
-            info_path = os.path.join(self.data_path, "train_ir_info.npy")
+            raise ValueError("modal should be rgb or ir")
             
-        if not os.path.exists(img_path) or not os.path.exists(info_path):
-            raise FileNotFoundError(
-                f"SYSU pre-processed files not found:\n  {img_path}\n  {info_path}\n"
-                "Please run 'python pre_process_sysu.py' first!"
-            )
-            
-        # 2. 加载数据到内存
-        print(f"  Loading {self.modal.upper()} data from .npy files...")
-        self.train_image = np.load(img_path) # [N, H, W, C]
-        train_info = np.load(info_path)      # [index, label, cam_id]
+        self.train_info, self.relabel_dict = self._relabel(train_info)
+        self.label = self.train_info[:,1]
         
-        # 3. ID 重映射
-        self.train_info, self.pid2label = self._relabel(train_info)
-        self.label = self.train_info[:, 1]
-        self.num_classes = len(self.pid2label)
-
     def _relabel(self, info):
-        """严格的 ID 重映射"""
-        raw_labels = info[:, 1]
-        unique_pids = sorted(list(set(raw_labels)))
-        pid2label = {pid: i for i, pid in enumerate(unique_pids)}
+        label = info[:,1]
+        gt = label.reshape(label.shape[0],-1)
+        info = np.concatenate((info,gt),axis=1)
+        pid_set = set(label)
+        random_pid = list(range(len(pid_set)))
+        random.shuffle(random_pid)
+        pid2label = {pid:idx for idx, pid in enumerate(pid_set)}
+        pid2random_label = {pid:idx for idx, pid in enumerate(random_pid)}
+        for i in range(len(label)):
+            labeled_id = pid2label[label[i]]
+            info[:,-1][i] = labeled_id
+            if self.relabel:
+                info[:,1][i]= pid2random_label[labeled_id]
+            else:
+                info[:,1][i]= labeled_id
+        return info, pid2random_label
         
-        for i in range(len(info)):
-            info[i, 1] = pid2label[raw_labels[i]]
-            
-        return info, pid2label
-
     def __len__(self):
         return len(self.train_image)
 
     def __getitem__(self, index):
-        if self.load_mode == 'train' and self.sampler_idx is not None:
-            real_index = self.sampler_idx[index]
-        else:
-            real_index = index
-
-        info = self.train_info[real_index]
-        img_arr = self.train_image[real_index] # ndarray
-        
-        if self.load_mode == 'train':
-            if self.modal == 'rgb':
-                img = self.transform_color(img_arr)
-                aug_img = self.transform_color(img_arr)
-            else:
-                img = self.transform_ir(img_arr)
-                aug_img = self.transform_ir(img_arr)
-            return img, aug_img, info
-        else:
-            img = self.transform_test(img_arr)
-            return img, info
-
+        if self.load_mode == 'train': 
+            idx = self.sampler_idx[index]
+            info = self.train_info[idx]
+            img_np = self.train_image[idx]
+            
+            # [修改] 转换为 PIL 并 Resize，确保输入 ViT 的尺寸正确
+            img = Image.fromarray(img_np)
+            img = img.resize((self.img_w, self.img_h), Image.LANCZOS)
+            
+            # 转换为 Tensor (Transform 内部也做了 ToTensor，这里注意不要重复)
+            # data_process.py 中的 get_train_transforms 包含了 ToTensor
+            # 传入 PIL Image 即可
+            return self.transform_normal(img), self.transform_aug(img), info
+            
+        else: 
+            img_np = self.train_image[index]
+            img = Image.fromarray(img_np)
+            img = img.resize((self.img_w, self.img_h), Image.LANCZOS)
+            
+            return self.transform_test(img), self.train_info[index]
 
 class SYSU_test(data.Dataset):
-    """
-    SYSU 测试数据集
-    """
     def __init__(self, args, data_path, mode, search_mode="all", gall_mode="single", trial=0):
         self.data_path = data_path
         self.mode = mode
         self.search_mode = args.search_mode
         self.gall_mode = args.gall_mode
-        self.transform = transform_test
+        
+        # [修改] 动态获取 Transform
+        self.transform = get_test_transformer(args.img_h, args.img_w)
+        self.img_h = args.img_h
+        self.img_w = args.img_w
         
         if mode == "query":
-            img_paths, labels, cams = self._process_query_sysu()
+            test_img_file, test_label, test_cam = self._process_query_sysu()
         elif mode == "gallery":
-            img_paths, labels, cams = self._process_gallery_sysu(trial)
-        else:
-            raise ValueError(f"Invalid mode: {mode}")
+            test_img_file, test_label, test_cam = self._process_gallery_sysu(trial)
+            
+        test_image = []
+        for i in range(len(test_img_file)):
+            img = Image.open(test_img_file[i])
+            # [修改] 使用参数 Resize
+            img = img.resize((self.img_w, self.img_h), Image.LANCZOS)
+            pix_array = np.array(img)
+            test_image.append(pix_array)
+        test_image = np.array(test_image)
 
-        self.img_paths = img_paths
-        self.labels = labels
-        self.cams = cams
+        self.test_image = test_image
+        self.test_label = test_label
+        self.test_cam = test_cam
 
     def __len__(self):
-        return len(self.labels)
+        return len(self.test_label)
 
     def __getitem__(self, index):
-        path = self.img_paths[index]
-        if not os.path.exists(path):
-            # 容错处理：如果是 gallery 多张图模式，这里可能是 list
-            if isinstance(path, list):
-                # 这里暂不处理 multi-shot gallery 的复杂情况，遵循原代码逻辑
-                # 原代码 logic: gall_img.append(random.choice(new_files)) for single
-                # gall_img.append(np.random.choice(new_files, 10)) for multi
-                # 如果是 multi，下面的 Image.open 会报错，需注意 args.gall_mode
-                pass 
-            else:
-                 raise FileNotFoundError(f"Image not found: {path}")
-
-        try:
-            img = Image.open(path).convert('RGB')
-            img = img.resize((144, 288), Image.LANCZOS)
-            img = np.array(img)
-            img = self.transform(img)
-        except Exception as e:
-            print(f"Error loading {path}: {e}")
-            img = torch.zeros(3, 288, 144)
-
-        return img, self.labels[index], self.cams[index]
+        return self.transform(self.test_image[index]), self.test_label[index]
 
     def _process_query_sysu(self):
-        # 确定 IR 相机
         if self.search_mode == "all":
             ir_cameras = ["cam3", "cam6"]
         elif self.search_mode == "indoor":
             ir_cameras = ["cam3", "cam6"]
-        else:
-            raise ValueError(f"Unknown search mode: {self.search_mode}")
 
         file_path = os.path.join(self.data_path, "exp/test_id.txt")
-        if not os.path.exists(file_path):
-            raise FileNotFoundError(f"ID list not found: {file_path}")
+        files_ir = []
 
         with open(file_path, "r") as file:
             ids = file.read().splitlines()
             ids = [int(y) for y in ids[0].split(",")]
             ids = ["%04d" % x for x in ids]
 
-        files_ir = []
         for id in sorted(ids):
             for cam in ir_cameras:
                 img_dir = os.path.join(self.data_path, cam, id)
                 if os.path.isdir(img_dir):
-                    new_files = sorted([os.path.join(img_dir, i) for i in os.listdir(img_dir)])
+                    new_files = sorted([img_dir + "/" + i for i in os.listdir(img_dir)])
                     files_ir.extend(new_files)
-        
         query_img = []
         query_id = []
         query_cam = []
         for img_path in files_ir:
-            # 解析路径: .../cam3/0001/0001.jpg
-            # camid: cam3 -> 3
-            # pid: 0001 -> 1
-            camid = int(os.path.basename(os.path.dirname(os.path.dirname(img_path)))[-1])
-            pid = int(os.path.basename(os.path.dirname(img_path)))
-            
+            camid, pid = int(img_path[-15]), int(img_path[-13:-9])
             query_img.append(img_path)
             query_id.append(pid)
             query_cam.append(camid)
@@ -254,106 +216,86 @@ class SYSU_test(data.Dataset):
 
     def _process_gallery_sysu(self, seed):
         random.seed(seed)
-        np.random.seed(seed)
-
         if self.search_mode == 'all':
             rgb_cameras = ['cam1', 'cam2', 'cam4', 'cam5']
         elif self.search_mode == 'indoor':
             rgb_cameras = ['cam1', 'cam2']
-        else:
-             raise ValueError(f"Unknown search mode: {self.search_mode}")
 
         file_path = os.path.join(self.data_path, 'exp/test_id.txt')
+        files_rgb = []
         with open(file_path, 'r') as file:
             ids = file.read().splitlines()
             ids = [int(y) for y in ids[0].split(',')]
             ids = ["%04d" % x for x in ids]
 
-        files_rgb = []
         for id in sorted(ids):
             for cam in rgb_cameras:
                 img_dir = os.path.join(self.data_path, cam, id)
                 if os.path.isdir(img_dir):
-                    new_files = sorted([os.path.join(img_dir, i) for i in os.listdir(img_dir)])
-                    
+                    new_files = sorted([img_dir + '/' + i for i in os.listdir(img_dir)])
                     if self.gall_mode == 'single':
                         files_rgb.append(random.choice(new_files))
-                    elif self.gall_mode == 'multi':
-                        # 如果图片少于10张，全部选上；否则选10张
-                        if len(new_files) < 10:
-                            files_rgb.extend(new_files)
-                        else:
-                            files_rgb.extend(np.random.choice(new_files, 10, replace=False))
-        
+                    if self.gall_mode == 'multi':
+                        files_rgb.append(np.random.choice(new_files, 10, replace=False))
         gall_img = []
         gall_id = []
         gall_cam = []
 
         for img_path in files_rgb:
-            camid = int(os.path.basename(os.path.dirname(os.path.dirname(img_path)))[-1])
-            pid = int(os.path.basename(os.path.dirname(img_path)))
-            
-            gall_img.append(img_path)
-            gall_id.append(pid)
-            gall_cam.append(camid)
+            if self.gall_mode == 'single':
+                camid, pid = int(img_path[-15]), int(img_path[-13:-9])
+                gall_img.append(img_path)
+                gall_id.append(pid)
+                gall_cam.append(camid)
+
+            if self.gall_mode == 'multi':
+                for i in img_path:
+                    camid, pid = int(i[-15]), int(i[-13:-9])
+                    gall_img.append(i)
+                    gall_id.append(pid)
+                    gall_cam.append(camid)
 
         return gall_img, np.array(gall_id), np.array(gall_cam)
-
-
+    
 class SYSU_Sampler(data.Sampler):
-    """
-    SYSU 专用采样器
-    """
-    def __init__(self, args, rgb_labels, ir_labels):
-        self.rgb_labels = rgb_labels
-        self.ir_labels = ir_labels
+    # 保持不变
+    def __init__(self, args, rgb, ir):
+        self.rgb = rgb
+        self.ir = ir
+        self.len=max(len(rgb),len(ir))
+        self.num_classes = args.num_classes
         self.batch_pidnum = args.batch_pidnum
         self.pid_numsample = args.pid_numsample
-        self.length = max(len(rgb_labels), len(ir_labels))
         
-        self.rgb_dict = self._build_dict(rgb_labels)
-        self.ir_dict = self._build_dict(ir_labels)
-        
-        self.pids = sorted(list(set(rgb_labels)))
-        self.num_classes = len(self.pids)
-        
-        self.rgb_index = []
-        self.ir_index = []
-        self._generate_indices()
+        self.rgb_dict = {k:[] for k in range(self.num_classes)}
+        self.ir_dict  = {k:[] for k in range(self.num_classes)}
+        for i in range(len(rgb)):
+            self.rgb_dict[int(rgb[i])].append(i)
+            if i < len(ir):
+                self.ir_dict[int(ir[i])].append(i)
 
-    def _build_dict(self, labels):
-        d = {}
-        for idx, label in enumerate(labels):
-            if label not in d:
-                d[label] = []
-            d[label].append(idx)
-        return d
-
-    def _generate_indices(self):
-        self.rgb_index = []
-        self.ir_index = []
+        self._sampler()
         
-        num_batches = self.length // (self.batch_pidnum * self.pid_numsample) + 1
-        
-        for _ in range(num_batches):
-            batch_pids = np.random.choice(self.pids, self.batch_pidnum, replace=False)
-            
-            for pid in batch_pids:
-                # RGB
-                rgb_idxs = self.rgb_dict[pid]
-                replace_rgb = len(rgb_idxs) < self.pid_numsample
-                sel_rgb = np.random.choice(rgb_idxs, self.pid_numsample, replace=replace_rgb)
-                self.rgb_index.extend(sel_rgb)
-                
-                # IR
-                ir_idxs = self.ir_dict[pid]
-                replace_ir = len(ir_idxs) < self.pid_numsample
-                sel_ir = np.random.choice(ir_idxs, self.pid_numsample, replace=replace_ir)
-                self.ir_index.extend(sel_ir)
+    def _sampler(self):
+        rgb_index = []
+        ir_index = []
+        batch_num = int(1+self.len/(self.batch_pidnum*self.pid_numsample))
+        for i in range(batch_num):
+            selected_id = random.sample(list(range(self.num_classes)),self.batch_pidnum)
+            for each_id in selected_id:
+                if min(len(self.rgb_dict[each_id]),len(self.ir_dict[each_id])) < self.pid_numsample:
+                    selected_rgb = random.choices(self.rgb_dict[each_id],k=self.pid_numsample)
+                    selected_ir = random.choices(self.ir_dict[each_id],k=self.pid_numsample)
+                else:
+                    selected_rgb = random.sample(self.rgb_dict[each_id],self.pid_numsample)
+                    selected_ir = random.sample(self.ir_dict[each_id],self.pid_numsample)
+                rgb_index.extend(selected_rgb)
+                ir_index.extend(selected_ir)
+        self.rgb_index = rgb_index
+        self.ir_index = ir_index
 
     def __iter__(self):
-        self._generate_indices()
-        return iter(range(len(self.rgb_index)))
-
+        return iter(range(self.len))
+            
     def __len__(self):
-        return len(self.rgb_index)
+        return self.len

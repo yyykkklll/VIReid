@@ -1,111 +1,307 @@
 import torch
-import torch.nn.functional as F
 import numpy as np
-from tqdm import tqdm
-import sys
-import os
+from utils import fliplr
 
-# 确保能导入 utils
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from utils import re_ranking
-
-def extract_features(model, dataloader, device, pool_parts=True):
-    model.eval()
-    features_list, labels_list, cam_ids_list = [], [], []
+def extract_ir_features(args, loader, model, num_samples):
+    ptr = 0
+    # [修改] 动态获取特征维度，默认为 2048 兼容旧代码
+    feat_dim = getattr(args, 'feat_dim', 2048)
+    ir_feat = np.zeros((num_samples, feat_dim))
     
     with torch.no_grad():
-        for batch_data in tqdm(dataloader, desc="Extracting"):
-            if len(batch_data) == 3:
-                images, labels, cam_ids = batch_data
-            else:
-                images, labels = batch_data[:2]
-                cam_ids = torch.zeros(labels.size(0), dtype=torch.long)
-            
-            images = images.to(device)
-            batch_features = model.extract_features(images, pool_parts=pool_parts)
-            
-            features_list.append(batch_features.cpu())
-            labels_list.append(labels)
-            cam_ids_list.append(cam_ids)
-    
-    return torch.cat(features_list), torch.cat(labels_list), torch.cat(cam_ids_list)
+        for batch_idx, (input, label) in enumerate(loader):
+            batch_num = input.size(0)
+            input = input.to(model.device)
+            # ViT forward returns (gap, bn), we typically use bn features for testing
+            _, feat = model.model(x2=input)
 
-def test(model, query_loader, gallery_loaders, args, device):
-    print("\n" + "="*50)
-    print(f"Starting Evaluation (With Re-Ranking)")
-    
-    # 1. 提取特征
-    q_feat, q_labels, q_cams = extract_features(model, query_loader, device, args.pool_parts)
-    
-    g_feats, g_labels, g_cams = [], [], []
-    for g_loader in gallery_loaders:
-        gf, gl, gc = extract_features(model, g_loader, device, args.pool_parts)
-        g_feats.append(gf)
-        g_labels.append(gl)
-        g_cams.append(gc)
-    
-    g_feat = torch.cat(g_feats)
-    g_label = torch.cat(g_labels)
-    g_cam = torch.cat(g_cams)
-    
-    print(f"Query: {q_feat.shape}, Gallery: {g_feat.shape}")
-    
-    # 2. 计算距离 (强制使用 Re-Ranking)
-    print("Applying Re-Ranking (k-reciprocal)...")
-    try:
-        # Re-ranking 使用欧氏距离，通常输入未归一化的特征效果也不错，
-        # 但既然网络输出已归一化，直接用即可。
-        dist_mat = re_ranking(q_feat, g_feat, k1=20, k2=6, lambda_value=0.3)
-    except Exception as e:
-        print(f"Re-ranking failed: {e}. Falling back to Cosine.")
-        q_feat = F.normalize(q_feat, p=2, dim=1)
-        g_feat = F.normalize(g_feat, p=2, dim=1)
-        dist_mat = 1 - torch.mm(q_feat, g_feat.t()).numpy()
-    
-    # 3. 评估
-    return evaluate_rank(dist_mat, q_labels.numpy(), g_label.numpy(), q_cams.numpy(), g_cam.numpy())
+            # Test-time Augmentation (Flip)
+            imgs_flip = fliplr(input)
+            _, feat_flip = model.model(x2=imgs_flip)
+            feat = (feat + feat_flip) / 2
 
-def evaluate_rank(dist_matrix, query_labels, gallery_labels, query_cam_ids, gallery_cam_ids, max_rank=20):
-    num_query = dist_matrix.shape[0]
-    all_cmc, all_AP, all_INP = [], [], []
+            # 通过分类器获取归一化特征
+            # model.classifier1 是 RGB classifier，但通常用来做特征变换
+            # 在原代码逻辑中，IR 特征提取也通过 classifier1 的 l2_norm 部分
+            # 注意：这里只取 [1] 即 l2_norm 后的特征
+            _, feat = model.classifier1(feat)
+            
+            ir_feat[ptr:ptr + batch_num, :] = feat.detach().cpu().numpy()
+            ptr = ptr + batch_num
+        return ir_feat
+
+def extract_rgb_features(args, loader, model, num_samples):
+    ptr = 0
+    # [修改] 动态获取特征维度
+    feat_dim = getattr(args, 'feat_dim', 2048)
+    rgb_feat = np.zeros((num_samples, feat_dim))
     
-    for i in range(num_query):
-        q_label = query_labels[i]
-        q_cam = query_cam_ids[i]
+    with torch.no_grad():
+        for batch_idx, (input, label) in enumerate(loader):
+            batch_num = input.size(0)
+            input = input.to(model.device)
+            _, feat = model.model(x1=input)
+
+            imgs_flip = fliplr(input)
+            _, feat_flip = model.model(x1=imgs_flip)
+            feat = (feat + feat_flip) / 2
+
+            _, feat = model.classifier1(feat)
+            
+            rgb_feat[ptr:ptr + batch_num, :] = feat.detach().cpu().numpy()
+            ptr = ptr + batch_num
+        return rgb_feat
+
+def test(args, model, dataset, *epoch):
+    model.set_eval()
+    all_cmc = 0
+    all_mAP = 0
+    all_mINP = 0
+    
+    if args.dataset == 'sysu' or args.dataset == 'llcm':
+        query_loader = dataset.query_loader
+        query_num = dataset.n_query
         
-        matches = (gallery_labels == q_label)
-        junk_mask = (gallery_labels == q_label) & (gallery_cam_ids == q_cam)
-        valid_matches = matches & ~junk_mask
+        # [修改] 传入 args
+        if args.dataset == 'sysu' or args.test_mode == "t2v":
+            query_feat = extract_ir_features(args, query_loader, model, query_num)
+        elif args.dataset == 'llcm' and args.test_mode == "v2t":
+            query_feat = extract_rgb_features(args, query_loader, model, query_num)
+            
+        query_label = dataset.query.test_label
+        query_cam = dataset.query.test_cam
         
-        if valid_matches.sum() == 0: continue
+        for i in range(10):
+            gall_num = dataset.n_gallery
+            gall_loader = dataset.gallery_loaders[i]
+            
+            # [修改] 传入 args
+            if args.dataset == 'sysu' or args.test_mode == "t2v":
+                gall_feat = extract_rgb_features(args, gall_loader, model, gall_num)
+            elif args.dataset == 'llcm' and args.test_mode == "v2t":
+                gall_feat = extract_ir_features(args, gall_loader, model, gall_num) 
+                
+            gall_label = dataset.gall_info[i][0]
+            gall_cam = dataset.gall_info[i][1]
+            
+            distmat = np.matmul(query_feat, gall_feat.T)
+            
+            if args.dataset == 'sysu':
+                cmc, mAP, mINP = eval_sysu(-distmat, query_label, gall_label, query_cam, gall_cam)
+            elif args.dataset == 'llcm':
+                cmc, mAP, mINP = eval_llcm(-distmat, query_label, gall_label, query_cam, gall_cam)
+                
+            all_cmc += cmc
+            all_mAP += mAP
+            all_mINP += mINP
+            
+        all_cmc = all_cmc / 10
+        all_mAP = all_mAP / 10
+        all_mINP = all_mINP / 10
+
+    elif args.dataset == 'regdb':
+        ir_loader = dataset.query_loader
+        query_num = dataset.n_query
+        # [修改] 传入 args
+        ir_feat = extract_ir_features(args, ir_loader, model, query_num)
+        ir_label = dataset.query.test_label
         
-        indices = np.argsort(dist_matrix[i])
-        valid_matches = valid_matches[indices]
+        rgb_loader = dataset.gallery_loader
+        gall_num = dataset.n_gallery
+        # [修改] 传入 args
+        rgb_feat = extract_rgb_features(args, rgb_loader, model, gall_num)
+        rgb_label = dataset.gallery.test_label
         
-        # CMC
-        cmc = valid_matches.cumsum()
+        if args.test_mode == "t2v":
+            distmat = np.matmul(ir_feat, rgb_feat.T)
+            cmc, mAP, mINP = eval_regdb(-distmat, ir_label, rgb_label)
+        elif args.test_mode == "v2t":
+            distmat = np.matmul(rgb_feat, ir_feat.T)
+            cmc, mAP, mINP = eval_regdb(-distmat, rgb_label, ir_label)
+            
+        all_cmc, all_mAP, all_mINP = cmc, mAP, mINP
+        
+    return all_cmc, all_mAP, all_mINP      
+
+def eval_sysu(distmat, q_pids, g_pids, q_camids, g_camids, max_rank = 20):
+    num_q, num_g = distmat.shape
+    if num_g < max_rank:
+        max_rank = num_g
+        print("Note: number of gallery samples is quite small, got {}".format(num_g))
+    indices = np.argsort(distmat, axis=1)
+    pred_label = g_pids[indices]
+    matches = (g_pids[indices] == q_pids[:, np.newaxis]).astype(np.int32)
+
+    new_all_cmc = []
+    all_cmc = []
+    all_AP = []
+    all_INP = []
+    num_valid_q = 0.
+    for q_idx in range(num_q):
+        q_pid = q_pids[q_idx]
+        q_camid = q_camids[q_idx]
+
+        order = indices[q_idx]
+        remove = (q_camid == 3) & (g_camids[order] == 2)
+        keep = np.invert(remove)
+        new_cmc = pred_label[q_idx][keep]
+        new_index = np.unique(new_cmc, return_index=True)[1]
+        new_cmc = [new_cmc[index] for index in sorted(new_index)]
+        
+        new_match = (new_cmc == q_pid).astype(np.int32)
+        new_cmc = new_match.cumsum()
+        new_all_cmc.append(new_cmc[:max_rank])
+        
+        orig_cmc = matches[q_idx][keep]
+        if not np.any(orig_cmc):
+            continue
+
+        cmc = orig_cmc.cumsum()
+
+        pos_idx = np.where(orig_cmc == 1)
+        pos_max_idx = np.max(pos_idx)
+        inp = cmc[pos_max_idx]/ (pos_max_idx + 1.0)
+        all_INP.append(inp)
+
         cmc[cmc > 1] = 1
+
         all_cmc.append(cmc[:max_rank])
-        
-        # AP
-        num_rel = valid_matches.sum()
-        tmp_cmc = valid_matches.cumsum()
-        tmp_cmc = [x / (i + 1.0) for i, x in enumerate(tmp_cmc)]
-        tmp_cmc = np.asarray(tmp_cmc) * valid_matches
+        num_valid_q += 1.
+
+        num_rel = orig_cmc.sum()
+        tmp_cmc = orig_cmc.cumsum()
+        tmp_cmc = [x / (i+1.) for i, x in enumerate(tmp_cmc)]
+        tmp_cmc = np.asarray(tmp_cmc) * orig_cmc
         AP = tmp_cmc.sum() / num_rel
         all_AP.append(AP)
-        
-        # INP
-        pos_indices = np.where(valid_matches)[0]
-        if len(pos_indices) > 0:
-            INP = 1.0 / (pos_indices[0] + 1)
-            all_INP.append(INP)
-            
-    if len(all_cmc) == 0: return 0.0, 0.0, 0.0
+
+    assert num_valid_q > 0, "Error: all query identities do not appear in gallery"
     
-    cmc = np.asarray(all_cmc).astype(np.float32).mean(axis=0)
+    all_cmc = np.asarray(all_cmc).astype(np.float32)
+    all_cmc = all_cmc.sum(0) / num_valid_q   # standard CMC
+    
+    new_all_cmc = np.asarray(new_all_cmc).astype(np.float32)
+    new_all_cmc = new_all_cmc.sum(0) / num_valid_q
     mAP = np.mean(all_AP)
     mINP = np.mean(all_INP)
+    return new_all_cmc, mAP, mINP
+
+def eval_llcm(distmat, q_pids, g_pids, q_camids, g_camids, max_rank = 20):
+    num_q, num_g = distmat.shape
+    if num_g < max_rank:
+        max_rank = num_g
+        print("Note: number of gallery samples is quite small, got {}".format(num_g))
+    indices = np.argsort(distmat, axis=1)
+    pred_label = g_pids[indices]
+    matches = (g_pids[indices] == q_pids[:, np.newaxis]).astype(np.int32)
     
-    print(f"Rank-1: {cmc[0]*100:.2f}%, mAP: {mAP*100:.2f}%, mINP: {mINP*100:.2f}%")
-    return cmc[0]*100, mAP*100, mINP*100
+    new_all_cmc = []
+    all_cmc = []
+    all_AP = []
+    all_INP = []
+    num_valid_q = 0. 
+    for q_idx in range(num_q):
+        q_pid = q_pids[q_idx]
+        q_camid = q_camids[q_idx]
+
+        order = indices[q_idx]
+        remove = (g_pids[order] == q_pid) & (g_camids[order] == q_camid)
+        keep = np.invert(remove)
+
+        new_cmc = pred_label[q_idx][keep]
+        new_index = np.unique(new_cmc, return_index=True)[1]
+
+        new_cmc = [new_cmc[index] for index in sorted(new_index)]
+        
+        new_match = (new_cmc == q_pid).astype(np.int32)
+        new_cmc = new_match.cumsum()
+        new_all_cmc.append(new_cmc[:max_rank])
+        
+        orig_cmc = matches[q_idx][keep]
+        if not np.any(orig_cmc):
+            continue
+
+        cmc = orig_cmc.cumsum()
+
+        pos_idx = np.where(orig_cmc == 1)
+        pos_max_idx = np.max(pos_idx)
+        inp = cmc[pos_max_idx]/ (pos_max_idx + 1.0)
+        all_INP.append(inp)
+
+        cmc[cmc > 1] = 1
+
+        all_cmc.append(cmc[:max_rank])
+        num_valid_q += 1.
+
+        num_rel = orig_cmc.sum()
+        tmp_cmc = orig_cmc.cumsum()
+        tmp_cmc = [x / (i+1.) for i, x in enumerate(tmp_cmc)]
+        tmp_cmc = np.asarray(tmp_cmc) * orig_cmc
+        AP = tmp_cmc.sum() / num_rel
+        all_AP.append(AP)
+
+    assert num_valid_q > 0, "Error: all query identities do not appear in gallery"
+    
+    all_cmc = np.asarray(all_cmc).astype(np.float32)
+    all_cmc = all_cmc.sum(0) / num_valid_q
+    
+    new_all_cmc = np.asarray(new_all_cmc).astype(np.float32)
+    new_all_cmc = new_all_cmc.sum(0) / num_valid_q
+    mAP = np.mean(all_AP)
+    mINP = np.mean(all_INP)
+    return new_all_cmc, mAP, mINP
+
+def eval_regdb(distmat, q_pids, g_pids, max_rank = 20):
+    num_q, num_g = distmat.shape
+    if num_g < max_rank:
+        max_rank = num_g
+        print("Note: number of gallery samples is quite small, got {}".format(num_g))
+    indices = np.argsort(distmat, axis=1)
+    matches = (g_pids[indices] == q_pids[:, np.newaxis]).astype(np.int32)
+
+    all_cmc = []
+    all_AP = []
+    all_INP = []
+    num_valid_q = 0.
+
+    q_camids = np.ones(num_q).astype(np.int32)
+    g_camids = 2 * np.ones(num_g).astype(np.int32)
+    
+    for q_idx in range(num_q):
+        q_pid = q_pids[q_idx]
+        q_camid = q_camids[q_idx]
+
+        order = indices[q_idx]
+        remove = (g_pids[order] == q_pid) & (g_camids[order] == q_camid)
+        keep = np.invert(remove)
+
+        raw_cmc = matches[q_idx][keep]
+        if not np.any(raw_cmc):
+            continue
+
+        cmc = raw_cmc.cumsum()
+
+        pos_idx = np.where(raw_cmc == 1)
+        pos_max_idx = np.max(pos_idx)
+        inp = cmc[pos_max_idx]/ (pos_max_idx + 1.0)
+        all_INP.append(inp)
+
+        cmc[cmc > 1] = 1
+
+        all_cmc.append(cmc[:max_rank])
+        num_valid_q += 1.
+
+        num_rel = raw_cmc.sum()
+        tmp_cmc = raw_cmc.cumsum()
+        tmp_cmc = [x / (i+1.) for i, x in enumerate(tmp_cmc)]
+        tmp_cmc = np.asarray(tmp_cmc) * raw_cmc
+        AP = tmp_cmc.sum() / num_rel
+        all_AP.append(AP)
+
+    assert num_valid_q > 0, "Error: all query identities do not appear in gallery"
+
+    all_cmc = np.asarray(all_cmc).astype(np.float32)
+    all_cmc = all_cmc.sum(0) / num_valid_q
+    mAP = np.mean(all_AP)
+    mINP = np.mean(all_INP)
+    return all_cmc, mAP, mINP
