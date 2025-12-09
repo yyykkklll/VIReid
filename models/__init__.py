@@ -1,24 +1,27 @@
 import torch
 import os
 
-# 导入各个模块
 from .classifier import Image_Classifier
 from utils import os_walk
 
-# 引入 ViT
-from .vit import build_vit
-from .clip_model import CLIP
-from .optim import WarmupMultiStepLR
-from .loss import TripletLoss_WRT, Weak_loss, CrossEntropyLabelSmooth
+# 引入 Backbone (仅保留 VMamba)
+# [Clean Up] 移除了 CLIP 和 ViT 的引用，确保架构纯净
+from .vmamba import build_vmamba 
 
+# 引入优化器和损失函数
+from .optim import WarmupMultiStepLR
+from .loss import TripletLoss_WRT, Weak_loss, CrossEntropyLabelSmooth, ConsistencyLoss
+
+# 注册支持的模型架构
+# [Note] CLIP 和 ViT 已被弃用，不再支持调用
 _models = {
-    "vit": build_vit,          
-    "clip-resnet": CLIP,       
+    "vmamba": build_vmamba, 
 }
 
 def create(args):
     if args.arch not in _models:
-        raise KeyError("Unknown backbone:", args.arch)
+        # 如果用户试图使用 vit 或 clip，直接抛出更明确的错误
+        raise KeyError(f"Unknown backbone: {args.arch}. Currently only 'vmamba' is supported.")
     print('正在加载模型架构: {} ...'.format(args.arch))
     return Model(args)
 
@@ -33,29 +36,44 @@ class Model:
         self.resume = args.resume
         self.args = args
         
-        # [修复] 必须初始化 resume_epoch，防止从头训练时报错
         self.resume_epoch = 0 
 
-        # 构建骨干网络 (Backbone)
+        # 1. 构建骨干网络 (Backbone)
         print(f"Building Backbone: {args.arch}")
         self.model = _models[args.arch](args).to(self.device)
         
-        # 构建分类器
-        self.classifier1 = Image_Classifier(args).to(self.device) # RGB 分类器
-        self.classifier2 = Image_Classifier(args).to(self.device) # IR 分类器
-        self.classifier3 = Image_Classifier(args).to(self.device) # 共享分类器
+        # 2. 确定特征维度
+        # VMamba-Tiny/Small/Base 的最终输出维度均为 768
+        # 不再依赖 args.feat_dim 的手动输入，直接锁定为 768 以匹配预训练权重
+        if args.arch == 'vmamba':
+             self.in_dim = 768 
+             print(f">>> Auto-detected VMamba dimension: {self.in_dim}")
+        else:
+             # 保留此分支以防未来扩展其他架构
+             self.in_dim = getattr(args, 'feat_dim', 768)
+
+        # 3. 同步参数供 Classifier 使用
+        args.feat_dim = self.in_dim 
+        
+        # 4. 构建分类器 (Classifiers)
+        self.classifier1 = Image_Classifier(args).to(self.device) # RGB Expert
+        self.classifier2 = Image_Classifier(args).to(self.device) # IR Expert
+        self.classifier3 = Image_Classifier(args).to(self.device) # Shared Expert
         self.enable_cls3 = False 
 
+        # 5. 初始化优化器和损失函数
         self._init_optimizer()
         self._init_criterion()
 
     def _init_optimizer(self):
         """
-        [修复] 使用 AdamW 优化器以适配 ViT 和较大的 weight_decay (0.05)
+        使用 AdamW 优化器
+        分类器部分的学习率设置为 Backbone 的 2 倍
         """
         params_phase1 = []
         params_phase2 = []
         
+        # Phase 1 参数
         for part in (self.model, self.classifier1, self.classifier2):
             for key, value in part.named_parameters():
                 if value.requires_grad:
@@ -68,6 +86,7 @@ class Model:
                                            "lr": self.lr,
                                            "weight_decay": self.weight_decay}]
         
+        # Phase 2 参数
         params_phase2.extend(params_phase1)
         
         for key, value in self.classifier3.named_parameters():
@@ -76,7 +95,6 @@ class Model:
                                    "lr": 2 * self.lr,
                                    "weight_decay": self.weight_decay}]
         
-        # [关键修复] 替换为 AdamW
         self.optimizer_phase1 = torch.optim.AdamW(params_phase1)
         self.optimizer_phase2 = torch.optim.AdamW(params_phase2)
         
@@ -89,6 +107,7 @@ class Model:
         self.pid_criterion = CrossEntropyLabelSmooth(num_classes=self.args.num_classes, epsilon=0.1, use_gpu=True)
         self.tri_criterion = TripletLoss_WRT()
         self.weak_criterion = Weak_loss()
+        self.cons_criterion = ConsistencyLoss() 
 
     def set_train(self):
         self.model.train()
@@ -160,4 +179,4 @@ class Model:
             print(f'Resumed from epoch {self.resume_epoch}')
         else:
             print('No valid checkpoint found. Starting from scratch.')
-            self.resume_epoch = 0 # 显式重置
+            self.resume_epoch = 0

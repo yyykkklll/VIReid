@@ -17,15 +17,23 @@ def pdist_torch(emb1, emb2):
 def softmax_weights(dist, mask):
     max_v = torch.max(dist * mask, dim=1, keepdim=True)[0]
     diff = dist - max_v
-    Z = torch.sum(torch.exp(diff) * mask, dim=1, keepdim=True) + 1e-6 # avoid division by zero
+    Z = torch.sum(torch.exp(diff) * mask, dim=1, keepdim=True) + 1e-6 
     W = torch.exp(diff) * mask / Z
     return W
 
+# [新增] 频域一致性损失 (Scheme C)
+class ConsistencyLoss(nn.Module):
+    """
+    约束原始图像和频域增强图像的特征距离
+    """
+    def __init__(self):
+        super(ConsistencyLoss, self).__init__()
+        self.mse = nn.MSELoss()
+
+    def forward(self, feat_real, feat_aug):
+        return self.mse(feat_real, feat_aug)
+
 class CrossEntropyLabelSmooth(nn.Module):
-    """
-    [Strong Baseline] 标签平滑交叉熵损失
-    相比标准 CE，它能防止模型对训练数据过拟合，提升泛化能力。
-    """
     def __init__(self, num_classes, epsilon=0.1, use_gpu=True):
         super(CrossEntropyLabelSmooth, self).__init__()
         self.num_classes = num_classes
@@ -34,11 +42,6 @@ class CrossEntropyLabelSmooth(nn.Module):
         self.logsoftmax = nn.LogSoftmax(dim=1)
 
     def forward(self, inputs, targets):
-        """
-        Args:
-            inputs: prediction matrix (before softmax) with shape (batch_size, num_classes)
-            targets: ground truth labels with shape (batch_size)
-        """
         log_probs = self.logsoftmax(inputs)
         targets = torch.zeros(log_probs.size()).scatter_(1, targets.unsqueeze(1).data.cpu(), 1)
         if self.use_gpu: targets = targets.cuda()
@@ -74,9 +77,6 @@ class TripletLoss_WRT(nn.Module):
         return loss
 
 class Weak_loss(nn.Module):
-    """
-    Compute contrastive loss for weak supervision
-    """
     def __init__(self, tau=0.05, q=0.5, ratio=0):
         super(Weak_loss, self).__init__()
         self.tau = tau
@@ -89,19 +89,14 @@ class Weak_loss(nn.Module):
         scores = scores.exp()
         scores = scores/((scores.sum(1,keepdim=True))+eps)
         
-        # [修改] 关键修复：处理索引标签，转换为 One-hot 掩码
         if labels.dim() == 1:
-            # 如果输入是 (Batch,) 的索引，转为 (Batch, Num_Classes) 的 bool 掩码
             label_mask = torch.zeros((n, c), device=scores.device, dtype=torch.bool)
             label_mask.scatter_(1, labels.unsqueeze(1), 1)
         else:
-            # 如果已经是掩码形式，直接转 bool
             label_mask = labels.bool()
 
         label_probs = torch.zeros((n,1), device=scores.device)
         for i in range(n):
-            # 此时 label_mask[i] 是一个长度为 C 的向量，其中只有一个 True
-            # scores[i][label_mask[i]] 会正确选出那个 True 对应的概率值
             min_prob = scores[i][label_mask[i]].min()
             label_probs[i] = min_prob
             

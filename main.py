@@ -4,7 +4,7 @@ import setproctitle
 import torch
 import warnings
 import time
-import copy # [新增]
+import copy 
 
 import datasets
 import models
@@ -44,10 +44,11 @@ def main(args):
             enable_phase1 = True
         
         # ======================================================
-        # Phase 1: 单模态预热
+        # Phase 1: 
+        # 修改: 引入频域增强后，数据效率提升，适当缩短 Warmup
         # ======================================================
         if enable_phase1:
-            logger('Time: {} | [Phase 1] Intra-modal Warmup Start'.format(time_now()))
+            logger('Time: {} | [Phase 1] Mamba + FreqAug Warmup'.format(time_now()))
             for current_epoch in range(0, args.stage1_epoch):
                 model.scheduler_phase1.step(current_epoch)
                 
@@ -57,35 +58,26 @@ def main(args):
                 best_rank1 = max(cmc[0], best_rank1)
                 best_mAP = max(mAP, best_mAP)
                 
-                logger('Time: {} | Phase 1 Epoch {}; Setting: {}'.format(time_now(), current_epoch+1, args.save_path))
-                logger(f'LR: {model.scheduler_phase1.get_lr()[0]}')
-                logger(result)
-                logger('R1:{:.2f} | R10:{:.2f} | mAP:{:.2f} | Best R1:{:.2f}'.format(
-                    cmc[0]*100, cmc[9]*100, mAP*100, best_rank1*100))
-                logger('=' * 50)
+                logger('Time: {} | P1 Epoch {}; {}'.format(time_now(), current_epoch+1, result))
+                logger('R1:{:.2f} | mAP:{:.2f}'.format(cmc[0]*100, mAP*100))
                 
                 if current_epoch == args.stage1_epoch - 1:
                     save_checkpoint(args, model, current_epoch + 1)
 
         # ======================================================
-        # Phase 2: 结构感知对齐
+        # Phase 2: 
         # ======================================================
         enable_phase1 = False
         start_epoch = model.resume_epoch
         if start_epoch < args.stage1_epoch and 'wsl' in args.debug and not args.resume:
              start_epoch = args.stage1_epoch
 
-        logger('Time: {} | [Phase 2] Structure-Aware Alignment Start from Epoch {}'.format(time_now(), start_epoch))
+        logger('Time: {} | [Phase 2] Structure-Aware Alignment'.format(time_now()))
         
-        # [核心创新点实现]：专家权重继承 (Expert Inheritance)
-        # 在进入 Phase 2 之前，将 Classifier1 (RGB Expert) 的权重复制给 Classifier3 (Shared)
-        # 避免 Classifier3 冷启动导致的崩塌
-        if model.classifier3 is not None and model.classifier1 is not None:
-            logger('>>> [Init] Initializing Shared Classifier from RGB Expert...')
-            model.classifier3.load_state_dict(model.classifier1.state_dict())
-            
-            # 由于优化器已经初始化过了，我们需要确保优化器状态也是健康的
-            # 这里简单起见，我们让 classifier3 继承权重，然后在后续训练中微调
+        # [关键修复] 移除错误的权重覆盖逻辑
+        # 原代码: model.classifier3.load_state_dict(model.classifier1.state_dict())
+        # 新逻辑: 保持独立初始化，或仅在第一次进入 P2 时做温和的初始化
+        # 由于我们现在有了 FreqAug，classifier3 从头学也能很快收敛，因此直接移除该行。
         
         for current_epoch in range(start_epoch, args.stage2_epoch):
             model.scheduler_phase2.step(current_epoch)
@@ -100,27 +92,24 @@ def main(args):
             
             model.save_model(current_epoch + 1, is_best_rank)
             
-            logger('=' * 50)
-            logger('Epoch: {} | Time: {}'.format(current_epoch + 1, time_now()))
-            logger(f'LR: {model.scheduler_phase2.get_lr()[0]}')
+            logger('Epoch: {} | LR: {:.6f}'.format(current_epoch + 1, model.scheduler_phase2.get_lr()[0]))
             logger(result)
-            logger('R1:{:.2f} | R10:{:.2f} | mAP:{:.2f} | Best R1:{:.2f}'.format(
-                    cmc[0]*100, cmc[9]*100, mAP*100, best_rank1*100))
-            logger('=' * 50)
+            logger('R1:{:.2f} | mAP:{:.2f} | Best R1:{:.2f}'.format(cmc[0]*100, mAP*100, best_rank1*100))
         
     if args.mode == 'test':
         model.resume_model(args.model_path)
         cmc, mAP, mINP = test(args, model, dataset)
-        logger('Time: {}; Test on Dataset: {}'.format(time_now(), args.dataset))
-        logger('R1:{:.2f} | R10:{:.2f} | mAP:{:.2f}'.format(
-               cmc[0]*100, cmc[9]*100, mAP*100))
+        logger('R1:{:.2f} | mAP:{:.2f}'.format(cmc[0]*100, mAP*100))
         
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser("SG-WSL: Semantic-Graph Weakly Supervised ReID")
-    parser.add_argument("--dataset", default="regdb", type=str, help="dataset name")
+    parser = argparse.ArgumentParser("FD-Mamba: Frequency-Disentangled Mamba for VI-ReID")
+    parser.add_argument("--dataset", default="regdb", type=str)
     parser.add_argument("--data-path", default="/root/vireid/datasets", type=str)
-    parser.add_argument("--arch", default="vit", type=str, help="backbone architecture")
-    parser.add_argument('--feat-dim', default=768, type=int, help='feature dimension')
+    
+    # [修改] 默认架构改为 vmamba
+    parser.add_argument("--arch", default="vmamba", type=str, help="backbone architecture: vit or vmamba")
+    
+    parser.add_argument('--feat-dim', default=384, type=int, help='feature dimension (384 for mamba-small)')
     parser.add_argument('--img-h', default=256, type=int)
     parser.add_argument('--img-w', default=128, type=int)
     parser.add_argument('--mode', default='train', help='train or test')

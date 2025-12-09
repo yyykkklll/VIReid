@@ -1,14 +1,16 @@
 #!/bin/bash
-# RegDB ViT-Base Quick Verification - 60 Epochs
-# 目标: 快速验证改进策略（如 Sinkhorn）是否生效，避免长时间无效等待
+# RegDB FD-Mamba (Frequency-Disentangled Mamba) Training Script
+# 目标: 验证 Scheme A (Mamba) + Scheme C (FreqAug) 在 RegDB 上的性能
+# 预期: 相比 ViT-Base，Mamba 参数更少且具备全局感受野，配合频域增强应能显著缓解过拟合。
 
-# 自动切换到脚本所在目录的上一级 (项目根目录)
+# 自动切换到脚本所在目录
 cd "$(dirname "$0")" || exit
-
-echo "🚀 RegDB SG-WSL (ViT-Base) - Quick Verification (60 Epochs)..."
-
-# 设置 Python 路径
 export PYTHONPATH=$PYTHONPATH:.
+
+echo "🚀 RegDB FD-Mamba (Scheme A + C) - Training Start..."
+
+# 清理可能存在的缓存（可选）
+rm -rf __pycache__
 
 python main.py \
     --dataset regdb \
@@ -17,8 +19,8 @@ python main.py \
     --device 0 \
     --seed 42 \
     \
-    --arch vit \
-    --feat-dim 768 \
+    --arch vmamba \
+    --feat-dim 384 \
     --img-h 256 \
     --img-w 128 \
     \
@@ -29,16 +31,16 @@ python main.py \
     \
     --lr 0.0003 \
     --weight-decay 0.05 \
-    --milestones 30 50 \
+    --milestones 40 80 \
     \
-    --stage1-epoch 13 \
-    --stage2-epoch 60 \
+    --stage1-epoch 20 \
+    --stage2-epoch 120 \
     --trial 1 \
     \
-    --save-path regdb_vit_quick_v1 \
+    --save-path regdb_fd_mamba_v1 \
     --debug wsl \
     --relabel 1 \
     --weak-weight 0.25 \
     --tri-weight 0.25
 
-echo "✅ Quick Verification Complete! Logs saved to saved_regdb_vit/regdb_vit_quick_v1"
+echo "✅ Training Complete! Logs saved to saved_regdb_vmamba/regdb_fd_mamba_v1"
