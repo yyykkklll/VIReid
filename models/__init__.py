@@ -1,144 +1,80 @@
 import torch
 import os
-
-from .classifier import Image_Classifier
-from utils import os_walk
 from .resnet import build_resnet 
+from .projector import Projector
+from .discriminator import DomainDiscriminator
+from .loss import InfoNCELoss, SinkhornLoss, AdversarialLoss
+from utils import os_walk
 
-# 仅保留通用的优化器和损失函数
-from .optim import WarmupMultiStepLR
-from .loss import TripletLoss_WRT, Weak_loss, CrossEntropyLabelSmooth, ConsistencyLoss
-
-# 注册表仅保留 ResNet50，彻底杜绝 Mamba 警告
+# 仅保留 ResNet
 _models = {
     "resnet50": build_resnet,
 }
 
 def create(args):
-    if args.arch not in _models:
-        raise KeyError(f"Unknown backbone: {args.arch}. Only 'resnet50' is supported.")
-    return Model(args)
+    return UnsupervisedModel(args)
 
-class Model:
+class UnsupervisedModel:
     def __init__(self, args):
-        self.mode = args.mode
+        self.args = args
         self.device = torch.device(args.device if torch.cuda.is_available() else "cpu")
         self.save_path = os.path.join(args.save_path, "models/")
-        self.lr = args.lr
-        self.weight_decay = args.weight_decay
-        self.milestones = args.milestones
-        self.resume = args.resume
-        self.args = args
-        self.resume_epoch = 0 
-
+        
         print(f"Building Backbone: {args.arch}")
-        self.model = _models[args.arch](args).to(self.device)
+        self.backbone = _models[args.arch](args).to(self.device)
+        self.feat_dim = 2048 # ResNet50
         
-        # ResNet50 固定维度
-        self.in_dim = 2048
-        args.feat_dim = self.in_dim 
+        print("Building Unsupervised Components...")
+        self.projector = Projector(self.feat_dim, 256).to(self.device)
+        self.discriminator = DomainDiscriminator(self.feat_dim).to(self.device)
         
-        self.classifier1 = Image_Classifier(args).to(self.device) 
-        self.classifier2 = Image_Classifier(args).to(self.device) 
-        self.classifier3 = Image_Classifier(args).to(self.device) 
-        self.enable_cls3 = False 
-
         self._init_optimizer()
         self._init_criterion()
 
     def _init_optimizer(self):
-        params_phase1 = []
-        params_phase2 = []
+        # Backbone 和 Projector 是一伙的
+        self.opt_backbone = torch.optim.AdamW([
+            {'params': self.backbone.parameters()},
+            {'params': self.projector.parameters(), 'lr': self.args.lr * 2}
+        ], lr=self.args.lr, weight_decay=self.args.weight_decay)
         
-        for part in (self.model, self.classifier1, self.classifier2):
-            for key, value in part.named_parameters():
-                if value.requires_grad:
-                    if "classifier" in key:
-                        params_phase1 += [{"params": [value], "lr": 2 * self.lr, "weight_decay": self.weight_decay}]
-                    else:
-                        params_phase1 += [{"params": [value], "lr": self.lr, "weight_decay": self.weight_decay}]
-        
-        params_phase2.extend(params_phase1)
-        
-        for key, value in self.classifier3.named_parameters():
-            if value.requires_grad:
-                params_phase2 += [{"params": [value], "lr": 2 * self.lr, "weight_decay": self.weight_decay}]
-        
-        self.optimizer_phase1 = torch.optim.AdamW(params_phase1)
-        self.optimizer_phase2 = torch.optim.AdamW(params_phase2)
-        
-        self.scheduler_phase1 = WarmupMultiStepLR(self.optimizer_phase1, self.milestones, gamma=0.1, warmup_factor=0.01, warmup_iters=10, mode='cls')
-        self.scheduler_phase2 = WarmupMultiStepLR(self.optimizer_phase2, self.milestones, gamma=0.1, warmup_factor=0.01, warmup_iters=10, mode='cls')
+        # Discriminator 是对手
+        self.opt_disc = torch.optim.Adam(
+            self.discriminator.parameters(), lr=self.args.lr, betas=(0.5, 0.999)
+        )
 
     def _init_criterion(self):
-        self.pid_criterion = CrossEntropyLabelSmooth(num_classes=self.args.num_classes, epsilon=0.1, use_gpu=True)
-        self.tri_criterion = TripletLoss_WRT()
-        self.weak_criterion = Weak_loss()
-        self.cons_criterion = ConsistencyLoss() 
+        self.criterion_nce = InfoNCELoss(temperature=0.07).to(self.device)
+        self.criterion_ot = SinkhornLoss(epsilon=0.05).to(self.device)
+        self.criterion_adv = AdversarialLoss().to(self.device)
 
     def set_train(self):
-        self.model.train()
-        self.classifier1.train()
-        self.classifier2.train()
-        self.classifier3.train()
+        self.backbone.train()
+        self.projector.train()
+        self.discriminator.train()
 
     def set_eval(self):
-        self.model.eval()
-        self.classifier1.eval()
-        self.classifier2.eval()
-        self.classifier3.eval()
-
-    def save_model(self, save_epoch, is_best):
-        if is_best:
-            model_file_path = os.path.join(self.save_path, 'model_{}.pth'.format(save_epoch))
-            root, _, files = os_walk(self.save_path)
-            for file in files:
-                if '.pth' not in file: continue
-                try:
-                    file_iters = int(file.replace('.pth', '').split('_')[1])
-                    if file_iters <= save_epoch: 
-                        os.remove(os.path.join(root, 'model_{}.pth'.format(file_iters)))
-                except: pass
-            
-            all_state_dict = {
-                'backbone': self.model.state_dict(),
-                'classifier1': self.classifier1.state_dict(),
-                'classifier2': self.classifier2.state_dict(),
-                'classifier3': self.classifier3.state_dict()
-            }
-            torch.save(all_state_dict, model_file_path)
-            print(f"Model saved to {model_file_path}")
+        self.backbone.eval()
+        self.projector.eval()
+        self.discriminator.eval()
         
-    def resume_model(self, specified_model=None):
-        model_path = None
-        if specified_model is None or specified_model == 'default':
-            root, _, files = os_walk(self.save_path)
-            if len(files) > 0:
-                indexes = []
-                for file in files:
-                    if 'model_' in file and '.pth' in file:
-                        try:
-                            indexes.append(int(file.replace('.pth', '').split('_')[-1]))
-                        except: pass
-                if indexes:
-                    indexes = sorted(list(set(indexes)), reverse=False)
-                    model_path = os.path.join(self.save_path, 'model_{}.pth'.format(indexes[-1]))
+    def save_model(self, epoch, is_best):
+        if is_best:
+            path = os.path.join(self.save_path, f"model_best.pth")
         else:
-            model_path = specified_model
+            path = os.path.join(self.save_path, f"model_epoch_{epoch}.pth")
+            
+        state = {
+            'backbone': self.backbone.state_dict(),
+            'projector': self.projector.state_dict(),
+            'discriminator': self.discriminator.state_dict(),
+            'epoch': epoch
+        }
+        torch.save(state, path)
+        print(f"Saved model to {path}")
 
-        if model_path and os.path.exists(model_path):
-            print(f'Loading checkpoint from {model_path}')
-            loaded_dict = torch.load(model_path, map_location=self.device)
-            self.model.load_state_dict(loaded_dict['backbone'], strict=False)
-            self.classifier1.load_state_dict(loaded_dict['classifier1'], strict=False)
-            self.classifier2.load_state_dict(loaded_dict['classifier2'], strict=False)
-            if 'classifier3' in loaded_dict:
-                self.classifier3.load_state_dict(loaded_dict['classifier3'], strict=False)
-            try:
-                self.resume_epoch = int(os.path.basename(model_path).split('_')[1].split('.')[0])
-            except:
-                self.resume_epoch = 0
-            print(f'Resumed from epoch {self.resume_epoch}')
-        else:
-            print('No valid checkpoint found. Starting from scratch.')
-            self.resume_epoch = 0
+    def load_model(self, path):
+        if not os.path.exists(path): return
+        state = torch.load(path, map_location=self.device)
+        self.backbone.load_state_dict(state['backbone'], strict=False)
+        print(f"Loaded backbone from {path}")

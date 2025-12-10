@@ -129,19 +129,23 @@ class LLCM_train(data.Dataset):
         label = info[:,1]
         gt = label.reshape(label.shape[0],-1)
         info = np.concatenate((info,gt),axis=1)
-        pid_set = set(label)
-        random_pid = list(range(len(pid_set)))
-        random.shuffle(random_pid)
-        pid2label = {pid:idx for idx, pid in enumerate(pid_set)}
-        pid2random_label = {pid:idx for idx, pid in enumerate(random_pid)}
+        
+        # [修复核心] 强制排序，去随机化
+        pid_list = sorted(list(set(label)))
+        pid2label = {pid:idx for idx, pid in enumerate(pid_list)}
+        
         for i in range(len(label)):
-            labeled_id = pid2label[label[i]]
+            original_pid = label[i]
+            labeled_id = pid2label[original_pid]
+            
             info[:,-1][i] = labeled_id
+            
             if self.relabel:
-                info[:,1][i]= pid2random_label[labeled_id]
+                info[:,1][i]= labeled_id
             else:
                 info[:,1][i]= labeled_id
-        return info, pid2random_label
+                
+        return info, pid2label
     
     def __len__(self):
         return len(self.train_image)
