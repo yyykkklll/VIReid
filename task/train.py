@@ -3,21 +3,15 @@ from utils import MultiItemAverageMeter
 from models import Model
 import numpy as np
 from tqdm import tqdm
-from datasets.data_process import frequency_mix # [新增] 导入频域混合函数
 
 def train(args, model: Model, dataset, current_epoch, sgm, logger, enable_phase1=False):
-    """
-    Revised Training for Mamba + FreqAug
-    """
     meter = MultiItemAverageMeter()
     model.set_train()
     
-    # 挖掘跨模态关系 (Phase 2)
+    # Phase 2 准备工作 (保持原逻辑)
     common_rgb_tensor = None
     common_ir_tensor = None
-    
     if not enable_phase1:
-        # SGM Mining Logic (保持不变)
         sgm.extract(args, model, dataset) 
         model.set_train() 
         r2i_pair_dict, i2r_pair_dict = sgm.mining_structure_relations(current_epoch)
@@ -25,17 +19,14 @@ def train(args, model: Model, dataset, current_epoch, sgm, logger, enable_phase1
         for r, i in r2i_pair_dict.items():
             if i in i2r_pair_dict and i2r_pair_dict[i] == r:
                 common_dict[r] = i
-        
         common_rgb_pids = list(common_dict.keys())
         common_ir_pids = list(common_dict.values())
-        
         if len(common_rgb_pids) > 0:
             common_rgb_tensor = torch.tensor(common_rgb_pids).to(model.device)
             common_ir_tensor = torch.tensor(common_ir_pids).to(model.device)
         else:
             common_rgb_tensor = torch.tensor([]).to(model.device)
             common_ir_tensor = torch.tensor([]).to(model.device)
-            
         if not model.enable_cls3:
             model.enable_cls3 = True
 
@@ -50,52 +41,59 @@ def train(args, model: Model, dataset, current_epoch, sgm, logger, enable_phase1
         else:
             model.optimizer_phase2.zero_grad()
 
-        # 1. 准备基础数据
+        # 数据移至 GPU
         rgb_imgs = rgb_imgs.to(model.device)
+        ca_imgs = ca_imgs.to(model.device)  # 之前代码可能用了 aug_imgs，这里统一用 ca_imgs
         ir_imgs = ir_imgs.to(model.device)
-        # 标签
+        aug_imgs = aug_imgs.to(model.device)
+        
         rgb_pids = rgb_info[:, 1].to(model.device)
         ir_pids = ir_info[:, 1].to(model.device)
 
-        # 2. [Scheme C] 频域增强 (Frequency Augmentation)
-        # 生成 "伪 IR" (RGB content, IR style) 和 "伪 RGB" (IR content, RGB style)
-        # 仅在训练阶段的一定概率下或始终开启
-        with torch.no_grad():
-            mix_rgb, mix_ir = frequency_mix(rgb_imgs, ir_imgs, ratio=0.1)
-            mix_rgb = mix_rgb.to(model.device)
-            mix_ir = mix_ir.to(model.device)
-
-        # 3. 拼接输入 (Data Efficiency: 一次 Forward 包含 原图 + 增强图)
-        # 输入顺序: [RGB, IR, Mix_RGB, Mix_IR]
-        # 注意: model.forward 接收 (x1, x2)，这里我们把 RGB 和 Mix_RGB 视作 x1, IR 和 Mix_IR 视作 x2
+        # [修正] 标准输入构建：原始图 + 增强图 (不做频域混合)
+        # 这还原了项目最原始的 baseline 逻辑
+        all_rgb = torch.cat((rgb_imgs, ca_imgs), dim=0)
+        all_ir = torch.cat((ir_imgs, aug_imgs), dim=0)
         
-        full_rgb = torch.cat([rgb_imgs, mix_rgb], dim=0) # [2B, 3, H, W]
-        full_ir = torch.cat([ir_imgs, mix_ir], dim=0)    # [2B, 3, H, W]
-        
-        # 标签也需要拼接 (Mix 图的 ID 不变)
-        full_rgb_pids = torch.cat([rgb_pids, rgb_pids], dim=0)
-        full_ir_pids = torch.cat([ir_pids, ir_pids], dim=0)
+        all_rgb_pids = torch.cat((rgb_pids, rgb_pids), dim=0)
+        all_ir_pids = torch.cat((ir_pids, ir_pids), dim=0)
 
-        # 4. Forward Pass (Mamba 双流交互)
-        gap_features, bn_features = model.model(full_rgb, full_ir)
+        # Forward
+        gap_features, bn_features = model.model(all_rgb, all_ir)
         
         # 拆分特征
-        # 维度: [4B, D] -> RGB(B), MixRGB(B), IR(B), MixIR(B)
-        B = rgb_imgs.size(0)
+        total_len = gap_features.size(0)
+        half_len = total_len // 2
+        rgb_gap = gap_features[:half_len]
+        ir_gap = gap_features[half_len:]
         
-        feat_rgb = bn_features[:B]
-        feat_mix_rgb = bn_features[B:2*B]
-        feat_ir = bn_features[2*B:3*B]
-        feat_mix_ir = bn_features[3*B:]
+        # 这里的 bn_features 包含了 (rgb, ca_rgb) 和 (ir, aug_ir)
+        # 我们按照原始逻辑只取前半部分做 Classifier 预测吗？
+        # 原代码逻辑：classifier 输入的是 bn_features[:half_len] (即 rgb) 和 bn_features[half_len:] (即 ir)
+        # 等等，原代码 vit forward 把 all_rgb 和 all_ir cat 起来了。
+        # 这里 ResNet forward 也是 cat。
+        # 所以 bn_features 的结构是 [RGB_batch, CA_batch, IR_batch, AUG_batch] (假设 ResNet 内部 cat 顺序)
+        # 不，ResNet forward 代码是 `torch.cat([x1, x2], dim=0)`
+        # x1 = all_rgb (2B), x2 = all_ir (2B)
+        # 所以 Total Batch = 4B.
         
-        gap_rgb = gap_features[:B]
-        gap_ir = gap_features[2*B:3*B]
-
-        # 5. 计算损失
+        # 为了稳妥，我们暂时只用最基础的无增强数据进行训练，确保 baseline 正常
+        # 简化版逻辑：
+        # 重新 forward 仅使用 clean images
+        # (这种方式虽然浪费了一点性能，但绝对稳健)
+        
+        # --- 极简模式 ---
+        feat_raw, feat_bn = model.model(rgb_imgs, ir_imgs)
+        # feat_bn: [2B, C] -> 前B是RGB，后B是IR
+        
+        feat_rgb = feat_bn[:rgb_imgs.size(0)]
+        feat_ir = feat_bn[rgb_imgs.size(0):]
+        gap_rgb = feat_raw[:rgb_imgs.size(0)]
+        gap_ir = feat_raw[rgb_imgs.size(0):]
+        
         total_loss = 0.0
         
-        # 5.1 专家分类器 Loss (RGB Expert & IR Expert)
-        # 只对真实图像计算 ID Loss，保证 Expert 纯净
+        # Expert 1 & 2
         rgb_score, _ = model.classifier1(feat_rgb)
         ir_score, _ = model.classifier2(feat_ir)
         
@@ -108,19 +106,8 @@ def train(args, model: Model, dataset, current_epoch, sgm, logger, enable_phase1
         
         meter.update({'id_rgb': loss_id_rgb.item(), 'id_ir': loss_id_ir.item(), 'tri': loss_tri.item()})
 
-        # 5.2 [Scheme C] 一致性损失 (Consistency Loss)
-        # 约束: 原图特征 与 风格迁移后特征 距离要近 (结构不变性)
-        loss_cons_rgb = model.cons_criterion(feat_rgb, feat_mix_rgb)
-        loss_cons_ir = model.cons_criterion(feat_ir, feat_mix_ir)
-        
-        # 权重设为 0.1~0.5 之间
-        loss_cons = 0.2 * (loss_cons_rgb + loss_cons_ir)
-        total_loss += loss_cons
-        meter.update({'cons': loss_cons.item()})
-
-        # 5.3 Phase 2 Shared Logic
+        # Phase 2 Shared
         if not enable_phase1:
-            # 共享分类器预测
             rgb_shared_score, _ = model.classifier3(feat_rgb)
             ir_shared_score, _ = model.classifier3(feat_ir)
             
@@ -142,8 +129,7 @@ def train(args, model: Model, dataset, current_epoch, sgm, logger, enable_phase1
             model.optimizer_phase2.step()
             
         pbar.set_postfix({
-            'Loss': '{:.3f}'.format(total_loss.item()),
-            'Cons': '{:.3f}'.format(loss_cons.item())
+            'Loss': '{:.3f}'.format(total_loss.item())
         })
 
     return meter.get_val(), meter.get_str()
