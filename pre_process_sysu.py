@@ -10,7 +10,7 @@ IMAGE_WIDTH = 144
 # data_path = "/media/d/KLQ/MINI_Dataset/SYSU-MM01/"
 # data_path = '/home/ps/data/data-1/KLQ/MINI_Dataset/SYSU-MM01'
 
-data_path = "/root/vireid/datasets/SYSU-MM01"
+data_path = "/home/l/data_1/KLQ/VIREID_Dataset/SYSU-MM01/"
 assert os.path.exists(data_path)
 '''
 save trainset and info as numpy array
