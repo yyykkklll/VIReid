@@ -1,55 +1,41 @@
 #!/bin/bash
-# WSL-VI-ReID Training on RegDB with CLIP & Sinkhorn
-# 修复记录：添加 --data-path 参数指向正确的数据集位置
 
-# 1. 自动切换到脚本所在目录
 cd "$(dirname "$0")" || exit
 export PYTHONPATH=$PYTHONPATH:.
 
-echo "🚀 [RegDB] Training Start with CLIP-Refereed & Sinkhorn Matching..."
+echo "🚀 [RegDB] Training Start (Fixed Version)..."
 
-# 2. 清理缓存
-echo "🧹 Cleaning up cache..."
-find . -name "__pycache__" -type d -exec rm -rf {} +
-find . -name "*.pyc" -delete
+find . -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null
+find . -name "*.pyc" -delete 2>/dev/null
 
-# 3. 启动训练
-# 关键修改：添加 --data-path ./datasets
-# 代码逻辑会自动在 datasets 目录下寻找 "RegDB" 文件夹，所以这里只需指向 datasets
-
-#!/bin/bash
-# RegDB 训练脚本 (优化版)
+# 检查磁盘空间
+FREE_SPACE=$(df -h . | tail -1 | awk '{print $4}')
+echo "Available disk space: $FREE_SPACE"
 
 python main.py \
     --dataset regdb \
     --data-path ./datasets \
-    --save-path regdb_wsl_optimized \
+    --save-path regdb_wsl_fixed \
     --arch resnet \
     --trial 1 \
-    \
     --mode train \
     --device 0 \
     --seed 42 \
-    \
     --img-h 288 \
     --img-w 144 \
-    --batch-pidnum 16 \          # ✅ 增加 batch size
+    --batch-pidnum 16 \
     --pid-numsample 4 \
-    \
-    --lr 0.0002 \                # ✅ 降低学习率
+    --lr 0.0003 \
     --weight-decay 0.0005 \
-    \
-    --stage1-epoch 80 \          # ✅ 延长 Phase1
-    --stage2-epoch 120 \
-    --milestones 40 80 \         # ✅ 调整 milestone
-    \
+    --stage1-epoch 60 \
+    --stage2-epoch 100 \
+    --milestones 40 70 \
     --debug wsl \
-    \
     --use-clip \
     --use-sinkhorn \
     --w-clip 0.3 \
-    --sinkhorn-reg 0.1 \         # ✅ 增大正则化
+    --sinkhorn-reg 0.05 \
     --temperature 0.05 \
-    --sigma 0.1
+    --sigma 0.3
 
 echo "✅ Training Finished!"
