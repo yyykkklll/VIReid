@@ -17,7 +17,7 @@ class CMA(nn.Module):
     
     def __init__(self, args):
         super(CMA, self).__init__()
-        self.device = torch.device(args.device)
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.num_classes = args.num_classes
         self.T = args.temperature
         self.sigma = args.sigma
@@ -188,24 +188,27 @@ class CMA(nn.Module):
     
     def _generate_matches_from_Q_fixed(self, Q):
         """
-        Fixed matching generation with adaptive threshold
+        Fixed matching generation with adaptive threshold and Top-K strategy
+        
+        Args:
+            Q: Transport matrix [N_rgb, N_ir]
+        
+        Returns:
+            v2i: RGB to IR matching dict
+            i2v: IR to RGB matching dict
         """
         v2i = OrderedDict()
         i2v = OrderedDict()
         
-        # 计算每行和每列的最大值
-        max_rgb = np.max(Q, axis=1)
-        max_ir = np.max(Q, axis=0)
-        
-        # 使用Top-K策略而非固定阈值
-        top_k = min(5, Q.shape[1])  # 每个RGB最多匹配5个IR
+        # Use Top-K strategy instead of fixed threshold
+        top_k = min(5, Q.shape[1])
         
         for i in range(Q.shape[0]):
-            # 获取Top-K匹配
+            # Get Top-K matches
             top_indices = np.argsort(Q[i])[-top_k:][::-1]
             
             for j in top_indices:
-                # 双向验证：必须互为Top-K
+                # Bidirectional verification: must be mutually in Top-K
                 if i in np.argsort(Q[:, j])[-top_k:]:
                     rgb_id = self.rgb_ids[i].item()
                     ir_id = self.ir_ids[j].item()
@@ -214,9 +217,10 @@ class CMA(nn.Module):
                         v2i[rgb_id] = ir_id
                     if ir_id not in i2v:
                         i2v[ir_id] = rgb_id
-                    break  # 只保留最佳匹配
+                    break
         
         return v2i, i2v
+
     
     def _match_greedy(self):
         """Greedy matching algorithm"""

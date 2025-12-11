@@ -2,8 +2,10 @@
 Model Management Module
 =======================
 Components: Backbone, Classifiers, CLIP, Optimizers, Schedulers
-Author: Fixed Version
-Date: 2025-12-11
+Updates:
+- Added CosineAnnealingWarmupLR scheduler support
+- Integrated LabelSmoothingCrossEntropy and InfoNCE loss
+- Added adaptive loss weighting
 """
 
 import torch
@@ -12,8 +14,14 @@ import os
 from .classifier import Image_Classifier
 from .agw import AGW
 from .clip_model import CLIP, load_clip_to_cpu
-from .optim import WarmupMultiStepLR
-from .loss import TripletLoss_WRT, Weak_loss
+from .optim import WarmupMultiStepLR, CosineAnnealingWarmupLR
+from .loss import (
+    TripletLoss_WRT, 
+    Weak_loss, 
+    LabelSmoothingCrossEntropy, 
+    InfoNCELoss, 
+    AdaptiveLossWeighting
+)
 from utils import os_walk
 
 
@@ -36,7 +44,7 @@ class Model:
     def __init__(self, args):
         self.args = args
         self.mode = args.mode
-        self.device = torch.device(f'cuda:{args.device}' if torch.cuda.is_available() else "cpu")
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.save_path = os.path.join(args.save_path, "models/")
         
         self.lr = args.lr
@@ -86,7 +94,9 @@ class Model:
         return clip_model
     
     def _init_optimizer(self):
-        """Initialize optimizers for two-stage training"""
+        """Initialize optimizers and schedulers for two-stage training"""
+        
+        # Build parameter groups for Phase 1
         params_phase1 = []
         for module in [self.model, self.classifier1, self.classifier2]:
             for name, param in module.named_parameters():
@@ -99,6 +109,7 @@ class Model:
                     'weight_decay': self.weight_decay
                 })
         
+        # Build parameter groups for Phase 2 (includes classifier3)
         params_phase2 = params_phase1.copy()
         for name, param in self.classifier3.named_parameters():
             if param.requires_grad:
@@ -108,23 +119,83 @@ class Model:
                     'weight_decay': self.weight_decay
                 })
         
+        # Initialize optimizers
         self.optimizer_phase1 = torch.optim.Adam(params_phase1)
         self.optimizer_phase2 = torch.optim.Adam(params_phase2)
         
-        self.scheduler_phase1 = WarmupMultiStepLR(
-            self.optimizer_phase1, milestones=self.milestones,
-            gamma=0.1, warmup_factor=0.1, warmup_iters=5, mode='cls'
-        )
-        self.scheduler_phase2 = WarmupMultiStepLR(
-            self.optimizer_phase2, milestones=self.milestones,
-            gamma=0.1, warmup_factor=0.1, warmup_iters=5, mode='cls'
-        )
+        # Initialize schedulers based on configuration
+        use_cosine = getattr(self.args, 'use_cosine_scheduler', False)
+        
+        if use_cosine:
+            print("Using Cosine Annealing with Warmup scheduler")
+            
+            warmup_epochs = getattr(self.args, 'warmup_epochs', 5)
+            eta_min = getattr(self.args, 'eta_min', 1e-6)
+            
+            self.scheduler_phase1 = CosineAnnealingWarmupLR(
+                self.optimizer_phase1,
+                warmup_epochs=warmup_epochs,
+                max_epochs=self.args.stage1_epoch,
+                eta_min=eta_min
+            )
+            self.scheduler_phase2 = CosineAnnealingWarmupLR(
+                self.optimizer_phase2,
+                warmup_epochs=warmup_epochs,
+                max_epochs=self.args.stage2_epoch,
+                eta_min=eta_min
+            )
+            
+            print(f"  Warmup epochs: {warmup_epochs}")
+            print(f"  Eta min: {eta_min}")
+            
+        else:
+            print("Using MultiStep with Warmup scheduler")
+            
+            self.scheduler_phase1 = WarmupMultiStepLR(
+                self.optimizer_phase1, 
+                milestones=self.milestones,
+                gamma=0.1, 
+                warmup_factor=0.1, 
+                warmup_iters=5, 
+                mode='cls'
+            )
+            self.scheduler_phase2 = WarmupMultiStepLR(
+                self.optimizer_phase2, 
+                milestones=self.milestones,
+                gamma=0.1, 
+                warmup_factor=0.1, 
+                warmup_iters=5, 
+                mode='cls'
+            )
+            
+            print(f"  Milestones: {self.milestones}")
     
     def _init_criterion(self):
-        """Initialize loss functions"""
-        self.pid_criterion = nn.CrossEntropyLoss()
+        """Initialize loss functions with new optimized versions"""
+        
+        # Get label smoothing epsilon from args
+        label_smoothing = getattr(self.args, 'label_smoothing', 0.1)
+        contrastive_temp = getattr(self.args, 'contrastive_temp', 0.07)
+        
+        # NEW: Use Label Smoothing instead of vanilla CrossEntropy
+        self.pid_criterion = LabelSmoothingCrossEntropy(epsilon=label_smoothing)
+        
+        # Keep original loss functions
         self.tri_criterion = TripletLoss_WRT()
         self.weak_criterion = Weak_loss()
+        
+        # NEW: Add contrastive loss
+        self.contrastive_criterion = InfoNCELoss(temperature=contrastive_temp)
+        
+        # NEW: Add adaptive loss weighting
+        self.loss_weighter = AdaptiveLossWeighting(num_losses=10)
+        
+        print("Loss functions initialized:")
+        print(f"  - LabelSmoothingCrossEntropy (ε={label_smoothing})")
+        print(f"  - TripletLoss_WRT")
+        print(f"  - Weak_loss")
+        print(f"  - InfoNCELoss (τ={contrastive_temp})")
+        print(f"  - AdaptiveLossWeighting (10 losses)")
     
     def set_train(self):
         """Set model to training mode"""
@@ -154,6 +225,8 @@ class Model:
             'classifier3': self.classifier3.state_dict(),
             'optimizer_phase1': self.optimizer_phase1.state_dict(),
             'optimizer_phase2': self.optimizer_phase2.state_dict(),
+            'scheduler_phase1': self.scheduler_phase1.state_dict(),
+            'scheduler_phase2': self.scheduler_phase2.state_dict(),
         }
         
         if is_best:
@@ -206,11 +279,23 @@ class Model:
             
             self.resume_epoch = checkpoint.get('epoch', 0)
             
-            if self.mode == 'train' and 'optimizer_phase2' in checkpoint:
+            # Load optimizer and scheduler states
+            if self.mode == 'train':
                 try:
-                    self.optimizer_phase2.load_state_dict(checkpoint['optimizer_phase2'])
-                except:
-                    print("Failed to load optimizer state, using fresh optimizer")
+                    if 'optimizer_phase1' in checkpoint:
+                        self.optimizer_phase1.load_state_dict(checkpoint['optimizer_phase1'])
+                    if 'optimizer_phase2' in checkpoint:
+                        self.optimizer_phase2.load_state_dict(checkpoint['optimizer_phase2'])
+                    
+                    if 'scheduler_phase1' in checkpoint:
+                        self.scheduler_phase1.load_state_dict(checkpoint['scheduler_phase1'])
+                    if 'scheduler_phase2' in checkpoint:
+                        self.scheduler_phase2.load_state_dict(checkpoint['scheduler_phase2'])
+                    
+                    print("  Optimizer and scheduler states loaded")
+                except Exception as e:
+                    print(f"  Failed to load optimizer/scheduler state: {e}")
+                    print("  Using fresh optimizer and scheduler")
             
             print(f"Model loaded successfully from epoch {self.resume_epoch}")
             
@@ -289,3 +374,10 @@ class Model:
     def get_learning_rate(self):
         """Get current learning rate"""
         return self.optimizer_phase2.param_groups[0]['lr']
+    
+    def step_scheduler(self, phase=2):
+        """Step the learning rate scheduler"""
+        if phase == 1:
+            self.scheduler_phase1.step()
+        else:
+            self.scheduler_phase2.step()

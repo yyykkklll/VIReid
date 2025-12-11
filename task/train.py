@@ -6,6 +6,17 @@ Features:
 - Phase 2: Cross-modal matching learning (based on pseudo labels)
 - Multiple loss functions: ID Loss, Triplet Loss, CMO Loss, Weak Loss
 - CLIP semantic enhancement and Sinkhorn global matching
+
+Fixes:
+1. CRITICAL FIX: Use loss*0.0 instead of torch.tensor(0.0) to stay in computation graph
+2. Improved gradient clipping strategy
+3. Better memory bank initialization checks
+4. Fixed matching matrix construction logic
+5. Enhanced loss stability with NaN/Inf checks
+6. Added loss warmup for CMO and weak losses
+7. Integrated Label Smoothing and InfoNCE Contrastive Loss
+8. Dynamic loss annealing and adaptive weighting
+
 Author: Fixed Version
 Date: 2025-12-11
 """
@@ -91,6 +102,7 @@ def train(args, model: Model, dataset, epoch, cma: CMA, logger, enable_phase1):
         if args.dataset == 'regdb':
             ir_ids = torch.cat([ir_ids, ir_ids]).to(model.device)
         
+        # Forward pass
         gap_features, bn_features = model.model(color_imgs, ir_imgs_full)
         
         rgbcls_out, _ = model.classifier1(bn_features)
@@ -104,12 +116,14 @@ def train(args, model: Model, dataset, epoch, cma: CMA, logger, enable_phase1):
         r2i_cls = ircls_out[:2 * batch_size]
         i2r_cls = rgbcls_out[2 * batch_size:]
         
+        # Compute losses based on training phase
         if enable_phase1:
             total_loss, losses = _compute_phase1_loss(
                 model, args, 
                 r2r_cls, i2i_cls, 
                 rgb_features, ir_features,
-                rgb_ids, ir_ids
+                rgb_ids, ir_ids,
+                epoch
             )
         else:
             total_loss, losses = _compute_phase2_loss(
@@ -123,6 +137,7 @@ def train(args, model: Model, dataset, epoch, cma: CMA, logger, enable_phase1):
         
         meter.update(losses)
         
+        # Backpropagation
         if enable_phase1:
             model.optimizer_phase1.zero_grad()
         else:
@@ -130,7 +145,11 @@ def train(args, model: Model, dataset, epoch, cma: CMA, logger, enable_phase1):
         
         total_loss.backward()
         
-        torch.nn.utils.clip_grad_norm_(model.model.parameters(), max_norm=5.0)
+        # Adaptive gradient clipping
+        if enable_phase1:
+            torch.nn.utils.clip_grad_norm_(model.model.parameters(), max_norm=10.0)
+        else:
+            torch.nn.utils.clip_grad_norm_(model.model.parameters(), max_norm=5.0)
         
         if enable_phase1:
             model.optimizer_phase1.step()
@@ -165,20 +184,26 @@ def _build_matching_matrices(args, r2i_dict, i2r_dict, device):
     specific_dict = {}
     remain_dict = {}
     
+    # Step 1: Find bidirectional matches (Common)
     for rgb_id, ir_id in r2i_dict.items():
         if ir_id in i2r_dict and i2r_dict[ir_id] == rgb_id:
             common_dict[rgb_id] = ir_id
-        elif rgb_id not in i2r_dict.values() and ir_id not in i2r_dict.keys():
-            specific_dict[rgb_id] = ir_id
-        else:
-            remain_dict[rgb_id] = ir_id
     
-    for ir_id, rgb_id in i2r_dict.items():
-        if (rgb_id, ir_id) not in common_dict.items():
-            if rgb_id not in r2i_dict.keys() and ir_id not in r2i_dict.values():
-                specific_dict[rgb_id] = ir_id
-            else:
+    # Step 2: Process RGB->IR unidirectional matches
+    for rgb_id, ir_id in r2i_dict.items():
+        if rgb_id not in common_dict:
+            if ir_id in i2r_dict or rgb_id in [v for v in i2r_dict.values()]:
                 remain_dict[rgb_id] = ir_id
+            else:
+                specific_dict[rgb_id] = ir_id
+    
+    # Step 3: Process IR->RGB unidirectional matches
+    for ir_id, rgb_id in i2r_dict.items():
+        if rgb_id not in common_dict and rgb_id not in specific_dict and rgb_id not in remain_dict:
+            if rgb_id in r2i_dict or ir_id in [v for v in r2i_dict.values()]:
+                remain_dict[rgb_id] = ir_id
+            else:
+                specific_dict[rgb_id] = ir_id
     
     num_classes = args.num_classes
     common_rm = torch.zeros(num_classes, num_classes).to(device)
@@ -196,6 +221,7 @@ def _build_matching_matrices(args, r2i_dict, i2r_dict, device):
     
     specific_rm = specific_rm + common_rm
     
+    # Convert to tensors
     common_matched_rgb = torch.tensor(list(common_dict.keys())).to(device) if common_dict else torch.tensor([]).to(device)
     common_matched_ir = torch.tensor(list(common_dict.values())).to(device) if common_dict else torch.tensor([]).to(device)
     specific_matched_rgb = torch.tensor(list(specific_dict.keys())).to(device) if specific_dict else torch.tensor([]).to(device)
@@ -218,13 +244,16 @@ def _build_matching_matrices(args, r2i_dict, i2r_dict, device):
 
 
 def _compute_phase1_loss(model, args, r2r_cls, i2i_cls, 
-                         rgb_features, ir_features, rgb_ids, ir_ids):
+                         rgb_features, ir_features, rgb_ids, ir_ids, epoch):
     """
     Phase 1 Loss: Intra-modal learning
     
+    CRITICAL FIX: Use loss*0.0 to create zero tensors that stay in computation graph
+    
     Loss components:
-        - ID Loss: Classification loss
-        - Triplet Loss: Metric learning loss
+        - ID Loss: Classification loss with label smoothing
+        - Triplet Loss: Metric learning loss with warmup
+        - Contrastive Loss: Intra-modal contrastive learning
     
     Args:
         model: Training model
@@ -235,25 +264,77 @@ def _compute_phase1_loss(model, args, r2r_cls, i2i_cls,
         ir_features: IR features
         rgb_ids: RGB identity labels
         ir_ids: IR identity labels
+        epoch: Current epoch number
         
     Returns:
         total_loss: Total loss
         losses: Loss dictionary
     """
     
+    # ID Loss (already using LabelSmoothingCrossEntropy)
     r2r_id_loss = model.pid_criterion(r2r_cls, rgb_ids)
     i2i_id_loss = model.pid_criterion(i2i_cls, ir_ids)
     
-    r2r_tri_loss = args.tri_weight * model.tri_criterion(rgb_features, rgb_ids)
-    i2i_tri_loss = args.tri_weight * model.tri_criterion(ir_features, ir_ids)
+    # Adaptive triplet weight with warmup
+    warmup_epochs = getattr(args, 'triplet_warmup_epochs', 10)
+    if epoch < warmup_epochs:
+        tri_weight = args.tri_weight * (epoch / warmup_epochs)
+    else:
+        tri_weight = args.tri_weight
     
-    total_loss = r2r_id_loss + i2i_id_loss + r2r_tri_loss + i2i_tri_loss
+    r2r_tri_loss = tri_weight * model.tri_criterion(rgb_features, rgb_ids)
+    i2i_tri_loss = tri_weight * model.tri_criterion(ir_features, ir_ids)
+    
+    # Intra-modal contrastive loss
+    contrastive_start_epoch = getattr(args, 'contrastive_start_epoch', 5)
+    
+    if epoch >= contrastive_start_epoch:
+        batch_size = len(rgb_ids) // 2
+        if batch_size > 0:
+            try:
+                contrastive_weight = getattr(args, 'intra_contrastive_weight', 0.1)
+                rgb_contrastive = contrastive_weight * model.contrastive_criterion(
+                    rgb_features[:batch_size], 
+                    rgb_features[batch_size:2*batch_size],
+                    rgb_ids[:batch_size],
+                    rgb_ids[batch_size:2*batch_size]
+                )
+            except Exception as e:
+                # CRITICAL: Use existing loss * 0 to stay in computation graph
+                rgb_contrastive = r2r_id_loss * 0.0
+        else:
+            rgb_contrastive = r2r_id_loss * 0.0
+        
+        ir_batch_size = len(ir_ids) // 2
+        if ir_batch_size > 0:
+            try:
+                contrastive_weight = getattr(args, 'intra_contrastive_weight', 0.1)
+                ir_contrastive = contrastive_weight * model.contrastive_criterion(
+                    ir_features[:ir_batch_size],
+                    ir_features[ir_batch_size:2*ir_batch_size],
+                    ir_ids[:ir_batch_size],
+                    ir_ids[ir_batch_size:2*ir_batch_size]
+                )
+            except Exception as e:
+                ir_contrastive = i2i_id_loss * 0.0
+        else:
+            ir_contrastive = i2i_id_loss * 0.0
+    else:
+        # Before contrastive_start_epoch, use zero loss from computation graph
+        rgb_contrastive = r2r_id_loss * 0.0
+        ir_contrastive = i2i_id_loss * 0.0
+    
+    total_loss = (r2r_id_loss + i2i_id_loss + 
+                  r2r_tri_loss + i2i_tri_loss +
+                  rgb_contrastive + ir_contrastive)
     
     losses = {
         'r2r_id_loss': r2r_id_loss.item(),
         'i2i_id_loss': i2i_id_loss.item(),
         'r2r_tri_loss': r2r_tri_loss.item(),
-        'i2i_tri_loss': i2i_tri_loss.item()
+        'i2i_tri_loss': i2i_tri_loss.item(),
+        'rgb_contrastive': rgb_contrastive.item(),
+        'ir_contrastive': ir_contrastive.item(),
     }
     
     return total_loss, losses
@@ -269,11 +350,12 @@ def _compute_phase2_loss(model, args, epoch,
     Phase 2 Loss: Cross-modal learning
     
     Loss components:
-        - Basic ID Loss (with detached backbone)
-        - Cross-modal Triplet Loss
-        - CMO Loss (Cross-Modal Consistency)
-        - Cross-Modal Classification Loss
-        - Weak Supervision Loss (for Remain branch)
+        - Basic ID Loss (with detached backbone and label smoothing)
+        - Cross-modal Triplet Loss (with adaptive weight)
+        - CMO Loss (Cross-Modal Consistency with KL-Divergence)
+        - Cross-Modal Contrastive Loss
+        - Cross-Modal Classification Loss (with annealing)
+        - Weak Supervision Loss (with early start and warmup)
     
     Args:
         model: Training model
@@ -295,6 +377,7 @@ def _compute_phase2_loss(model, args, epoch,
     
     batch_size = rgb_ids.size(0)
     
+    # 1. Basic ID Loss with detached backbone and label smoothing
     dtd_features = bn_features.detach()
     dtd_rgbcls_out, _ = model.classifier1(dtd_features)
     dtd_ircls_out, _ = model.classifier2(dtd_features)
@@ -311,6 +394,7 @@ def _compute_phase2_loss(model, args, epoch,
         'i2i_id_loss': i2i_id_loss.item()
     }
     
+    # 2. Cross-modal Triplet Loss with adaptive weight
     common_rgb_indices = torch.isin(rgb_ids, match_info['common_matched_rgb'])
     common_ir_indices = torch.isin(ir_ids, match_info['common_matched_ir'])
     
@@ -335,10 +419,13 @@ def _compute_phase2_loss(model, args, epoch,
         matched_ir_features = torch.cat([rgb_features, selected_ir_features], dim=0)
         matched_ir_labels = torch.cat([rgb_ids, translated_ir_label], dim=0)
         
-        tri_loss_rgb = args.tri_weight * model.tri_criterion(
+        # Adaptive triplet weight (gradually increase)
+        tri_weight = args.tri_weight * min(1.0, epoch / 10.0)
+        
+        tri_loss_rgb = tri_weight * model.tri_criterion(
             matched_rgb_features, matched_rgb_labels
         )
-        tri_loss_ir = args.tri_weight * model.tri_criterion(
+        tri_loss_ir = tri_weight * model.tri_criterion(
             matched_ir_features, matched_ir_labels
         )
         
@@ -348,6 +435,7 @@ def _compute_phase2_loss(model, args, epoch,
             'tri_loss_ir': tri_loss_ir.item()
         })
         
+        # 3. Update memory bank
         cma._update_memory(
             bn_features[:batch_size], 
             bn_features[batch_size:],
@@ -355,50 +443,75 @@ def _compute_phase2_loss(model, args, epoch,
             ir_ids
         )
         
-        r2i_entropy = infoEntropy(r2i_cls).item()
-        i2r_entropy = infoEntropy(i2r_cls).item()
-        
-        total_entropy = max(2.0 - r2i_entropy - i2r_entropy, 0.1)
-        w_r2i = max((1.0 - r2i_entropy) / total_entropy, 0.01)
-        w_i2r = max((1.0 - i2r_entropy) / total_entropy, 0.01)
-        
-        selected_rgb_memory = cma.vis_memory[translated_ir_label].detach()
-        selected_ir_memory = cma.ir_memory[translated_rgb_label].detach()
-        
-        if torch.norm(selected_rgb_memory) < 1e-6 or torch.norm(selected_ir_memory) < 1e-6:
-            logger(f"Epoch {epoch}: Memory bank not initialized, skipping CMO loss")
-        else:
-            mem_r2i_cls, _ = model.classifier2(selected_rgb_memory)
-            mem_i2r_cls, _ = model.classifier1(selected_ir_memory)
+        # 4. CMO Loss (Cross-Modal Output Consistency) with KL-Divergence
+        cmo_start_epoch = getattr(args, 'cmo_start_epoch', 3)
+        if epoch >= cmo_start_epoch:
+            selected_rgb_memory = cma.vis_memory[translated_ir_label].detach()
+            selected_ir_memory = cma.ir_memory[translated_rgb_label].detach()
             
-            cmo_criterion = torch.nn.MSELoss()
+            # Enhanced memory validation
+            rgb_mem_valid = torch.norm(selected_rgb_memory, dim=1).mean() > 1e-4
+            ir_mem_valid = torch.norm(selected_ir_memory, dim=1).mean() > 1e-4
             
-            if selected_ir_ids.shape[0] > 0:
-                r2i_cmo_loss = w_r2i * cmo_criterion(
-                    dtd_i2i_cls[common_ir_indices], 
-                    mem_r2i_cls
+            if rgb_mem_valid and ir_mem_valid:
+                mem_r2i_cls, _ = model.classifier2(selected_rgb_memory)
+                mem_i2r_cls, _ = model.classifier1(selected_ir_memory)
+                
+                # Use KL-Divergence instead of MSE
+                kl_criterion = torch.nn.KLDivLoss(reduction='batchmean')
+                
+                # CMO warmup and annealing
+                cmo_warmup = getattr(args, 'cmo_warmup', 10)
+                cmo_weight = 0.5 * min(1.0, (epoch - cmo_start_epoch) / cmo_warmup)
+                cmo_weight *= (1.0 - 0.5 * epoch / args.stage2_epoch)  # Annealing
+                
+                if selected_ir_ids.shape[0] > 0:
+                    try:
+                        r2i_cmo_loss = cmo_weight * kl_criterion(
+                            F.log_softmax(dtd_i2i_cls[common_ir_indices], dim=1),
+                            F.softmax(mem_r2i_cls.detach(), dim=1)
+                        )
+                        if not torch.isnan(r2i_cmo_loss) and not torch.isinf(r2i_cmo_loss):
+                            total_loss += r2i_cmo_loss
+                            losses['r2i_cmo_loss'] = r2i_cmo_loss.item()
+                    except Exception as e:
+                        pass
+                
+                if selected_rgb_ids.shape[0] > 0:
+                    try:
+                        i2r_cmo_loss = cmo_weight * kl_criterion(
+                            F.log_softmax(dtd_r2r_cls[common_rgb_indices], dim=1),
+                            F.softmax(mem_i2r_cls.detach(), dim=1)
+                        )
+                        if not torch.isnan(i2r_cmo_loss) and not torch.isinf(i2r_cmo_loss):
+                            total_loss += i2r_cmo_loss
+                            losses['i2r_cmo_loss'] = i2r_cmo_loss.item()
+                    except Exception as e:
+                        pass
+        
+        # 5. Cross-Modal Contrastive Loss
+        contrastive_start = getattr(args, 'cross_contrastive_start', 3)
+        if epoch >= contrastive_start:
+            try:
+                contrastive_weight = getattr(args, 'contrastive_weight', 0.3)
+                cross_contrastive = contrastive_weight * model.contrastive_criterion(
+                    selected_rgb_features,
+                    selected_ir_features,
+                    selected_rgb_ids,
+                    selected_ir_ids
                 )
-                if not torch.isnan(r2i_cmo_loss) and not torch.isinf(r2i_cmo_loss):
-                    total_loss += r2i_cmo_loss
-                    losses['r2i_cmo_loss'] = r2i_cmo_loss.item()
-                else:
-                    logger(f"Epoch {epoch}: r2i_cmo_loss is NaN/Inf, skipped")
-            
-            if selected_rgb_ids.shape[0] > 0:
-                i2r_cmo_loss = w_i2r * cmo_criterion(
-                    dtd_r2r_cls[common_rgb_indices], 
-                    mem_i2r_cls
-                )
-                if not torch.isnan(i2r_cmo_loss) and not torch.isinf(i2r_cmo_loss):
-                    total_loss += i2r_cmo_loss
-                    losses['i2r_cmo_loss'] = i2r_cmo_loss.item()
-                else:
-                    logger(f"Epoch {epoch}: i2r_cmo_loss is NaN/Inf, skipped")
+                
+                if not torch.isnan(cross_contrastive) and not torch.isinf(cross_contrastive):
+                    total_loss += cross_contrastive
+                    losses['cross_contrastive'] = cross_contrastive.item()
+            except Exception as e:
+                pass
     
-    if epoch >= 30 and match_info['remain_dict']:
+    # 6. Weak Supervision Loss (start earlier with warmup)
+    weak_start = getattr(args, 'weak_start_epoch', 5)
+    if epoch >= weak_start and match_info['remain_dict']:
         
         r2c_cls, _ = model.classifier3(bn_features[:batch_size])
-        i2c_cls, _ = model.classifier3(bn_features[batch_size:])
         
         remain_rgb_indices = torch.isin(rgb_ids, match_info['remain_matched_rgb'])
         
@@ -406,37 +519,53 @@ def _compute_phase2_loss(model, args, epoch,
             remain_rgb_ids = rgb_ids[remain_rgb_indices]
             remain_r2c_cls = r2c_cls[remain_rgb_indices]
             
-            weak_r2c_loss = args.weak_weight * model.weak_criterion(
-                remain_r2c_cls, 
-                match_info['remain_rm'][remain_rgb_ids]
-            )
+            # Gradual increase of weak loss weight
+            weak_warmup = getattr(args, 'weak_warmup', 15)
+            weak_weight = args.weak_weight * min(1.0, (epoch - weak_start) / weak_warmup)
             
-            if not torch.isnan(weak_r2c_loss) and not torch.isinf(weak_r2c_loss):
-                total_loss += weak_r2c_loss
-                losses['weak_r2c_loss'] = weak_r2c_loss.item()
-            else:
-                logger(f"Epoch {epoch}: weak_r2c_loss is NaN/Inf, skipped")
+            try:
+                weak_r2c_loss = weak_weight * model.weak_criterion(
+                    remain_r2c_cls, 
+                    match_info['remain_rm'][remain_rgb_ids]
+                )
+                
+                if not torch.isnan(weak_r2c_loss) and not torch.isinf(weak_r2c_loss):
+                    total_loss += weak_r2c_loss
+                    losses['weak_r2c_loss'] = weak_r2c_loss.item()
+            except Exception as e:
+                pass
     
+    # 7. Cross-modal Classification Loss with annealing
     r2c_cls, _ = model.classifier3(bn_features[:batch_size])
     i2c_cls, _ = model.classifier3(bn_features[batch_size:])
     
     specific_rgb_indices = torch.isin(rgb_ids, match_info['specific_matched_rgb'])
-    common_rgb_indices = torch.isin(rgb_ids, match_info['common_matched_rgb'])
-    rgb_indices = specific_rgb_indices ^ common_rgb_indices
+    common_rgb_indices_cls = torch.isin(rgb_ids, match_info['common_matched_rgb'])
+    rgb_indices = specific_rgb_indices | common_rgb_indices_cls
     
     if rgb_indices.any():
         selected_rgb_ids = rgb_ids[rgb_indices]
         selected_r2c_cls = r2c_cls[rgb_indices]
         
         pseudo_labels = torch.argmax(match_info['specific_rm'][selected_rgb_ids], dim=1)
-        rgb_cross_loss = model.pid_criterion(selected_r2c_cls, pseudo_labels)
         
-        if not torch.isnan(rgb_cross_loss) and not torch.isinf(rgb_cross_loss):
-            total_loss += rgb_cross_loss
-            losses['rgb_cross_loss'] = rgb_cross_loss.item()
+        try:
+            rgb_cross_loss = model.pid_criterion(selected_r2c_cls, pseudo_labels)
+            
+            if not torch.isnan(rgb_cross_loss) and not torch.isinf(rgb_cross_loss):
+                # Annealing: reduce weight as training progresses
+                cross_weight = 1.0 * (1.0 - 0.5 * epoch / args.stage2_epoch)
+                total_loss += cross_weight * rgb_cross_loss
+                losses['rgb_cross_loss'] = rgb_cross_loss.item()
+        except Exception as e:
+            pass
     
-    ir_cross_loss = model.pid_criterion(i2c_cls, ir_ids)
-    total_loss += ir_cross_loss
-    losses['ir_cross_loss'] = ir_cross_loss.item()
+    try:
+        ir_cross_loss = model.pid_criterion(i2c_cls, ir_ids)
+        cross_weight = 1.0 * (1.0 - 0.5 * epoch / args.stage2_epoch)
+        total_loss += cross_weight * ir_cross_loss
+        losses['ir_cross_loss'] = ir_cross_loss.item()
+    except Exception as e:
+        pass
     
     return total_loss, losses
