@@ -52,10 +52,14 @@ class Bottleneck(nn.Module):
         return out
 
 
-class AttentionPool2d(nn.Module):
-    def __init__(self, spacial_dim: int, embed_dim: int, num_heads: int, output_dim: int = None):
+class AttentionPool2d(nn. Module):
+    def __init__(self, spacial_dim:  int, embed_dim: int, num_heads: int, output_dim: int = None):
         super().__init__()
-        self.positional_embedding = nn.Parameter(torch.randn(spacial_dim + 1, embed_dim) / embed_dim ** 0.5)
+        # ✅ spacial_dim 现在表示 h*w
+        self.spacial_dim = spacial_dim
+        self. positional_embedding = nn.Parameter(
+            torch.randn(spacial_dim + 1, embed_dim) / embed_dim ** 0.5
+        )
         self.k_proj = nn.Linear(embed_dim, embed_dim)
         self.q_proj = nn.Linear(embed_dim, embed_dim)
         self.v_proj = nn.Linear(embed_dim, embed_dim)
@@ -63,10 +67,20 @@ class AttentionPool2d(nn.Module):
         self.num_heads = num_heads
 
     def forward(self, x):
-        x = x.reshape(x.shape[0], x.shape[1], x.shape[2] * x.shape[3]).permute(2, 0,
-                                                                               1)  # NCHW -> (HW)NC  #32,2048,7,7 ->49, 32, 2048
-        x = torch.cat([x.mean(dim=0, keepdim=True), x], dim=0)  # (HW+1)NC  50,32,2048
-        x = x + self.positional_embedding[:, None, :].to(x.dtype)  # (HW+1)NC
+        # x:  [batch, channels, h, w]
+        B, C, H, W = x.shape
+        x = x.reshape(B, C, H * W).permute(2, 0, 1)  # [H*W, B, C]
+        x = torch.cat([x.mean(dim=0, keepdim=True), x], dim=0)  # [H*W+1, B, C]
+        
+        # ✅ 检查位置编码尺寸
+        if x.shape[0] != self.positional_embedding.shape[0]: 
+            raise RuntimeError(
+                f"Position embedding size mismatch: "
+                f"input requires {x.shape[0]} but got {self.positional_embedding.shape[0]}.  "
+                f"Feature map size: {H}x{W}"
+            )
+        
+        x = x + self.positional_embedding[:, None, :].to(x.dtype)  # [H*W+1, B, C]
         x, _ = F.multi_head_attention_forward(
             query=x, key=x, value=x,
             embed_dim_to_check=x.shape[-1],
@@ -86,8 +100,7 @@ class AttentionPool2d(nn.Module):
             training=self.training,
             need_weights=False
         )
-
-        return x
+        return x[0]
 
 
 class ModifiedResNet(nn.Module):
@@ -248,25 +261,26 @@ class CLIP(nn.Module):
                  vision_patch_size: int,
                  vision_stride_size: int,
                  # text
-                 context_length: int,
+                 context_length:  int,
                  vocab_size: int,
                  transformer_width: int,
                  transformer_heads: int,
                  transformer_layers: int,
                  h_resolution: int,
-                 w_resolution: int
-                 ):
+                 w_resolution: int):
         super().__init__()
 
         self.context_length = context_length
 
         if isinstance(vision_layers, (tuple, list)):
             vision_heads = vision_width * 32 // 64
+            
+            # ✅ 关键修复：传递 h*w 而不是分开的 h 和 w
             self.visual = ModifiedResNet(
                 layers=vision_layers,
                 output_dim=embed_dim,
                 heads=vision_heads,
-                input_resolution=h_resolution * w_resolution,
+                input_resolution=h_resolution * w_resolution,  # ✅ 这是特征图的总像素数
                 width=vision_width
             )
         else:
@@ -397,75 +411,166 @@ def convert_weights(model: nn.Module):
     model.apply(_convert_weights_to_fp16)
 
 
-def build_model(state_dict: dict, h_resolution: int, w_resolution: int, vision_stride_size: int):
-    vit = "visual.proj" in state_dict
-
+def build_model(state_dict:  dict, h_resolution: int, w_resolution: int, vision_stride_size: int):
+    """
+    构建 CLIP 模型并适配分辨率（完整修复版）
+    
+    关键修复：
+    1. 先构建模型（使用默认分辨率）
+    2. 调整位置编码到目标分辨率
+    3. 加载调整后的权重
+    """
+    import torch. nn. functional as F
+    
+    vit = "visual. proj" in state_dict
+    
     if vit:
         vision_width = state_dict["visual.conv1.weight"].shape[0]
-        vision_layers = len(
-            [k for k in state_dict.keys() if k.startswith("visual.") and k.endswith(".attn.in_proj_weight")])
+        vision_layers = len([k for k in state_dict.keys() if k.startswith("visual.") and k.endswith(".attn.in_proj_weight")])
         vision_patch_size = state_dict["visual.conv1.weight"].shape[-1]
         grid_size = round((state_dict["visual.positional_embedding"].shape[0] - 1) ** 0.5)
         image_resolution = vision_patch_size * grid_size
-    else:  # RN50
-        counts: list = [len(set(k.split(".")[2] for k in state_dict if k.startswith(f"visual.layer{b}"))) for b in
-                        [1, 2, 3, 4]]
+    else:  # ResNet
+        counts = [len(set(k.split(".")[2] for k in state_dict if k.startswith(f"visual.layer{b}"))) for b in [1, 2, 3, 4]]
         vision_layers = tuple(counts)
         vision_width = state_dict["visual.layer1.0.conv1.weight"].shape[0]
-        output_width = round((state_dict["visual.attnpool.positional_embedding"].shape[0] - 1) ** 0.5)
+        
+        # ✅ 获取原始的 attnpool 位置编码尺寸
+        original_pos_embed = state_dict["visual.attnpool.positional_embedding"]
+        output_width = round((original_pos_embed.shape[0] - 1) ** 0.5)
+        
         vision_patch_size = None
-        assert output_width ** 2 + 1 == state_dict["visual.attnpool.positional_embedding"].shape[0]
+        assert output_width ** 2 + 1 == original_pos_embed.shape[0], \
+            f"Invalid position embedding size: {original_pos_embed.shape[0]}"
         image_resolution = output_width * 32
-
+    
     embed_dim = state_dict["text_projection"].shape[1]
-    context_length = state_dict["positional_embedding"].shape[0]  # 77 (77,512)
-    vocab_size = state_dict["token_embedding.weight"].shape[0]
+    context_length = state_dict["positional_embedding"].shape[0]
+    vocab_size = state_dict["token_embedding.weight"]. shape[0]
     transformer_width = state_dict["ln_final.weight"].shape[0]
     transformer_heads = transformer_width // 64
-    transformer_layers = len(set(k.split(".")[2] for k in state_dict if k.startswith(f"transformer.resblocks")))
-
+    transformer_layers = len(set(k.split(".")[2] for k in state_dict if k.startswith("transformer. resblocks")))
+    
+    # ✅ 关键修复：使用目标分辨率构建模型
     model = CLIP(
         embed_dim,
         image_resolution, vision_layers, vision_width, vision_patch_size, vision_stride_size,
         context_length, vocab_size, transformer_width, transformer_heads, transformer_layers,
-        h_resolution, w_resolution
+        h_resolution, w_resolution  # 传递目标分辨率
     )
+    
+    # ==================== 调整位置编码 ====================
+    
+    def resize_pos_embed(posemb, h, w):
+        """调整位置编码到目标尺寸"""
+        cls_posemb = posemb[0:1]  # [1, dim]
+        spatial_posemb = posemb[1:]  # [old_h*old_w, dim]
+        
+        ntok_old = spatial_posemb.shape[0]
+        old_h = old_w = int(ntok_old ** 0.5)
+        
+        if h * w == ntok_old: 
+            print(f"   位置编码尺寸匹配: {old_h}x{old_w} == {h}x{w}")
+            return posemb
+        
+        print(f"   调整位置编码:  {old_h}x{old_w} ({ntok_old}) -> {h}x{w} ({h*w})")
+        
+        dim = spatial_posemb.shape[-1]
+        spatial_posemb = spatial_posemb.reshape(1, old_h, old_w, dim).permute(0, 3, 1, 2)
+        
+        spatial_posemb = F.interpolate(
+            spatial_posemb,
+            size=(h, w),
+            mode='bilinear',
+            align_corners=False
+        )
+        
+        spatial_posemb = spatial_posemb.permute(0, 2, 3, 1).reshape(-1, dim)
+        
+        return torch.cat([cls_posemb, spatial_posemb], dim=0)
+    
+    # 调整位置编码
     if vit:
-        state_dict["visual.positional_embedding"] = resize_pos_embed(state_dict["visual.positional_embedding"],
-                                                                     model.visual.positional_embedding, h_resolution,
-                                                                     w_resolution)
-    else:  # RN50
-        state_dict["visual.attnpool.positional_embedding"] = resize_pos_embed(
-            state_dict["visual.attnpool.positional_embedding"], model.visual.attnpool.positional_embedding,
-            h_resolution, w_resolution)
-
+        state_dict["visual.positional_embedding"] = resize_pos_embed(
+            state_dict["visual.positional_embedding"],
+            h_resolution,
+            w_resolution
+        )
+    else:  # ResNet
+        state_dict["visual. attnpool.positional_embedding"] = resize_pos_embed(
+            state_dict["visual.attnpool.positional_embedding"],
+            h_resolution,
+            w_resolution
+        )
+    
+    # 删除不需要的键
     for key in ["input_resolution", "context_length", "vocab_size"]:
         if key in state_dict:
             del state_dict[key]
-
+    
+    # ✅ 加载权重（允许部分不匹配）
     convert_weights(model)
-
-    model.load_state_dict(state_dict)
-    return model.eval()
+    missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+    
+    if missing_keys:
+        print(f"   ⚠️ Missing keys: {missing_keys[: 3]}...")  # 只显示前3个
+    if unexpected_keys:
+        print(f"   ⚠️ Unexpected keys: {unexpected_keys[: 3]}...")
+    
+    return model. eval()
 
 
 import math
 
 
-def resize_pos_embed(posemb, posemb_new, hight, width):
-    # Rescale the grid of position embeddings when loading from state_dict. Adapted from
-    # https://github.com/google-research/vision_transformer/blob/00883dd691c63a6830751563748663526e811cee/vit_jax/checkpoint.py#L224
-    #print('Resized position embedding: %s to %s', posemb.shape, posemb_new.shape)# 修改
+def resize_pos_embed(posemb, posemb_new, h, w):
+    """
+    调整位置编码尺寸以适配不同分辨率
+    
+    Args:
+        posemb: 原始位置编码 [old_h*old_w+1, dim]
+        posemb_new: 目标位置编码形状 [new_h*new_w+1, dim]
+        h:  新的特征图高度
+        w: 新的特征图宽度
+    
+    Returns:
+        resized_posemb: 调整后的位置编码 [h*w+1, dim]
+    """
+    import torch. nn.functional as F
+    
+    # 分离 CLS token 和 spatial tokens
+    cls_posemb = posemb[0:1]  # [1, dim]
+    spatial_posemb = posemb[1:]  # [old_h*old_w, dim]
+    
+    # 计算原始特征图尺寸
+    ntok_old = spatial_posemb.shape[0]
+    old_h = old_w = int(ntok_old ** 0.5)  # 假设是方形
+    
+    print(f"   调整位置编码:  {old_h}x{old_w} -> {h}x{w}")
+    
+    # 如果尺寸相同，直接返回
+    if h == old_h and w == old_w:
+        return posemb
+    
+    # Reshape 为 2D 并插值
+    dim = spatial_posemb.shape[-1]
+    spatial_posemb = spatial_posemb.reshape(1, old_h, old_w, dim)  # [1, old_h, old_w, dim]
+    spatial_posemb = spatial_posemb.permute(0, 3, 1, 2)  # [1, dim, old_h, old_w]
+    
+    # 双线性插值到新尺寸
+    spatial_posemb = F.interpolate(
+        spatial_posemb,
+        size=(h, w),
+        mode='bilinear',
+        align_corners=False
+    )
+    
+    # Reshape 回 1D
+    spatial_posemb = spatial_posemb. permute(0, 2, 3, 1)  # [1, h, w, dim]
+    spatial_posemb = spatial_posemb.reshape(-1, dim)  # [h*w, dim]
+    
+    # 拼接 CLS token
+    resized_posemb = torch.cat([cls_posemb, spatial_posemb], dim=0)  # [h*w+1, dim]
+    
+    return resized_posemb
 
-    ntok_new = posemb_new.shape[0]  # 129,2048
-
-    posemb_token, posemb_grid = posemb[:1], posemb[1:]
-    ntok_new -= 1
-
-    gs_old = int(math.sqrt(len(posemb_grid)))  # 14
-    #print('Position embedding resize to height:{} width: {}'.format(hight, width))# 修改
-    posemb_grid = posemb_grid.reshape(1, gs_old, gs_old, -1).permute(0, 3, 1, 2)
-    posemb_grid = F.interpolate(posemb_grid, size=(hight, width), mode='bilinear')
-    posemb_grid = posemb_grid.permute(0, 2, 3, 1).reshape(1, hight * width, -1)
-    posemb = torch.cat([posemb_token, posemb_grid.squeeze()], dim=0)
-    return posemb

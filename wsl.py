@@ -1,321 +1,368 @@
+"""
+跨模态匹配聚合模块 (Cross-Modal Match Aggregation)
+=================================================
+功能：
+1. 提取 RGB 和 IR 模态的特征
+2. 使用 Sinkhorn 算法进行全局最优匹配
+3. 支持 CLIP 语义特征增强匹配
+4. 管理特征记忆库用于一致性约束
+"""
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
-from collections import defaultdict, Counter, OrderedDict
-from sklearn.preprocessing import normalize
-import time
-import pickle
-from utils import fliplr
+from collections import Counter, OrderedDict
+
 
 class CMA(nn.Module):
-    '''
-    Cross modal Match Aggregation
-    Modified to support CLIP Referee and Sinkhorn Matching
-    '''
+    """
+    跨模态匹配聚合器
+    """
     def __init__(self, args):
         super(CMA, self).__init__()
         self.device = torch.device(args.device)
-        self.not_saved = True
         self.num_classes = args.num_classes
-        self.T = args.temperature # softmax temperature
-        self.sigma = args.sigma # momentum update factor
-        self.args = args 
+        self.T = args.temperature           # Softmax 温度参数
+        self.sigma = args.sigma             # 记忆库动量更新系数
+        self.args = args
         
-        # memory of visible and infrared modal
-        self.register_buffer('vis_memory',torch.zeros(self.num_classes,2048))
-        self.register_buffer('ir_memory',torch.zeros(self.num_classes,2048))
+        # 特征记忆库：存储每个类别的平均特征 (用于一致性约束)
+        self.register_buffer('vis_memory', torch.zeros(self.num_classes, 2048))
+        self.register_buffer('ir_memory', torch. zeros(self.num_classes, 2048))
         
-        # CLIP 特征临时存储
+        # CLIP 特征缓存 (用于语义匹配)
         self.vis_clip_feats = None
         self.ir_clip_feats = None
-
-    @torch.no_grad()
-    def save(self,vis,ir,rgb_ids,ir_ids,rgb_idx,ir_idx,mode, rgb_features=None, ir_features=None, clip_rgb=None, clip_ir=None):
-    # vis: vis sample(v2i scores or vis features) ir: ir sample
-        self.mode = mode
-        self.not_saved = False
-        if self.mode != 'scores' and self.mode != 'features':
-            raise ValueError('invalid mode!')
-        elif self.mode == 'scores': # predict scores
-            vis = torch.nn.functional.softmax(self.T*vis,dim=1)
-            ir = torch.nn.functional.softmax(self.T*ir,dim=1)
-        ###############################
-        # save features in memory bank
-        if rgb_features is not None and ir_features is not None:
-            # Prepare empty memory banks on the device
-            self.vis_memory = self.vis_memory.to(self.device)
-            self.ir_memory = self.ir_memory.to(self.device)
-            
-            # Get unique labels and process RGB and IR features
-            label_set = torch.unique(rgb_ids)
-            
-            for label in label_set:
-                # Select RGB features for the current label
-                rgb_mask = (rgb_ids == label)
-                ir_mask = (ir_ids == label)
-                # .any() check True in bool tensor
-                if rgb_mask.any():
-                    rgb_selected = rgb_features[rgb_mask]
-                    self.vis_memory[label] = rgb_selected.mean(dim=0)
-                
-                if ir_mask.any():
-                    ir_selected = ir_features[ir_mask]
-                    self.ir_memory[label] = ir_selected.mean(dim=0)
         
-        # [NEW] Save CLIP features for matching
-        if clip_rgb is not None and clip_ir is not None:
-            self.vis_clip_feats = clip_rgb.detach().cpu()
-            self.ir_clip_feats = clip_ir.detach().cpu()
-        ################################
-        vis = vis.detach().cpu().numpy()
-        ir = ir.detach().cpu().numpy()
-        rgb_ids, ir_ids = rgb_ids.cpu(), ir_ids.cpu()
-            
-        self.vis, self.ir = vis, ir
-        self.rgb_ids, self.ir_ids = rgb_ids, ir_ids
-        self.rgb_idx, self.ir_idx = rgb_idx, ir_idx
+        # 内部状态
+        self.not_saved = True
+        self.mode = None
         
-    @torch.no_grad()
-    def update(self, rgb_feats, ir_feats, rgb_labels, ir_labels):
-        rgb_set = torch.unique(rgb_labels)
-        ir_set = torch.unique(ir_labels)
-        for i in rgb_set:
-            rgb_mask = (rgb_labels == i)
-            selected_rgb = rgb_feats[rgb_mask].mean(dim=0)
-            self.vis_memory[i] = (1-self.sigma)*self.vis_memory[i] + self.sigma * selected_rgb
-        for i in ir_set:
-            ir_mask = (ir_labels == i)
-            selected_ir = ir_feats[ir_mask].mean(dim=0)
-            self.ir_memory[i] = (1-self.sigma)*self.ir_memory[i] + self.sigma * selected_ir
 
-    def get_label(self, epoch=None):
-        if self.not_saved:# pass if 
-            pass
+    # ==================== 核心接口 ====================
+    
+    def extract_and_match(self, model, dataset, clip_model=None):
+        """
+        统一接口：提取特征并执行匹配
+        
+        Args:
+            model: 训练模型
+            dataset: 数据集对象
+            clip_model:  CLIP 模型 (可选)
+            
+        Returns:
+            v2i_dict: RGB -> IR 匹配字典
+            i2v_dict: IR -> RGB 匹配字典
+        """
+        # 1. 提取特征
+        self._extract_features(model, dataset, clip_model)
+        
+        # 2. 执行匹配
+        if hasattr(self. args, 'use_sinkhorn') and self.args.use_sinkhorn:
+            print("🔗 使用 Sinkhorn 算法进行全局最优匹配...")
+            return self._match_sinkhorn()
         else:
-            print('get match labels')
+            print("🔗 使用贪婪算法进行快速匹配...")
+            return self._match_greedy()
+    
+
+    # ==================== 特征提取 ====================
+    
+    @torch.no_grad()
+    def _extract_features(self, model, dataset, clip_model=None):
+        """
+        提取 RGB 和 IR 模态的特征
+        """
+        model.set_eval()
+        rgb_loader, ir_loader = dataset.get_normal_loader()
+        
+        print("📊 提取 RGB 特征...")
+        rgb_feats, rgb_labels, rgb_cls, rgb_clip = self._extract_single_modal(
+            model, rgb_loader, 'rgb', clip_model)
+        
+        print("📊 提取 IR 特征...")
+        ir_feats, ir_labels, ir_cls, ir_clip = self._extract_single_modal(
+            model, ir_loader, 'ir', clip_model)
+        
+        # 保存到内部状态
+        self._save_features(
+            rgb_cls, ir_cls, rgb_labels, ir_labels, 
+            rgb_feats, ir_feats, rgb_clip, ir_clip
+        )
+    
+    
+    @torch.no_grad()
+    def _extract_single_modal(self, model, loader, modal, clip_model=None):
+        """
+        提取单个模态的特征
+        
+        Returns:
+            features: BN 特征 [N, 2048]
+            labels: 伪标签 [N]
+            cls_scores: 分类分数 [N, num_classes]
+            clip_feats: CLIP 特征 [N, 1024] (如果启用)
+        """
+        all_features = []
+        all_labels = []
+        all_cls_scores = []
+        all_clip_feats = []
+        
+        for imgs_list, infos in loader:
+            labels = infos[: , 1]. to(self.device)
             
-            # [NEW] Sinkhorn Matching Branch
-            if hasattr(self.args, 'use_sinkhorn') and self.args.use_sinkhorn:
-                print("Using Sinkhorn Global Matching...")
-                return self._get_label_sinkhorn()
+            # 处理数据增强的情况
+            if isinstance(imgs_list, (list, tuple)):
+                imgs = imgs_list[0]. to(self.device)  # 只用原始图像
+            else: 
+                imgs = imgs_list.to(self.device)
+            
+            # 提取任务模型特征
+            _, bn_features = model. model(imgs)
+            
+            # 根据模态选择分类器 (交叉分类策略)
+            if modal == 'rgb':
+                cls_scores, _ = model.classifier2(bn_features)  # RGB -> IR 分类器
+            else: 
+                cls_scores, _ = model.classifier1(bn_features)  # IR -> RGB 分类器
+            
+            all_features.append(bn_features. cpu())
+            all_labels. append(labels. cpu())
+            all_cls_scores.append(cls_scores. cpu())
+            
+            # 提取 CLIP 特征 (如果启用)
+            if clip_model is not None: 
+                clip_feats = self._extract_clip_features(clip_model, imgs)
+                all_clip_feats.append(clip_feats)
+        
+        # 合并所有 batch
+        features = torch.cat(all_features, dim=0)
+        labels = torch.cat(all_labels, dim=0)
+        cls_scores = torch.cat(all_cls_scores, dim=0)
+        clip_feats = torch.cat(all_clip_feats, dim=0) if all_clip_feats else None
+        
+        return features, labels, cls_scores, clip_feats
+    
+    
+    @torch.no_grad()
+    def _extract_clip_features(self, clip_model, imgs):
+        """
+        提取 CLIP 语义特征 (修复版本)
+        
+        关键修复：
+        1. 直接调用 attnpool，不加索引
+        2. 确保输入是标准归一化的图像
+        """
+        # CLIP 编码图像
+        feat_map = clip_model.encode_image(imgs)  # [Batch, 2048, H, W]
+        
+        # 通过 Attention Pooling 得到全局特征
+        if hasattr(clip_model. visual, 'attnpool'):
+            # ResNet50 分支：attnpool 直接返回 [Batch, 1024]
+            clip_emb = clip_model.visual.attnpool(feat_map)  # ✅ 修复：去掉 [0]
+        else:
+            # ViT 分支：使用 CLS token
+            if isinstance(feat_map, tuple):
+                clip_emb = feat_map[-1]  # 取最后一个输出 (通常是投影后的特征)
+            else:
+                clip_emb = feat_map. mean(dim=[-2, -1])  # 全局平均池化
+        
+        return clip_emb. detach().cpu()
+    
+    
+    @torch.no_grad()
+    def _save_features(self, rgb_cls, ir_cls, rgb_labels, ir_labels, 
+                       rgb_features, ir_features, clip_rgb, clip_ir):
+        """
+        保存特征到内部状态并更新记忆库
+        """
+        self.mode = 'scores'
+        self.not_saved = False
+        
+        # 保存分类分数 (用于匹配)
+        self.vis = F.softmax(self.T * rgb_cls, dim=1).cpu().numpy()
+        self.ir = F.softmax(self.T * ir_cls, dim=1).cpu().numpy()
+        self.rgb_ids = rgb_labels.cpu()
+        self.ir_ids = ir_labels.cpu()
+        
+        # 更新特征记忆库
+        self._update_memory(rgb_features. to(self.device), ir_features.to(self.device),
+                            rgb_labels.to(self. device), ir_labels.to(self.device))
+        
+        # 保存 CLIP 特征
+        if clip_rgb is not None and clip_ir is not None: 
+            self.vis_clip_feats = clip_rgb
+            self.ir_clip_feats = clip_ir
+            print(f"✅ CLIP 特征已保存: RGB {clip_rgb.shape}, IR {clip_ir.shape}")
+        else:
+            self.vis_clip_feats = None
+            self.ir_clip_feats = None
+    
+    
+    @torch.no_grad()
+    def _update_memory(self, rgb_feats, ir_feats, rgb_labels, ir_labels):
+        """
+        使用 EMA 更新特征记忆库
+        """
+        self.vis_memory = self.vis_memory. to(self.device)
+        self.ir_memory = self.ir_memory.to(self.device)
+        
+        # 更新 RGB 记忆
+        for label in torch.unique(rgb_labels):
+            mask = (rgb_labels == label)
+            if mask.any():
+                new_feat = rgb_feats[mask]. mean(dim=0)
+                self.vis_memory[label] = (1 - self.sigma) * self.vis_memory[label] + \
+                                         self.sigma * new_feat
+        
+        # 更新 IR 记忆
+        for label in torch.unique(ir_labels):
+            mask = (ir_labels == label)
+            if mask.any():
+                new_feat = ir_feats[mask]. mean(dim=0)
+                self.ir_memory[label] = (1 - self.sigma) * self.ir_memory[label] + \
+                                        self.sigma * new_feat
+    
 
-            # Original Greedy Matching
-            if self.mode == 'features':
-                dists = np.matmul(self.vis, self.ir.T)
-                v2i_dict, i2v_dict = self._get_label(dists,'dist')
-
-            elif self.mode == 'scores':
-                v2i_dict, _ = self._get_label(self.vis,'rgb')
-                i2v_dict, _ = self._get_label(self.ir,'ir')
-                self.v2i = v2i_dict
-                self.i2v = i2v_dict
-            return v2i_dict, i2v_dict
-
-    # [NEW] Sinkhorn Algorithm Implementation
-    def _get_label_sinkhorn(self):
-        # 1. 计算专家相似度 (基于分类分数)
+    # ==================== Sinkhorn 匹配 ====================
+    
+    def _match_sinkhorn(self):
+        """
+        使用 Sinkhorn 算法进行全局最优匹配
+        
+        核心思想：
+        1. 构建相似度矩阵 (专家分数 + CLIP 语义)
+        2. Sinkhorn 迭代求解最优传输
+        3. 基于传输矩阵生成匹配字典
+        """
+        # 1. 计算专家相似度
         score_rgb = torch.from_numpy(self.vis).to(self.device)
         score_ir = torch.from_numpy(self.ir).to(self.device)
+        score_rgb = F.normalize(score_rgb, dim=1)
+        score_ir = F.normalize(score_ir, dim=1)
+        sim_expert = torch.matmul(score_rgb, score_ir.T)  # [N_rgb, N_ir]
         
-        # Normalize
-        score_rgb = torch.nn.functional.normalize(score_rgb, dim=1)
-        score_ir = torch.nn.functional.normalize(score_ir, dim=1)
-        
-        sim_expert = torch.matmul(score_rgb, score_ir.T) # [N_vis, N_ir]
-
-        # 2. 计算 CLIP 语义相似度 (如果启用了 CLIP)
+        # 2. 融合 CLIP 语义相似度 (如果启用)
         if self.vis_clip_feats is not None and self.ir_clip_feats is not None:
-            clip_rgb = self.vis_clip_feats.to(self.device)
-            clip_ir = self.ir_clip_feats.to(self.device)
-            
-            clip_rgb = torch.nn.functional.normalize(clip_rgb, dim=1)
-            clip_ir = torch.nn.functional.normalize(clip_ir, dim=1)
-            
+            clip_rgb = F.normalize(self.vis_clip_feats. to(self.device), dim=1)
+            clip_ir = F.normalize(self.ir_clip_feats.to(self.device), dim=1)
             sim_clip = torch.matmul(clip_rgb, clip_ir.T)
             
-            # 融合权重
             w_clip = getattr(self.args, 'w_clip', 0.3)
             sim_final = (1 - w_clip) * sim_expert + w_clip * sim_clip
+            print(f"🎯 CLIP 权重:  {w_clip:.2f}")
         else:
             sim_final = sim_expert
-
-        # 3. 构建代价矩阵 (Cost = 1 - Similarity)
-        # Q = exp(Sim / epsilon)
+        
+        # 3. Log-domain Sinkhorn (数值稳定版本)
         epsilon = getattr(self.args, 'sinkhorn_reg', 0.05)
+        log_Q = sim_final / epsilon
         
-        # Sinkhorn Iteration
-        Q = torch.exp(sim_final / epsilon)
-        
-        for _ in range(50): 
-            Q /= Q.sum(dim=0, keepdim=True) + 1e-8
-            Q /= Q.sum(dim=1, keepdim=True) + 1e-8
+        # 迭代求解
+        max_iters = 100
+        tolerance = 1e-4
+        for iteration in range(max_iters):
+            log_Q_prev = log_Q.clone()
             
-        # 4. 从 Q 生成匹配字典
-        Q = Q.cpu().numpy()
+            # 行归一化 (log-domain)
+            log_Q = log_Q - torch.logsumexp(log_Q, dim=1, keepdim=True)
+            # 列归一化 (log-domain)
+            log_Q = log_Q - torch.logsumexp(log_Q, dim=0, keepdim=True)
+            
+            # 检查收敛
+            if torch.abs(log_Q - log_Q_prev).max() < tolerance:
+                print(f"✅ Sinkhorn 在第 {iteration} 轮收敛")
+                break
         
-        # 生成 v2i
+        Q = torch.exp(log_Q).cpu().numpy()
+        
+        # 4. 生成匹配字典 (置信度阈值策略)
+        confidence_threshold = 0.5
+        v2i, i2v = self._generate_matches_from_Q(Q, confidence_threshold)
+        
+        print(f"📊 匹配结果: RGB->IR {len(v2i)}/{len(self.rgb_ids)}, "
+              f"IR->RGB {len(i2v)}/{len(self.ir_ids)}")
+        
+        return v2i, i2v
+    
+    
+    def _generate_matches_from_Q(self, Q, threshold):
+        """
+        从传输矩阵生成匹配字典
+        
+        策略：基于置信度阈值的软匹配 (相比严格双向验证更宽松)
+        """
         v2i = OrderedDict()
+        i2v = OrderedDict()
+        
+        # RGB -> IR 匹配
         max_j = np.argmax(Q, axis=1)
         for i, j in enumerate(max_j):
-            # 双向验证
-            if np.argmax(Q[:, j]) == i:
-                real_id_rgb = self.rgb_ids[i].item()
-                real_id_ir = self.ir_ids[j].item()
-                if real_id_rgb not in v2i:
-                     v2i[real_id_rgb] = real_id_ir
-
-        # 生成 i2v
-        i2v = OrderedDict()
+            if Q[i, j] > threshold:   # 置信度足够高
+                rgb_id = self.rgb_ids[i]. item()
+                ir_id = self.ir_ids[j]. item()
+                if rgb_id not in v2i:  # 避免重复
+                    v2i[rgb_id] = ir_id
+        
+        # IR -> RGB 匹配
         max_i = np.argmax(Q, axis=0)
         for j, i in enumerate(max_i):
-             if np.argmax(Q[i, :]) == j:
-                real_id_rgb = self.rgb_ids[i].item()
-                real_id_ir = self.ir_ids[j].item()
-                if real_id_ir not in i2v:
-                    i2v[real_id_ir] = real_id_rgb
-                    
-        return v2i, i2v
-
-    def _get_label(self,dists,mode):
-        sample_rate = 1
-        dists_shape = dists.shape
-        sorted_1d = np.argsort(dists, axis=None)[::-1]# flat to 1d and sort
-        sorted_2d = np.unravel_index(sorted_1d, dists_shape)# sort index return to 2d, like ([0,1,2],[1,2,0])
-        idx1, idx2 = sorted_2d[0], sorted_2d[1]# sorted idx of dim0 and dim1
-        dists = dists[idx1, idx2]
-        idx_length = int(np.ceil(sample_rate*dists.shape[0]/self.num_classes))
-        dists = dists[:idx_length]
-
-        if mode=='dist': # multiply the instance features of the two modalities
-            convert_label = [(i,j) for i,j in zip(np.array(self.rgb_ids)[idx1[:idx_length]],\
-                                            np.array(self.ir_ids)[idx2[:idx_length]])]
-            
-        elif mode=='rgb': # classify score of RGB (v2i)
-            convert_label = [(i,j) for i,j in zip(np.array(self.rgb_ids)[idx1[:idx_length]],\
-                                                  idx2[:idx_length])]
-
-        elif mode=='ir': # classify score of IR (v2i)
-            convert_label = [(i,j) for i,j in zip(np.array(self.ir_ids)[idx1[:idx_length]],\
-                                                  idx2[:idx_length])]
-        else:
-            raise AttributeError('invalid mode!')
-        convert_label_cnt = Counter(convert_label)
-        convert_label_cnt_sorted = sorted(convert_label_cnt.items(),key = lambda x:x[1],reverse = True)
-        length = len(convert_label_cnt_sorted)
-        lambda_cm=0.1
-        in_rgb_label=[]
-        in_ir_label=[]
-        v2i = OrderedDict()
-        i2v = OrderedDict()
-
-        length_ratio = 1
-        for i in range(int(length*length_ratio)):
-            key = convert_label_cnt_sorted[i][0] 
-            value = convert_label_cnt_sorted[i][1]
-            if key[0] in in_rgb_label or key[1] in in_ir_label:
-                continue
-            in_rgb_label.append(key[0])
-            in_ir_label.append(key[1])
-            v2i[key[0]] = key[1]
-            i2v[key[1]] = key[0]
-            
-        return v2i, i2v 
-
-    # [MODIFIED] 增加 clip_model 参数
-    def extract(self, args, model, dataset, clip_model=None):
-        '''
-        Output: BN_features, labels, cls
-        '''
-        model.set_eval()
-        rgb_loader, ir_loader = dataset.get_normal_loader() 
-        with torch.no_grad():
-            rgb_features, rgb_labels, rgb_gt, r2i_cls, rgb_idx, rgb_clip = self._extract_feature(model, rgb_loader,'rgb', clip_model)
-            ir_features, ir_labels, ir_gt, i2r_cls, ir_idx, ir_clip = self._extract_feature(model, ir_loader,'ir', clip_model)
-
-        # Pass clip features to save
-        self.save(r2i_cls, i2r_cls, rgb_labels, ir_labels, rgb_idx,\
-                 ir_idx, 'scores', rgb_features, ir_features, clip_rgb=rgb_clip, clip_ir=ir_clip)
+            if Q[i, j] > threshold: 
+                rgb_id = self.rgb_ids[i].item()
+                ir_id = self.ir_ids[j].item()
+                if ir_id not in i2v: 
+                    i2v[ir_id] = rgb_id
         
-    def _extract_feature(self, model, loader, modal, clip_model=None):
-        print('extracting {} features'.format(modal))
+        return v2i, i2v
+    
 
-        saved_features, saved_labels, saved_cls= None, None, None
-        saved_gts, saved_idx= None, None
-        saved_clip_feats = None
+    # ==================== 贪婪匹配 (备用) ====================
+    
+    def _match_greedy(self):
+        """
+        贪婪匹配算法 (用于快速实验或消融研究)
+        """
+        # 计算相似度矩阵
+        dists = np.matmul(self.vis, self.ir.T)
+        
+        # 排序并贪婪选择
+        sorted_indices = np.argsort(-dists, axis=None)
+        sorted_2d = np.unravel_index(sorted_indices, dists.shape)
+        idx_rgb, idx_ir = sorted_2d[0], sorted_2d[1]
+        
+        # 统计匹配频率
+        pairs = [(self.rgb_ids[i]. item(), self.ir_ids[j].item()) 
+                 for i, j in zip(idx_rgb, idx_ir)]
+        pair_counts = Counter(pairs)
+        
+        # 生成唯一匹配
+        v2i, i2v = OrderedDict(), OrderedDict()
+        matched_rgb, matched_ir = set(), set()
+        
+        for (rgb_id, ir_id), count in pair_counts.most_common():
+            if rgb_id not in matched_rgb and ir_id not in matched_ir:
+                v2i[rgb_id] = ir_id
+                i2v[ir_id] = rgb_id
+                matched_rgb.add(rgb_id)
+                matched_ir.add(ir_id)
+        
+        print(f"📊 贪婪匹配结果: {len(v2i)} 对")
+        return v2i, i2v
+    
 
-        for imgs_list, infos in loader:
-            labels = infos[:,1]
-            idx = infos[:,0]
-            gts = infos[:,-1].to(model.device)
-            if imgs_list.__class__.__name__ != 'list':
-                imgs = imgs_list
-                imgs, labels, idx = \
-                    imgs.to(model.device), labels.to(model.device), idx.to(model.device)
-            else:
-                ori_imgs, ca_imgs = imgs_list[0], imgs_list[1]
-                if len(ori_imgs.shape) < 4:
-                    ori_imgs = ori_imgs.unsqueeze(0)
-                    ca_imgs = ca_imgs.unsqueeze(0)
-
-                imgs = torch.cat((ori_imgs,ca_imgs),dim=0)
-                labels = torch.cat((labels,labels),dim=0)
-                idx = torch.cat((idx,idx),dim=0)
-                gts= torch.cat((gts,gts),dim=0).to(model.device)
-                imgs, labels, idx= \
-                    imgs.to(model.device), labels.to(model.device), idx.to(model.device)
-            _, bn_features = model.model(imgs) # _:gap feature
-
-            if modal == 'rgb':
-                cls, l2_features = model.classifier2(bn_features)
-            elif modal == 'ir':
-                cls, l2_features = model.classifier1(bn_features)
-            l2_features = l2_features.detach().cpu()
-            
-            # [FIXED] Extract CLIP features correctly
-            batch_clip_feats = None
-            if clip_model is not None:
-                # 1. 编码图像，得到特征图 x4 (N, C, H, W) 或元组
-                out = clip_model.encode_image(imgs)
-                
-                # 2. 获取全局特征
-                # 该仓库的 ResNet 实现比较特殊，Visual Encoder 返回的是 Feature Map (x4)
-                # 而我们需要的是 attnpool 后的投影特征 (xproj)
-                # 幸好 ModifiedResNet 保留了 attnpool 层
-                
-                if hasattr(clip_model.visual, 'attnpool'):
-                    # 如果是 ResNet 结构
-                    feat_map = out 
-                    # [CRITICAL FIX] attnpool returns (Seq, Batch, Dim), we need index [0]
-                    clip_emb = clip_model.visual.attnpool(feat_map)[0] 
-                else:
-                    # 如果是 ViT 结构 (encode_image 返回 (x11, x12, xproj))
-                    if isinstance(out, tuple):
-                        # xproj in ViT usually is (Seq, Batch, Dim) too?
-                        # Usually ViT output in this codebase is xproj = x12 @ proj.
-                        # Let's assume safe fallback to slice 0 just in case it is seq.
-                        # But for RN50 path, the above if branch handles it.
-                        clip_emb = out[-1]
-                        if len(clip_emb.shape) == 3:
-                             clip_emb = clip_emb[0]
-                    else:
-                        clip_emb = out
-
-                batch_clip_feats = clip_emb.detach().cpu()
-
-            if saved_features is None: 
-                saved_features, saved_labels, saved_cls, saved_idx = bn_features, labels, cls, idx
-                saved_gts = gts
-                if batch_clip_feats is not None:
-                    saved_clip_feats = batch_clip_feats
-            else:
-                saved_features = torch.cat((saved_features, bn_features), dim=0)
-                saved_labels = torch.cat((saved_labels, labels), dim=0)
-                saved_cls = torch.cat((saved_cls, cls), dim=0)
-                saved_idx = torch.cat((saved_idx, idx), dim=0)
-
-                saved_gts = torch.cat((saved_gts, gts), dim=0)
-                if batch_clip_feats is not None:
-                    # [FIXED] Now shapes match along dim 0 (Batch dimension)
-                    saved_clip_feats = torch.cat((saved_clip_feats, batch_clip_feats), dim=0)
-                    
-        return saved_features, saved_labels, saved_gts, saved_cls, saved_idx, saved_clip_feats
+    # ==================== 工具函数 ====================
+    
+    def get_memory_features(self):
+        """
+        获取记忆库特征 (用于一致性约束)
+        """
+        return self.vis_memory, self.ir_memory
+    
+    
+    def reset(self):
+        """
+        重置内部状态
+        """
+        self.not_saved = True
+        self.vis_clip_feats = None
+        self.ir_clip_feats = None
