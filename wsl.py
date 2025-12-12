@@ -1,258 +1,208 @@
-"""
-Cross-Modal Matching Aggregation Module
-========================================
-Author: Fixed Version
-Date: 2025-12-11
-"""
-
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import numpy as np
-from collections import Counter, OrderedDict
-
-
+from collections import defaultdict, Counter, OrderedDict
+from sklearn.preprocessing import normalize
+import time
+import pickle
+from utils import fliplr
 class CMA(nn.Module):
-    """Cross-Modal Matching Aggregator"""
-    
+    '''
+    Cross modal Match Aggregation
+    '''
     def __init__(self, args):
         super(CMA, self).__init__()
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.num_classes = args.num_classes
-        self.T = args.temperature
-        self.sigma = args.sigma
-        self.args = args
-        
-        self.register_buffer('vis_memory', torch.zeros(self.num_classes, 2048))
-        self.register_buffer('ir_memory', torch.zeros(self.num_classes, 2048))
-        
-        self.vis_clip_feats = None
-        self.ir_clip_feats = None
+        # self.inited = False
+        self.device = torch.device(args.device)
         self.not_saved = True
-        self.mode = None
-    
-    def extract_and_match(self, model, dataset, clip_model=None):
-        """Extract features and perform matching"""
-        self._extract_features(model, dataset, clip_model)
-        
-        if hasattr(self.args, 'use_sinkhorn') and self.args.use_sinkhorn:
-            print("Using Sinkhorn algorithm for global matching...")
-            return self._match_sinkhorn()
-        else:
-            print("Using greedy algorithm for fast matching...")
-            return self._match_greedy()
-    
+        # self.threshold = 0.8
+        self.num_classes = args.num_classes
+        self.T = args.temperature # softmax temperature
+        self.sigma = args.sigma # momentum update factor
+        # memory of visible and infrared modal
+        self.register_buffer('vis_memory',torch.zeros(self.num_classes,2048))
+        self.register_buffer('ir_memory',torch.zeros(self.num_classes,2048))
+
     @torch.no_grad()
-    def _extract_features(self, model, dataset, clip_model=None):
-        """Extract RGB and IR modality features"""
-        model.set_eval()
-        rgb_loader, ir_loader = dataset.get_normal_loader()
-        
-        print("Extracting RGB features...")
-        rgb_feats, rgb_labels, rgb_cls, rgb_clip = self._extract_single_modal(
-            model, rgb_loader, 'rgb', clip_model)
-        
-        print("Extracting IR features...")
-        ir_feats, ir_labels, ir_cls, ir_clip = self._extract_single_modal(
-            model, ir_loader, 'ir', clip_model)
-        
-        self._save_features(
-            rgb_cls, ir_cls, rgb_labels, ir_labels, 
-            rgb_feats, ir_feats, rgb_clip, ir_clip
-        )
-    
-    @torch.no_grad()
-    def _extract_single_modal(self, model, loader, modal, clip_model=None):
-        """Extract single modality features"""
-        all_features = []
-        all_labels = []
-        all_cls_scores = []
-        all_clip_feats = []
-        
-        for imgs_list, infos in loader:
-            labels = infos[:, 1].to(self.device)
-            
-            if isinstance(imgs_list, (list, tuple)):
-                imgs = imgs_list[0].to(self.device)
-            else: 
-                imgs = imgs_list.to(self.device)
-            
-            _, bn_features = model.model(imgs, None) if modal == 'rgb' else model.model(None, imgs)
-            
-            if modal == 'rgb':
-                cls_scores, _ = model.classifier2(bn_features)
-            else: 
-                cls_scores, _ = model.classifier1(bn_features)
-            
-            all_features.append(bn_features.cpu())
-            all_labels.append(labels.cpu())
-            all_cls_scores.append(cls_scores.cpu())
-            
-            if clip_model is not None: 
-                clip_feats = clip_model.encode_image(imgs)
-                all_clip_feats.append(clip_feats.detach().cpu())
-        
-        features = torch.cat(all_features, dim=0)
-        labels = torch.cat(all_labels, dim=0)
-        cls_scores = torch.cat(all_cls_scores, dim=0)
-        clip_feats = torch.cat(all_clip_feats, dim=0) if all_clip_feats else None
-        
-        return features, labels, cls_scores, clip_feats
-    
-    @torch.no_grad()
-    def _save_features(self, rgb_cls, ir_cls, rgb_labels, ir_labels, 
-                       rgb_features, ir_features, clip_rgb, clip_ir):
-        """Save features to internal state and update memory bank"""
-        self.mode = 'scores'
+    # def save(self,vis,ir,rgb_ids,ir_ids,rgb_idx,ir_idx,mode):
+    def save(self,vis,ir,rgb_ids,ir_ids,rgb_idx,ir_idx,mode, rgb_features=None, ir_features=None):
+    # vis: vis sample(v2i scores or vis features) ir: ir sample
+        self.mode = mode
         self.not_saved = False
+        if self.mode != 'scores' and self.mode != 'features':
+            raise ValueError('invalid mode!')
+        elif self.mode == 'scores': # predict scores
+            vis = torch.nn.functional.softmax(self.T*vis,dim=1)
+            ir = torch.nn.functional.softmax(self.T*ir,dim=1)
+        ###############################
+        # save features in memory bank
+        if rgb_features is not None and ir_features is not None:
+            # Prepare empty memory banks on the device
+            self.vis_memory = self.vis_memory.to(self.device)
+            self.ir_memory = self.ir_memory.to(self.device)
+            
+            # Get unique labels and process RGB and IR features
+            label_set = torch.unique(rgb_ids)
+            
+            for label in label_set:
+                # Select RGB features for the current label
+                rgb_mask = (rgb_ids == label)
+                ir_mask = (ir_ids == label)
+                # .any() check True in bool tensor
+                if rgb_mask.any():
+                    rgb_selected = rgb_features[rgb_mask]
+                    self.vis_memory[label] = rgb_selected.mean(dim=0)
+                
+                if ir_mask.any():
+                    ir_selected = ir_features[ir_mask]
+                    self.ir_memory[label] = ir_selected.mean(dim=0)
+        ################################
+        vis = vis.detach().cpu().numpy()
+        ir = ir.detach().cpu().numpy()
+        rgb_ids, ir_ids = rgb_ids.cpu(), ir_ids.cpu()
+            
+        self.vis, self.ir = vis, ir
+        self.rgb_ids, self.ir_ids = rgb_ids, ir_ids
+        self.rgb_idx, self.ir_idx = rgb_idx, ir_idx
         
-        self.vis = F.softmax(self.T * rgb_cls, dim=1).cpu().numpy()
-        self.ir = F.softmax(self.T * ir_cls, dim=1).cpu().numpy()
-        self.rgb_ids = rgb_labels.cpu()
-        self.ir_ids = ir_labels.cpu()
-        
-        self._update_memory(rgb_features.to(self.device), ir_features.to(self.device),
-                            rgb_labels.to(self.device), ir_labels.to(self.device))
-        
-        if clip_rgb is not None and clip_ir is not None: 
-            self.vis_clip_feats = clip_rgb
-            self.ir_clip_feats = clip_ir
-            print(f"CLIP features saved: RGB {clip_rgb.shape}, IR {clip_ir.shape}")
-        else:
-            self.vis_clip_feats = None
-            self.ir_clip_feats = None
-    
     @torch.no_grad()
-    def _update_memory(self, rgb_feats, ir_feats, rgb_labels, ir_labels):
-        """Update feature memory bank using EMA"""
-        self.vis_memory = self.vis_memory.to(self.device)
-        self.ir_memory = self.ir_memory.to(self.device)
-        
-        for label in torch.unique(rgb_labels):
-            mask = (rgb_labels == label)
-            if mask.any():
-                new_feat = rgb_feats[mask].mean(dim=0)
-                self.vis_memory[label] = (1 - self.sigma) * self.vis_memory[label] + \
-                                         self.sigma * new_feat
-        
-        for label in torch.unique(ir_labels):
-            mask = (ir_labels == label)
-            if mask.any():
-                new_feat = ir_feats[mask].mean(dim=0)
-                self.ir_memory[label] = (1 - self.sigma) * self.ir_memory[label] + \
-                                        self.sigma * new_feat
-    
-    def _match_sinkhorn(self):
-        """Global optimal matching using Sinkhorn algorithm"""
-        score_rgb = torch.from_numpy(self.vis).to(self.device)
-        score_ir = torch.from_numpy(self.ir).to(self.device)
-        score_rgb = F.normalize(score_rgb, dim=1)
-        score_ir = F.normalize(score_ir, dim=1)
-        sim_expert = torch.matmul(score_rgb, score_ir.T)
-        
-        if self.vis_clip_feats is not None and self.ir_clip_feats is not None:
-            clip_rgb = F.normalize(self.vis_clip_feats.to(self.device), dim=1)
-            clip_ir = F.normalize(self.ir_clip_feats.to(self.device), dim=1)
-            sim_clip = torch.matmul(clip_rgb, clip_ir.T)
-            
-            w_clip = getattr(self.args, 'w_clip', 0.3)
-            sim_final = (1 - w_clip) * sim_expert + w_clip * sim_clip
-            print(f"CLIP weight: {w_clip:.2f}")
+    def update(self, rgb_feats, ir_feats, rgb_labels, ir_labels):
+        rgb_set = torch.unique(rgb_labels)
+        ir_set = torch.unique(ir_labels)
+        for i in rgb_set:
+            rgb_mask = (rgb_labels == i)
+            selected_rgb = rgb_feats[rgb_mask].mean(dim=0)
+            self.vis_memory[i] = (1-self.sigma)*self.vis_memory[i] + self.sigma * selected_rgb
+        for i in ir_set:
+            ir_mask = (ir_labels == i)
+            selected_ir = ir_feats[ir_mask].mean(dim=0)
+            self.ir_memory[i] = (1-self.sigma)*self.ir_memory[i] + self.sigma * selected_ir
+
+    def get_label(self, epoch=None):
+        if self.not_saved:# pass if 
+            pass
         else:
-            sim_final = sim_expert
-        
-        epsilon = getattr(self.args, 'sinkhorn_reg', 0.05)
-        log_Q = sim_final / epsilon
-        log_Q = torch.clamp(log_Q, min=-50, max=50)
-        
-        max_iters = 100
-        tolerance = 1e-4
-        for iteration in range(max_iters):
-            log_Q_prev = log_Q.clone()
-            log_Q = log_Q - torch.logsumexp(log_Q, dim=1, keepdim=True)
-            log_Q = log_Q - torch.logsumexp(log_Q, dim=0, keepdim=True)
+            print('get match labels')
+            if self.mode == 'features':
+                dists = np.matmul(self.vis, self.ir.T)
+                v2i_dict, i2v_dict = self._get_label(dists,'dist')
+
+            elif self.mode == 'scores':
+                v2i_dict, _ = self._get_label(self.vis,'rgb')
+                i2v_dict, _ = self._get_label(self.ir,'ir')
+                self.v2i = v2i_dict
+                self.i2v = i2v_dict
+            return v2i_dict, i2v_dict
+    # TODO
+    def _get_label(self,dists,mode):
+        sample_rate = 1
+        dists_shape = dists.shape
+        sorted_1d = np.argsort(dists, axis=None)[::-1]# flat to 1d and sort
+        sorted_2d = np.unravel_index(sorted_1d, dists_shape)# sort index return to 2d, like ([0,1,2],[1,2,0])
+        idx1, idx2 = sorted_2d[0], sorted_2d[1]# sorted idx of dim0 and dim1
+        dists = dists[idx1, idx2]
+        idx_length = int(np.ceil(sample_rate*dists.shape[0]/self.num_classes))
+        dists = dists[:idx_length]
+
+        if mode=='dist': # multiply the instance features of the two modalities
+            convert_label = [(i,j) for i,j in zip(np.array(self.rgb_ids)[idx1[:idx_length]],\
+                                            np.array(self.ir_ids)[idx2[:idx_length]])]
             
-            if torch.abs(log_Q - log_Q_prev).max() < tolerance:
-                print(f"Sinkhorn converged at iteration {iteration}")
-                break
-        
-        Q = torch.exp(log_Q).cpu().numpy()
-        
-        # 修复：使用更合理的阈值策略
-        v2i, i2v = self._generate_matches_from_Q_fixed(Q)
-        
-        print(f"Matching results: RGB->IR {len(v2i)}/{len(self.rgb_ids)}, "
-              f"IR->RGB {len(i2v)}/{len(self.ir_ids)}")
-        
-        return v2i, i2v
-    
-    def _generate_matches_from_Q_fixed(self, Q):
-        """
-        Fixed matching generation with adaptive threshold and Top-K strategy
-        
-        Args:
-            Q: Transport matrix [N_rgb, N_ir]
-        
-        Returns:
-            v2i: RGB to IR matching dict
-            i2v: IR to RGB matching dict
-        """
+        elif mode=='rgb': # classify score of RGB (v2i)
+            convert_label = [(i,j) for i,j in zip(np.array(self.rgb_ids)[idx1[:idx_length]],\
+                                                  idx2[:idx_length])]
+
+        elif mode=='ir': # classify score of IR (v2i)
+            convert_label = [(i,j) for i,j in zip(np.array(self.ir_ids)[idx1[:idx_length]],\
+                                                  idx2[:idx_length])]
+        else:
+            raise AttributeError('invalid mode!')
+        convert_label_cnt = Counter(convert_label)
+        convert_label_cnt_sorted = sorted(convert_label_cnt.items(),key = lambda x:x[1],reverse = True)
+        length = len(convert_label_cnt_sorted)
+        lambda_cm=0.1
+        in_rgb_label=[]
+        in_ir_label=[]
         v2i = OrderedDict()
         i2v = OrderedDict()
-        
-        # Use Top-K strategy instead of fixed threshold
-        top_k = min(5, Q.shape[1])
-        
-        for i in range(Q.shape[0]):
-            # Get Top-K matches
-            top_indices = np.argsort(Q[i])[-top_k:][::-1]
-            
-            for j in top_indices:
-                # Bidirectional verification: must be mutually in Top-K
-                if i in np.argsort(Q[:, j])[-top_k:]:
-                    rgb_id = self.rgb_ids[i].item()
-                    ir_id = self.ir_ids[j].item()
-                    
-                    if rgb_id not in v2i:
-                        v2i[rgb_id] = ir_id
-                    if ir_id not in i2v:
-                        i2v[ir_id] = rgb_id
-                    break
-        
-        return v2i, i2v
 
-    
-    def _match_greedy(self):
-        """Greedy matching algorithm"""
-        dists = np.matmul(self.vis, self.ir.T)
+        length_ratio = 1
+        for i in range(int(length*length_ratio)):
+            key = convert_label_cnt_sorted[i][0] 
+            value = convert_label_cnt_sorted[i][1]
+            # if key[0] == -1 or key[1] == -1:
+            #     continue
+            if key[0] in in_rgb_label or key[1] in in_ir_label:
+                continue
+            in_rgb_label.append(key[0])
+            in_ir_label.append(key[1])
+            v2i[key[0]] = key[1]
+            i2v[key[1]] = key[0]
+            # v2i[key[0]][key[1]] = 1
+            
+        return v2i, i2v # only v2i/i2v is used in scores mode
+
+    def extract(self, args, model, dataset):
+        '''
+        Output: BN_features, labels, cls
+        '''
+        # save epoch
+        model.set_eval()
+        rgb_loader, ir_loader = dataset.get_normal_loader() 
+        with torch.no_grad():
+            
+            rgb_features, rgb_labels, rgb_gt, r2i_cls, rgb_idx = self._extract_feature(model, rgb_loader,'rgb')
+            ir_features, ir_labels, ir_gt, i2r_cls, ir_idx = self._extract_feature(model, ir_loader,'ir')
+
+        # # //match by cls and save features to memory bank
+        self.save(r2i_cls, i2r_cls, rgb_labels, ir_labels, rgb_idx,\
+                 ir_idx, 'scores', rgb_features, ir_features)
         
-        sorted_indices = np.argsort(-dists, axis=None)
-        sorted_2d = np.unravel_index(sorted_indices, dists.shape)
-        idx_rgb, idx_ir = sorted_2d[0], sorted_2d[1]
-        
-        pairs = [(self.rgb_ids[i].item(), self.ir_ids[j].item()) 
-                 for i, j in zip(idx_rgb, idx_ir)]
-        pair_counts = Counter(pairs)
-        
-        v2i, i2v = OrderedDict(), OrderedDict()
-        matched_rgb, matched_ir = set(), set()
-        
-        for (rgb_id, ir_id), count in pair_counts.most_common():
-            if rgb_id not in matched_rgb and ir_id not in matched_ir:
-                v2i[rgb_id] = ir_id
-                i2v[ir_id] = rgb_id
-                matched_rgb.add(rgb_id)
-                matched_ir.add(ir_id)
-        
-        print(f"Greedy matching results: {len(v2i)} pairs")
-        return v2i, i2v
-    
-    def get_memory_features(self):
-        """Get memory bank features"""
-        return self.vis_memory, self.ir_memory
-    
-    def reset(self):
-        """Reset internal state"""
-        self.not_saved = True
-        self.vis_clip_feats = None
-        self.ir_clip_feats = None
+    def _extract_feature(self, model, loader, modal):
+
+        print('extracting {} features'.format(modal))
+
+        saved_features, saved_labels, saved_cls= None, None, None
+        saved_gts, saved_idx= None, None
+        for imgs_list, infos in loader:
+            labels = infos[:,1]
+            idx = infos[:,0]
+            gts = infos[:,-1].to(model.device)
+            if imgs_list.__class__.__name__ != 'list':
+                imgs = imgs_list
+                imgs, labels, idx = \
+                    imgs.to(model.device), labels.to(model.device), idx.to(model.device)
+            else:
+                ori_imgs, ca_imgs = imgs_list[0], imgs_list[1]
+                if len(ori_imgs.shape) < 4:
+                    ori_imgs = ori_imgs.unsqueeze(0)
+                    ca_imgs = ca_imgs.unsqueeze(0)
+
+                imgs = torch.cat((ori_imgs,ca_imgs),dim=0)
+                labels = torch.cat((labels,labels),dim=0)
+                idx = torch.cat((idx,idx),dim=0)
+                gts= torch.cat((gts,gts),dim=0).to(model.device)
+                imgs, labels, idx= \
+                    imgs.to(model.device), labels.to(model.device), idx.to(model.device)
+            _, bn_features = model.model(imgs) # _:gap feature
+
+            if modal == 'rgb':
+                cls, l2_features = model.classifier2(bn_features)
+            elif modal == 'ir':
+                cls, l2_features = model.classifier1(bn_features)
+            l2_features = l2_features.detach().cpu()
+
+            if saved_features is None: 
+                # saved_features, saved_labels, saved_cls, saved_idx = l2_features, labels, cls, idx
+                saved_features, saved_labels, saved_cls, saved_idx = bn_features, labels, cls, idx
+
+                saved_gts = gts
+            else:
+                # saved_features = torch.cat((saved_features, l2_features), dim=0)
+                saved_features = torch.cat((saved_features, bn_features), dim=0)
+                saved_labels = torch.cat((saved_labels, labels), dim=0)
+                saved_cls = torch.cat((saved_cls, cls), dim=0)
+                saved_idx = torch.cat((saved_idx, idx), dim=0)
+
+                saved_gts = torch.cat((saved_gts, gts), dim=0)
+        return saved_features, saved_labels, saved_gts, saved_cls, saved_idx

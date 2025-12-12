@@ -1,3 +1,5 @@
+#!/bin/bash
+
 # ==================== Setup ====================
 cd "$(dirname "$0")" || exit
 
@@ -16,75 +18,50 @@ echo "=========================================="
 echo "Trial: ${TRIAL}"
 echo "Start Time: $(date '+%Y-%m-%d %H:%M:%S')"
 echo "=========================================="
+
 # ==================== Training Command ====================
-python main.py \
+python3 main.py \
     \
     `# Basic Settings` \
     --dataset regdb \
     --arch resnet \
-    --mode train \
-    --data-path ./datasets \
-    --save-path ./save \
-    --seed 42 \
-    --num-workers 8 \
-    \
-    `# Training Phases - Optimized for reasonable training time` \
-    --stage1-epoch 40 \
-    --stage2-epoch 60 \
+    --debug wsl \
+    --save-path ./saved_regdb_resnet/regdb_${TRIAL} \
     --trial ${TRIAL} \
+    \
+    `# Training Phases` \
+    --stage1-epoch 50 \
+    --stage2-epoch 120 \
     \
     `# Data Settings` \
     --img-h 288 \
     --img-w 144 \
-    --batch-pidnum 16 \
+    --batch-pidnum 8 \
     --pid-numsample 4 \
     --test-batch 128 \
     --relabel 1 \
     \
     `# Optimizer and Scheduler` \
-    --lr 0.0003 \
+    --lr 0.00045 \
     --weight-decay 0.0005 \
-    --milestones 30 50 \
-    --warmup-epochs 5 \
+    --milestones 50 70 \
     \
     `# Loss Function Settings` \
     --tri-weight 0.25 \
     --weak-weight 0.25 \
-    --label-smoothing 0.1 \
-    --contrastive-temp 0.07 \
-    --intra-contrastive-weight 0.1 \
-    --contrastive-weight 0.3 \
-    \
-    `# Loss Schedule` \
-    --triplet-warmup-epochs 8 \
-    --contrastive-start-epoch 5 \
-    --cross-contrastive-start 3 \
-    --cmo-start-epoch 3 \
-    --cmo-warmup 8 \
-    --weak-start-epoch 5 \
-    --weak-warmup 12 \
     \
     `# Cross-Modal Matching` \
-    --sigma 0.3 \
-    --temperature 0.05 \
-    \
-    `# Advanced Features (Optional - comment out if not needed)` \
-    --use-clip \
-    --w-clip 0.3 \
-    --use-sinkhorn \
-    --sinkhorn-reg 0.05 \
+    --sigma 0.8 \
+    --temperature 3 \
     \
     `# Testing Settings` \
-    --test-mode all \
+    --test-mode t2v \
     --search-mode all \
-    --gall-mode single \
-    \
-    `# Debug` \
-    --debug wsl
+    --gall-mode single
 
 # ==================== Training Complete ====================
 echo "=========================================="
 echo "Training Completed!"
 echo "End Time: $(date '+%Y-%m-%d %H:%M:%S')"
-echo "Check results in ./save/"
+echo "Check results in ./saved_regdb_resnet/regdb_${TRIAL}/"
 echo "=========================================="

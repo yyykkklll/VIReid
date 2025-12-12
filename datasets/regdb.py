@@ -84,10 +84,7 @@ class RegDB_train(data.Dataset):
         train_image = []
         for i in range(len(img_file)):
             img = Image.open(self.data_path + img_file[i])
-            try:
-                img = img.resize((144, 288), Image.ANTIALIAS)
-            except AttributeError:
-                img = img.resize((144, 288), Image.LANCZOS)
+            img = img.resize((144, 288), Image.LANCZOS)
             pix_array = np.array(img)
             train_image.append(pix_array)
 

@@ -1,383 +1,163 @@
-"""
-Model Management Module
-=======================
-Components: Backbone, Classifiers, CLIP, Optimizers, Schedulers
-Updates:
-- Added CosineAnnealingWarmupLR scheduler support
-- Integrated LabelSmoothingCrossEntropy and InfoNCE loss
-- Added adaptive loss weighting
-"""
-
 import torch
-import torch.nn as nn
 import os
+import re
+
 from .classifier import Image_Classifier
-from .agw import AGW
-from .clip_model import CLIP, load_clip_to_cpu
-from .optim import WarmupMultiStepLR, CosineAnnealingWarmupLR
-from .loss import (
-    TripletLoss_WRT, 
-    Weak_loss, 
-    LabelSmoothingCrossEntropy, 
-    InfoNCELoss, 
-    AdaptiveLossWeighting
-)
+
 from utils import os_walk
-
-
+from .agw import AGW
+from .clip_model import CLIP
+from .optim import WarmupMultiStepLR
+from .loss import TripletLoss_WRT, Weak_loss
 _models = {
-    "resnet": AGW,
-    "clip": CLIP,
+    "resnet": AGW,  # visual encoder AGW, no text encoder
+    "clip-resnet": CLIP,  # resnet50 + transformer
+    "vit": 0,  # visual encoder vit, no text encoder
+    #"clip-vit": CLIP,  # both vit-b/16 + transformer
 }
 
 
 def create(args):
-    """Model factory function"""
+    """
+    Create a dataset instance.
+    """
     if args.arch not in _models:
-        raise KeyError(f"Unknown backbone: {args.arch}. Available: {list(_models.keys())}")
+        raise KeyError("Unknown backbone:", args.arch)
+    print('loading {} dataset ...'.format(args.dataset))
     return Model(args)
 
 
 class Model:
-    """Cross-modal Person Re-ID Model Manager"""
-    
     def __init__(self, args):
-        self.args = args
         self.mode = args.mode
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.device = torch.device(args.device if torch.cuda.is_available() else "cpu")
         self.save_path = os.path.join(args.save_path, "models/")
-        
         self.lr = args.lr
         self.weight_decay = args.weight_decay
         self.milestones = args.milestones
-        self.resume_epoch = 0
-        
-        print(f"Building backbone: {args.arch}")
+        self.resume = args.resume
+        self.args = args
+
         self.model = _models[args.arch](args).to(self.device)
-        
-        print(f"Building classifiers (num_classes={args.num_classes})")
-        self.classifier1 = Image_Classifier(args).to(self.device)
-        self.classifier2 = Image_Classifier(args).to(self.device)
-        self.classifier3 = Image_Classifier(args).to(self.device)
+        self.classifier1 = Image_Classifier(args).to(self.device) # RGB classifier
+        self.classifier2 = Image_Classifier(args).to(self.device) # IR classifier
+        self.classifier3 = Image_Classifier(args).to(self.device) # Common classifier
         self.enable_cls3 = False
-        
-        self.clip_model = None
-        if hasattr(args, 'use_clip') and args.use_clip:
-            print("Loading CLIP as Semantic Referee...")
-            self.clip_model = self._build_clip_model(args)
-        
+
         self._init_optimizer()
         self._init_criterion()
-        print(f"Model initialized on {self.device}")
-    
-    def _build_clip_model(self, args):
-        """Build CLIP model with correct feature map resolution"""
-        h_resolution = (args.img_h - 32) // 32 + 1
-        w_resolution = (args.img_w - 32) // 32 + 1
-        
-        print(f"  CLIP feature map: {h_resolution}x{w_resolution}")
-        print(f"  Input image: {args.img_h}x{args.img_w}")
-        
-        clip_model = load_clip_to_cpu(
-            backbone_name='RN50',
-            h_resolution=h_resolution,
-            w_resolution=w_resolution,
-            vision_stride_size=32
-        )
-        
-        clip_model.to(self.device)
-        clip_model.eval()
-        
-        for param in clip_model.parameters():
-            param.requires_grad = False
-        
-        return clip_model
-    
+
     def _init_optimizer(self):
-        """Initialize optimizers and schedulers for two-stage training"""
-        
-        # Build parameter groups for Phase 1
+        ###########################
+        ###专家学习率适配###
         params_phase1 = []
-        for module in [self.model, self.classifier1, self.classifier2]:
-            for name, param in module.named_parameters():
-                if not param.requires_grad:
-                    continue
-                lr = 2.0 * self.lr if 'classifier' in name else self.lr
-                params_phase1.append({
-                    'params': [param],
-                    'lr': lr,
-                    'weight_decay': self.weight_decay
-                })
-        
-        # Build parameter groups for Phase 2 (includes classifier3)
-        params_phase2 = params_phase1.copy()
-        for name, param in self.classifier3.named_parameters():
-            if param.requires_grad:
-                params_phase2.append({
-                    'params': [param],
-                    'lr': 2.0 * self.lr,
-                    'weight_decay': self.weight_decay
-                })
-        
-        # Initialize optimizers
+        params_phase2 = []
+        for part in (self.model, self.classifier1, self.classifier2):
+            for key, value in part.named_parameters():
+                if value.requires_grad and key.find("classifier") != -1:
+                    params_phase1 += [{"params": [value], 
+                                "lr": 2 * self.lr,
+                                "weight_decay": self.weight_decay}]
+                elif value.requires_grad:
+                    params_phase1 += [{"params": [value], 
+                                "lr": self.lr,
+                                "weight_decay": self.weight_decay}]
+        params_phase2.extend(params_phase1)
+        for key, value in self.classifier3.named_parameters():
+            if value.requires_grad:
+                params_phase2 += [{"params": [value], 
+                            "lr": 2 * self.lr,
+                            "weight_decay": self.weight_decay}]
         self.optimizer_phase1 = torch.optim.Adam(params_phase1)
         self.optimizer_phase2 = torch.optim.Adam(params_phase2)
-        
-        # Initialize schedulers based on configuration
-        use_cosine = getattr(self.args, 'use_cosine_scheduler', False)
-        
-        if use_cosine:
-            print("Using Cosine Annealing with Warmup scheduler")
-            
-            warmup_epochs = getattr(self.args, 'warmup_epochs', 5)
-            eta_min = getattr(self.args, 'eta_min', 1e-6)
-            
-            self.scheduler_phase1 = CosineAnnealingWarmupLR(
-                self.optimizer_phase1,
-                warmup_epochs=warmup_epochs,
-                max_epochs=self.args.stage1_epoch,
-                eta_min=eta_min
-            )
-            self.scheduler_phase2 = CosineAnnealingWarmupLR(
-                self.optimizer_phase2,
-                warmup_epochs=warmup_epochs,
-                max_epochs=self.args.stage2_epoch,
-                eta_min=eta_min
-            )
-            
-            print(f"  Warmup epochs: {warmup_epochs}")
-            print(f"  Eta min: {eta_min}")
-            
-        else:
-            print("Using MultiStep with Warmup scheduler")
-            
-            self.scheduler_phase1 = WarmupMultiStepLR(
-                self.optimizer_phase1, 
-                milestones=self.milestones,
-                gamma=0.1, 
-                warmup_factor=0.1, 
-                warmup_iters=5, 
-                mode='cls'
-            )
-            self.scheduler_phase2 = WarmupMultiStepLR(
-                self.optimizer_phase2, 
-                milestones=self.milestones,
-                gamma=0.1, 
-                warmup_factor=0.1, 
-                warmup_iters=5, 
-                mode='cls'
-            )
-            
-            print(f"  Milestones: {self.milestones}")
-    
+        self.scheduler_phase1 = WarmupMultiStepLR(self.optimizer_phase1, self.milestones,
+                                           gamma=0.1, warmup_factor=0.01, warmup_iters=10, mode='cls')
+        self.scheduler_phase2 = WarmupMultiStepLR(self.optimizer_phase2, self.milestones,
+                                           gamma=0.1, warmup_factor=0.01, warmup_iters=10, mode='cls')
     def _init_criterion(self):
-        """Initialize loss functions with new optimized versions"""
-        
-        # Get label smoothing epsilon from args
-        label_smoothing = getattr(self.args, 'label_smoothing', 0.1)
-        contrastive_temp = getattr(self.args, 'contrastive_temp', 0.07)
-        
-        # NEW: Use Label Smoothing instead of vanilla CrossEntropy
-        self.pid_criterion = LabelSmoothingCrossEntropy(epsilon=label_smoothing)
-        
-        # Keep original loss functions
+        self.pid_criterion = torch.nn.CrossEntropyLoss()
         self.tri_criterion = TripletLoss_WRT()
         self.weak_criterion = Weak_loss()
-        
-        # NEW: Add contrastive loss
-        self.contrastive_criterion = InfoNCELoss(temperature=contrastive_temp)
-        
-        # NEW: Add adaptive loss weighting
-        self.loss_weighter = AdaptiveLossWeighting(num_losses=10)
-        
-        print("Loss functions initialized:")
-        print(f"  - LabelSmoothingCrossEntropy (ε={label_smoothing})")
-        print(f"  - TripletLoss_WRT")
-        print(f"  - Weak_loss")
-        print(f"  - InfoNCELoss (τ={contrastive_temp})")
-        print(f"  - AdaptiveLossWeighting (10 losses)")
-    
+
     def set_train(self):
-        """Set model to training mode"""
         self.model.train()
         self.classifier1.train()
         self.classifier2.train()
-        if self.enable_cls3:
-            self.classifier3.train()
-    
+        self.classifier3.train()
+
     def set_eval(self):
-        """Set model to evaluation mode"""
         self.model.eval()
         self.classifier1.eval()
         self.classifier2.eval()
         self.classifier3.eval()
-    
-    def save_model(self, epoch, is_best=False):
-        """Save model checkpoint with error handling"""
-        if not os.path.exists(self.save_path):
-            os.makedirs(self.save_path)
-        
-        state_dict = {
-            'epoch': epoch,
-            'backbone': self.model.state_dict(),
-            'classifier1': self.classifier1.state_dict(),
-            'classifier2': self.classifier2.state_dict(),
-            'classifier3': self.classifier3.state_dict(),
-            'optimizer_phase1': self.optimizer_phase1.state_dict(),
-            'optimizer_phase2': self.optimizer_phase2.state_dict(),
-            'scheduler_phase1': self.scheduler_phase1.state_dict(),
-            'scheduler_phase2': self.scheduler_phase2.state_dict(),
-        }
-        
+
+    def save_model(self, save_epoch, is_best):
         if is_best:
-            model_path = os.path.join(self.save_path, 'model_best.pth')
-        else:
-            model_path = os.path.join(self.save_path, f'model_{epoch}.pth')
+            model_file_path = os.path.join(self.save_path, 'model_{}.pth'.format(save_epoch))
+            root, _, files = os_walk(self.save_path)
+            for file in files:
+                if '.pth' not in file:
+                    files.remove(file)
+                file_iters = int(file.replace('.pth', '').split('_')[1])
+                if file_iters <= save_epoch: 
+                    remove_file_path = os.path.join(root, 'model_{}.pth'.format(file_iters))
+                    os.remove(remove_file_path)
+
+            all_state_dict = {'backbone': self.model.state_dict(),
+                               'classifier1': self.classifier1.state_dict(),
+                               'classifier2': self.classifier2.state_dict(),
+                               'classifier3': self.classifier3.state_dict()}
+            
+            torch.save(all_state_dict, model_file_path)        
         
-        try:
-            temp_path = model_path + '.tmp'
-            torch.save(state_dict, temp_path)
-            
-            if os.path.exists(model_path):
-                os.remove(model_path)
-            os.rename(temp_path, model_path)
-            
-            print(f"Model saved to {model_path}")
-            
-            if not is_best:
-                self._cleanup_old_models(keep_best=True, keep_recent=3)
+    def resume_model(self, specified_model=None):
+        '''
+        # load the weights from existed file
+        model_epoch: the epoch of the model to load(optional)
+        '''
+        if specified_model is None:
+            root, _, files = os_walk(self.save_path)
+            self.resume_epoch = 0
+            if len(files) > 0:
+                indexes = []
+                for file in files:
+                    indexes.append(int(file.replace('.pth', '').split('_')[-1]))
+                indexes = sorted(list(set(indexes)), reverse=False)
+                model_path = os.path.join(self.save_path, 'model_{}.pth'.format(indexes[-1]))
                 
-        except Exception as e:
-            print(f"Failed to save model: {e}")
-            if os.path.exists(temp_path):
-                try:
-                    os.remove(temp_path)
-                except:
-                    pass
-    
-    def resume_model(self, model_path=None):
-        """Load model checkpoint"""
-        if model_path is None:
-            model_path = self._find_latest_model()
-        
-        if model_path is None or not os.path.exists(model_path):
-            print("No checkpoint found, starting from scratch")
-            self.resume_epoch = 0
-            return
-        
-        print(f"Loading checkpoint from {model_path}")
-        
-        try:
-            checkpoint = torch.load(model_path, map_location=self.device)
-            
-            self.model.load_state_dict(checkpoint['backbone'], strict=False)
-            self.classifier1.load_state_dict(checkpoint['classifier1'], strict=False)
-            self.classifier2.load_state_dict(checkpoint['classifier2'], strict=False)
-            
-            if 'classifier3' in checkpoint:
-                self.classifier3.load_state_dict(checkpoint['classifier3'], strict=False)
-            
-            self.resume_epoch = checkpoint.get('epoch', 0)
-            
-            # Load optimizer and scheduler states
-            if self.mode == 'train':
-                try:
-                    if 'optimizer_phase1' in checkpoint:
-                        self.optimizer_phase1.load_state_dict(checkpoint['optimizer_phase1'])
-                    if 'optimizer_phase2' in checkpoint:
-                        self.optimizer_phase2.load_state_dict(checkpoint['optimizer_phase2'])
-                    
-                    if 'scheduler_phase1' in checkpoint:
-                        self.scheduler_phase1.load_state_dict(checkpoint['scheduler_phase1'])
-                    if 'scheduler_phase2' in checkpoint:
-                        self.scheduler_phase2.load_state_dict(checkpoint['scheduler_phase2'])
-                    
-                    print("  Optimizer and scheduler states loaded")
-                except Exception as e:
-                    print(f"  Failed to load optimizer/scheduler state: {e}")
-                    print("  Using fresh optimizer and scheduler")
-            
-            print(f"Model loaded successfully from epoch {self.resume_epoch}")
-            
-        except Exception as e:
-            print(f"Failed to load checkpoint: {e}")
-            self.resume_epoch = 0
-    
-    def _find_latest_model(self):
-        """Find the latest checkpoint"""
-        if not os.path.exists(self.save_path):
-            return None
-        
-        root, _, files = os_walk(self.save_path)
-        pth_files = [f for f in files if f.endswith('.pth') and not f.endswith('.tmp')]
-        
-        if not pth_files:
-            return None
-        
-        if 'model_best.pth' in pth_files:
-            return os.path.join(root, 'model_best.pth')
-        
-        epochs = []
-        for f in pth_files:
+                if self.resume or self.mode == 'test':
+                    loaded_dict = torch.load(model_path,map_location=self.device)
+                    self.model.load_state_dict(loaded_dict['backbone'], strict=False)
+                    self.classifier1.load_state_dict(loaded_dict['classifier1'], strict=False)
+                    self.classifier2.load_state_dict(loaded_dict['classifier2'], strict=False)
+                    try:
+                        self.classifier3.load_state_dict(loaded_dict['classifier3'], strict=False)
+                    except:
+                        pass
+                    start_epoch = indexes[-1]
+                    self.resume_epoch = start_epoch
+                    print(f'load {model_path}')
+                else:
+                    os.remove(model_path)
+                    print('existed model files removed!')
+            else:
+                print('valid model file not existed!')
+            print(f'from {self.resume_epoch} epoch training')
+
+        else:
+            model_path = specified_model
+            loaded_dict = torch.load(model_path,map_location=self.device)
+            self.model.load_state_dict(loaded_dict['backbone'], strict=False)
+            self.classifier1.load_state_dict(loaded_dict['classifier1'], strict=False)
+            self.classifier2.load_state_dict(loaded_dict['classifier2'], strict=False)
             try:
-                epoch = int(f.replace('.pth', '').split('_')[-1])
-                epochs.append((epoch, f))
-            except:
-                continue
-        
-        if epochs:
-            latest_file = max(epochs, key=lambda x: x[0])[1]
-            return os.path.join(root, latest_file)
-        
-        return None
-    
-    def _cleanup_old_models(self, keep_best=True, keep_recent=3):
-        """Clean up old model checkpoints"""
-        if not os.path.exists(self.save_path):
-            return
-        
-        root, _, files = os_walk(self.save_path)
-        pth_files = [f for f in files if f.endswith('.pth') and not f.endswith('.tmp')]
-        
-        epoch_files = []
-        for f in pth_files:
-            if f == 'model_best.pth' and keep_best:
-                continue
-            
-            try:
-                epoch = int(f.replace('.pth', '').split('_')[-1])
-                epoch_files.append((epoch, f))
-            except:
-                continue
-        
-        epoch_files.sort(key=lambda x: x[0], reverse=True)
-        
-        for epoch, filename in epoch_files[keep_recent:]:
-            file_path = os.path.join(root, filename)
-            try:
-                os.remove(file_path)
-                print(f"Removed old checkpoint: {filename}")
+                self.classifier3.load_state_dict(loaded_dict['classifier3'], strict=False)
             except:
                 pass
-    
-    def count_parameters(self):
-        """Count model parameters"""
-        total = sum(p.numel() for p in self.model.parameters())
-        trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-        
-        print(f"Model parameters:")
-        print(f"  Total: {total / 1e6:.2f}M")
-        print(f"  Trainable: {trainable / 1e6:.2f}M")
-        
-        return total, trainable
-    
-    def get_learning_rate(self):
-        """Get current learning rate"""
-        return self.optimizer_phase2.param_groups[0]['lr']
-    
-    def step_scheduler(self, phase=2):
-        """Step the learning rate scheduler"""
-        if phase == 1:
-            self.scheduler_phase1.step()
-        else:
-            self.scheduler_phase2.step()
+            
+            # match = re.search(r'\d+', specified_model)
+            # self.resume_epoch = int(match.group())
+            
+            self.resume_epoch = 0
+            print(f'load {model_path}')
+            print(f'from {self.resume_epoch} epoch training')
