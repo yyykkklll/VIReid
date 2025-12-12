@@ -1,208 +1,243 @@
+"""
+Cross-Modal Match Aggregation (CMA)
+跨模态匹配聚合模块 - 支持扩散桥生成的特征
+"""
 import torch
 import torch.nn as nn
 import numpy as np
-from collections import defaultdict, Counter, OrderedDict
-from sklearn.preprocessing import normalize
-import time
-import pickle
-from utils import fliplr
+from collections import Counter, OrderedDict
+
+
 class CMA(nn.Module):
-    '''
-    Cross modal Match Aggregation
-    '''
     def __init__(self, args):
         super(CMA, self).__init__()
-        # self.inited = False
         self.device = torch.device(args.device)
         self.not_saved = True
-        # self.threshold = 0.8
         self.num_classes = args.num_classes
-        self.T = args.temperature # softmax temperature
-        self.sigma = args.sigma # momentum update factor
-        # memory of visible and infrared modal
-        self.register_buffer('vis_memory',torch.zeros(self.num_classes,2048))
-        self.register_buffer('ir_memory',torch.zeros(self.num_classes,2048))
+        self.T = args.temperature  # Softmax temperature
+        self.sigma = args.sigma  # Momentum update factor
+        
+        # Memory banks for visible and infrared modalities
+        self.register_buffer('vis_memory', torch.zeros(self.num_classes, 2048))
+        self.register_buffer('ir_memory', torch.zeros(self.num_classes, 2048))
 
     @torch.no_grad()
-    # def save(self,vis,ir,rgb_ids,ir_ids,rgb_idx,ir_idx,mode):
-    def save(self,vis,ir,rgb_ids,ir_ids,rgb_idx,ir_idx,mode, rgb_features=None, ir_features=None):
-    # vis: vis sample(v2i scores or vis features) ir: ir sample
+    def save(self, vis, ir, rgb_ids, ir_ids, rgb_idx, ir_idx, mode, rgb_features=None, ir_features=None):
+        """
+        保存特征和分类分数
+        Args:
+            vis: RGB 模态数据（分数或特征）
+            ir: IR 模态数据（分数或特征）
+            mode: 'scores' 或 'features'
+            rgb_features: RGB 特征（用于初始化 memory bank）
+            ir_features: IR 特征（用于初始化 memory bank）
+        """
         self.mode = mode
         self.not_saved = False
-        if self.mode != 'scores' and self.mode != 'features':
-            raise ValueError('invalid mode!')
-        elif self.mode == 'scores': # predict scores
-            vis = torch.nn.functional.softmax(self.T*vis,dim=1)
-            ir = torch.nn.functional.softmax(self.T*ir,dim=1)
-        ###############################
-        # save features in memory bank
-        if rgb_features is not None and ir_features is not None:
-            # Prepare empty memory banks on the device
-            self.vis_memory = self.vis_memory.to(self.device)
-            self.ir_memory = self.ir_memory.to(self.device)
-            
-            # Get unique labels and process RGB and IR features
-            label_set = torch.unique(rgb_ids)
-            
-            for label in label_set:
-                # Select RGB features for the current label
-                rgb_mask = (rgb_ids == label)
-                ir_mask = (ir_ids == label)
-                # .any() check True in bool tensor
-                if rgb_mask.any():
-                    rgb_selected = rgb_features[rgb_mask]
-                    self.vis_memory[label] = rgb_selected.mean(dim=0)
-                
-                if ir_mask.any():
-                    ir_selected = ir_features[ir_mask]
-                    self.ir_memory[label] = ir_selected.mean(dim=0)
-        ################################
-        vis = vis.detach().cpu().numpy()
-        ir = ir.detach().cpu().numpy()
-        rgb_ids, ir_ids = rgb_ids.cpu(), ir_ids.cpu()
-            
-        self.vis, self.ir = vis, ir
-        self.rgb_ids, self.ir_ids = rgb_ids, ir_ids
-        self.rgb_idx, self.ir_idx = rgb_idx, ir_idx
         
+        if mode not in ['scores', 'features']:
+            raise ValueError(f'Invalid mode: {mode}')
+        
+        # 如果是分数模式，应用 softmax
+        if mode == 'scores':
+            vis = torch.nn.functional.softmax(self.T * vis, dim=1)
+            ir = torch.nn.functional.softmax(self.T * ir, dim=1)
+        
+        # ========== 初始化 Memory Bank ==========
+        if rgb_features is not None and ir_features is not None:
+            self._init_memory_bank(rgb_features, ir_features, rgb_ids, ir_ids)
+        # ========================================
+        
+        # 转换为 numpy 用于匹配
+        self.vis = vis.detach().cpu().numpy()
+        self.ir = ir.detach().cpu().numpy()
+        self.rgb_ids = rgb_ids.cpu()
+        self.ir_ids = ir_ids.cpu()
+        self.rgb_idx = rgb_idx
+        self.ir_idx = ir_idx
+    
+    def _init_memory_bank(self, rgb_features, ir_features, rgb_ids, ir_ids):
+        """初始化 Memory Bank（使用平均特征）"""
+        self.vis_memory = self.vis_memory.to(self.device)
+        self.ir_memory = self.ir_memory.to(self.device)
+        
+        # 对每个类别计算平均特征
+        unique_rgb_ids = torch.unique(rgb_ids)
+        unique_ir_ids = torch.unique(ir_ids)
+        
+        for label in unique_rgb_ids:
+            mask = (rgb_ids == label)
+            if mask.any():
+                self.vis_memory[label] = rgb_features[mask].mean(dim=0)
+        
+        for label in unique_ir_ids:
+            mask = (ir_ids == label)
+            if mask.any():
+                self.ir_memory[label] = ir_features[mask].mean(dim=0)
+
     @torch.no_grad()
     def update(self, rgb_feats, ir_feats, rgb_labels, ir_labels):
-        rgb_set = torch.unique(rgb_labels)
-        ir_set = torch.unique(ir_labels)
-        for i in rgb_set:
-            rgb_mask = (rgb_labels == i)
-            selected_rgb = rgb_feats[rgb_mask].mean(dim=0)
-            self.vis_memory[i] = (1-self.sigma)*self.vis_memory[i] + self.sigma * selected_rgb
-        for i in ir_set:
-            ir_mask = (ir_labels == i)
-            selected_ir = ir_feats[ir_mask].mean(dim=0)
-            self.ir_memory[i] = (1-self.sigma)*self.ir_memory[i] + self.sigma * selected_ir
+        """
+        动量更新 Memory Bank
+        Args:
+            rgb_feats: RGB 特征
+            ir_feats: IR 特征
+            rgb_labels: RGB 标签
+            ir_labels: IR 标签
+        """
+        for label in torch.unique(rgb_labels):
+            mask = (rgb_labels == label)
+            selected_rgb = rgb_feats[mask].mean(dim=0)
+            self.vis_memory[label] = (1 - self.sigma) * self.vis_memory[label] + self.sigma * selected_rgb
+        
+        for label in torch.unique(ir_labels):
+            mask = (ir_labels == label)
+            selected_ir = ir_feats[mask].mean(dim=0)
+            self.ir_memory[label] = (1 - self.sigma) * self.ir_memory[label] + self.sigma * selected_ir
 
     def get_label(self, epoch=None):
-        if self.not_saved:# pass if 
-            pass
-        else:
-            print('get match labels')
-            if self.mode == 'features':
-                dists = np.matmul(self.vis, self.ir.T)
-                v2i_dict, i2v_dict = self._get_label(dists,'dist')
-
-            elif self.mode == 'scores':
-                v2i_dict, _ = self._get_label(self.vis,'rgb')
-                i2v_dict, _ = self._get_label(self.ir,'ir')
-                self.v2i = v2i_dict
-                self.i2v = i2v_dict
-            return v2i_dict, i2v_dict
-    # TODO
-    def _get_label(self,dists,mode):
+        """
+        获取跨模态匹配标签
+        Returns:
+            v2i_dict: RGB → IR 匹配字典
+            i2v_dict: IR → RGB 匹配字典
+        """
+        if self.not_saved:
+            return {}, {}
+        
+        print('Getting match labels...')
+        
+        if self.mode == 'features':
+            dists = np.matmul(self.vis, self.ir.T)
+            v2i_dict, i2v_dict = self._get_label(dists, 'dist')
+        elif self.mode == 'scores':
+            v2i_dict, _ = self._get_label(self.vis, 'rgb')
+            i2v_dict, _ = self._get_label(self.ir, 'ir')
+        
+        return v2i_dict, i2v_dict
+    
+    def _get_label(self, dists, mode):
+        """
+        从距离/分数矩阵生成匹配标签
+        Args:
+            dists: 距离或分数矩阵
+            mode: 'dist', 'rgb', 或 'ir'
+        Returns:
+            v2i: RGB → IR 匹配
+            i2v: IR → RGB 匹配
+        """
         sample_rate = 1
         dists_shape = dists.shape
-        sorted_1d = np.argsort(dists, axis=None)[::-1]# flat to 1d and sort
-        sorted_2d = np.unravel_index(sorted_1d, dists_shape)# sort index return to 2d, like ([0,1,2],[1,2,0])
-        idx1, idx2 = sorted_2d[0], sorted_2d[1]# sorted idx of dim0 and dim1
-        dists = dists[idx1, idx2]
-        idx_length = int(np.ceil(sample_rate*dists.shape[0]/self.num_classes))
-        dists = dists[:idx_length]
-
-        if mode=='dist': # multiply the instance features of the two modalities
-            convert_label = [(i,j) for i,j in zip(np.array(self.rgb_ids)[idx1[:idx_length]],\
-                                            np.array(self.ir_ids)[idx2[:idx_length]])]
-            
-        elif mode=='rgb': # classify score of RGB (v2i)
-            convert_label = [(i,j) for i,j in zip(np.array(self.rgb_ids)[idx1[:idx_length]],\
-                                                  idx2[:idx_length])]
-
-        elif mode=='ir': # classify score of IR (v2i)
-            convert_label = [(i,j) for i,j in zip(np.array(self.ir_ids)[idx1[:idx_length]],\
-                                                  idx2[:idx_length])]
+        
+        # 展平并排序
+        sorted_1d = np.argsort(dists, axis=None)[::-1]
+        sorted_2d = np.unravel_index(sorted_1d, dists_shape)
+        idx1, idx2 = sorted_2d[0], sorted_2d[1]
+        
+        # 采样
+        idx_length = int(np.ceil(sample_rate * len(sorted_1d) / self.num_classes))
+        dists = dists[idx1[:idx_length], idx2[:idx_length]]
+        
+        # 构建候选匹配对
+        if mode == 'dist':
+            convert_label = [(int(self.rgb_ids[i]), int(self.ir_ids[j])) 
+                            for i, j in zip(idx1[:idx_length], idx2[:idx_length])]
+        elif mode == 'rgb':
+            convert_label = [(int(self.rgb_ids[i]), int(j)) 
+                            for i, j in zip(idx1[:idx_length], idx2[:idx_length])]
+        elif mode == 'ir':
+            convert_label = [(int(self.ir_ids[i]), int(j)) 
+                            for i, j in zip(idx1[:idx_length], idx2[:idx_length])]
         else:
-            raise AttributeError('invalid mode!')
+            raise ValueError(f'Invalid mode: {mode}')
+        
+        # 统计并排序
         convert_label_cnt = Counter(convert_label)
-        convert_label_cnt_sorted = sorted(convert_label_cnt.items(),key = lambda x:x[1],reverse = True)
-        length = len(convert_label_cnt_sorted)
-        lambda_cm=0.1
-        in_rgb_label=[]
-        in_ir_label=[]
-        v2i = OrderedDict()
-        i2v = OrderedDict()
-
-        length_ratio = 1
-        for i in range(int(length*length_ratio)):
-            key = convert_label_cnt_sorted[i][0] 
-            value = convert_label_cnt_sorted[i][1]
-            # if key[0] == -1 or key[1] == -1:
-            #     continue
-            if key[0] in in_rgb_label or key[1] in in_ir_label:
+        convert_label_sorted = sorted(convert_label_cnt.items(), key=lambda x: x[1], reverse=True)
+        
+        # 贪心匹配（避免一对多）
+        v2i, i2v = OrderedDict(), OrderedDict()
+        matched_rgb, matched_ir = set(), set()
+        
+        for (rgb_id, ir_id), count in convert_label_sorted:
+            if rgb_id in matched_rgb or ir_id in matched_ir:
                 continue
-            in_rgb_label.append(key[0])
-            in_ir_label.append(key[1])
-            v2i[key[0]] = key[1]
-            i2v[key[1]] = key[0]
-            # v2i[key[0]][key[1]] = 1
-            
-        return v2i, i2v # only v2i/i2v is used in scores mode
+            v2i[rgb_id] = ir_id
+            i2v[ir_id] = rgb_id
+            matched_rgb.add(rgb_id)
+            matched_ir.add(ir_id)
+        
+        return v2i, i2v
 
     def extract(self, args, model, dataset):
-        '''
-        Output: BN_features, labels, cls
-        '''
-        # save epoch
+        """
+        提取特征并保存用于匹配
+        """
         model.set_eval()
-        rgb_loader, ir_loader = dataset.get_normal_loader() 
-        with torch.no_grad():
-            
-            rgb_features, rgb_labels, rgb_gt, r2i_cls, rgb_idx = self._extract_feature(model, rgb_loader,'rgb')
-            ir_features, ir_labels, ir_gt, i2r_cls, ir_idx = self._extract_feature(model, ir_loader,'ir')
-
-        # # //match by cls and save features to memory bank
-        self.save(r2i_cls, i2r_cls, rgb_labels, ir_labels, rgb_idx,\
-                 ir_idx, 'scores', rgb_features, ir_features)
+        rgb_loader, ir_loader = dataset.get_normal_loader()
         
+        with torch.no_grad():
+            rgb_features, rgb_labels, _, r2i_cls, rgb_idx = self._extract_feature(model, rgb_loader, 'rgb')
+            ir_features, ir_labels, _, i2r_cls, ir_idx = self._extract_feature(model, ir_loader, 'ir')
+        
+        # 保存用于匹配
+        self.save(r2i_cls, i2r_cls, rgb_labels, ir_labels, rgb_idx, ir_idx, 'scores', 
+                  rgb_features, ir_features)
+    
     def _extract_feature(self, model, loader, modal):
-
-        print('extracting {} features'.format(modal))
-
-        saved_features, saved_labels, saved_cls= None, None, None
-        saved_gts, saved_idx= None, None
+        """
+        提取单个模态的特征
+        Args:
+            model: 模型
+            loader: 数据加载器
+            modal: 'rgb' 或 'ir'
+        Returns:
+            features, labels, gts, cls, idx
+        """
+        print(f'Extracting {modal} features...')
+        
+        saved_features, saved_labels, saved_gts, saved_cls, saved_idx = None, None, None, None, None
+        
         for imgs_list, infos in loader:
-            labels = infos[:,1]
-            idx = infos[:,0]
-            gts = infos[:,-1].to(model.device)
-            if imgs_list.__class__.__name__ != 'list':
-                imgs = imgs_list
-                imgs, labels, idx = \
-                    imgs.to(model.device), labels.to(model.device), idx.to(model.device)
+            labels = infos[:, 1]
+            idx = infos[:, 0]
+            gts = infos[:, -1].to(model.device)
+            
+            # 处理输入图像
+            if not isinstance(imgs_list, list):
+                imgs = imgs_list.to(model.device)
             else:
                 ori_imgs, ca_imgs = imgs_list[0], imgs_list[1]
                 if len(ori_imgs.shape) < 4:
                     ori_imgs = ori_imgs.unsqueeze(0)
                     ca_imgs = ca_imgs.unsqueeze(0)
-
-                imgs = torch.cat((ori_imgs,ca_imgs),dim=0)
-                labels = torch.cat((labels,labels),dim=0)
-                idx = torch.cat((idx,idx),dim=0)
-                gts= torch.cat((gts,gts),dim=0).to(model.device)
-                imgs, labels, idx= \
-                    imgs.to(model.device), labels.to(model.device), idx.to(model.device)
-            _, bn_features = model.model(imgs) # _:gap feature
-
+                imgs = torch.cat((ori_imgs, ca_imgs), dim=0)
+                labels = torch.cat((labels, labels), dim=0)
+                idx = torch.cat((idx, idx), dim=0)
+                gts = torch.cat((gts, gts), dim=0)
+            
+            imgs = imgs.to(model.device)
+            labels = labels.to(model.device)
+            idx = idx.to(model.device)
+            
+            # 特征提取
+            _, bn_features = model.model(imgs)
+            
+            # 跨模态分类
             if modal == 'rgb':
-                cls, l2_features = model.classifier2(bn_features)
+                cls, _ = model.classifier2(bn_features)
             elif modal == 'ir':
-                cls, l2_features = model.classifier1(bn_features)
-            l2_features = l2_features.detach().cpu()
-
-            if saved_features is None: 
-                # saved_features, saved_labels, saved_cls, saved_idx = l2_features, labels, cls, idx
-                saved_features, saved_labels, saved_cls, saved_idx = bn_features, labels, cls, idx
-
-                saved_gts = gts
+                cls, _ = model.classifier1(bn_features)
+            
+            # 累积
+            if saved_features is None:
+                saved_features, saved_labels, saved_cls, saved_idx, saved_gts = \
+                    bn_features, labels, cls, idx, gts
             else:
-                # saved_features = torch.cat((saved_features, l2_features), dim=0)
                 saved_features = torch.cat((saved_features, bn_features), dim=0)
                 saved_labels = torch.cat((saved_labels, labels), dim=0)
                 saved_cls = torch.cat((saved_cls, cls), dim=0)
                 saved_idx = torch.cat((saved_idx, idx), dim=0)
-
                 saved_gts = torch.cat((saved_gts, gts), dim=0)
+        
         return saved_features, saved_labels, saved_gts, saved_cls, saved_idx
