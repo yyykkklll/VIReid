@@ -125,12 +125,6 @@ class Logger:
 class AverageMeter:
     """
     Computes and stores the average and current value
-    
-    Usage:
-        >>> meter = AverageMeter()
-        >>> meter.update(0.5)
-        >>> meter.update(0.7)
-        >>> print(meter.avg)  # 0.6
     """
     def __init__(self):
         self.reset()
@@ -151,12 +145,6 @@ class AverageMeter:
 class MultiItemAverageMeter:
     """
     Computes and stores average for multiple items
-    
-    Usage:
-        >>> meter = MultiItemAverageMeter()
-        >>> meter.update({'loss1': 0.5, 'loss2': 0.3})
-        >>> meter.update({'loss1': 0.7, 'loss2': 0.4})
-        >>> print(meter.get_str())
     """
     def __init__(self):
         self.content = {}
@@ -209,11 +197,6 @@ def eval_regdb(distmat, q_pids, g_pids, max_rank=20):
         q_pids: Query person IDs
         g_pids: Gallery person IDs
         max_rank: Maximum rank for CMC computation
-    
-    Returns:
-        cmc: Cumulative Matching Characteristics
-        mAP: Mean Average Precision
-        mINP: Mean Inverse Negative Penalty
     """
     num_q, num_g = distmat.shape
     
@@ -234,13 +217,13 @@ def eval_regdb(distmat, q_pids, g_pids, max_rank=20):
         # Get query pid
         q_pid = q_pids[q_idx]
         
-        # Remove gallery samples that have the same pid as query
-        order = indices[q_idx]
-        remove = (g_pids[order] == q_pid)
-        keep = np.invert(remove)
+        # [FIX] Removed incorrect filtering of positive samples.
+        # In cross-modal ReID (RegDB), positive matches in the gallery (different modality) are valid.
+        # We should NOT remove g_pids == q_pid.
         
         # Compute CMC
-        raw_cmc = matches[q_idx][keep]
+        raw_cmc = matches[q_idx] # Use all matches without filtering
+        
         if not np.any(raw_cmc):
             continue
         
@@ -275,19 +258,6 @@ def eval_regdb(distmat, q_pids, g_pids, max_rank=20):
 def eval_sysu(distmat, q_pids, g_pids, q_camids, g_camids, max_rank=20):
     """
     Evaluation for SYSU-MM01 dataset
-    
-    Args:
-        distmat: Distance matrix [num_query, num_gallery]
-        q_pids: Query person IDs
-        g_pids: Gallery person IDs
-        q_camids: Query camera IDs
-        g_camids: Gallery camera IDs
-        max_rank: Maximum rank for CMC computation
-    
-    Returns:
-        cmc: Cumulative Matching Characteristics
-        mAP: Mean Average Precision
-        mINP: Mean Inverse Negative Penalty
     """
     num_q, num_g = distmat.shape
     
@@ -348,40 +318,14 @@ def eval_sysu(distmat, q_pids, g_pids, q_camids, g_camids, max_rank=20):
 
 # ============= Loss Utility Functions =============
 def get_loss_annealing_weight(epoch, total_epochs, start_weight=1.0, end_weight=0.5):
-    """
-    Compute annealing weight for loss terms
-    
-    Args:
-        epoch: Current epoch
-        total_epochs: Total training epochs
-        start_weight: Initial weight
-        end_weight: Final weight
-    
-    Returns:
-        weight: Annealed weight
-    """
     if epoch >= total_epochs:
         return end_weight
-    
     progress = epoch / total_epochs
     weight = start_weight - (start_weight - end_weight) * progress
-    
     return weight
 
 
 def compute_loss_warmup_weight(epoch, warmup_epochs, target_weight=1.0):
-    """
-    Compute warmup weight for loss terms
-    
-    Args:
-        epoch: Current epoch
-        warmup_epochs: Warmup epochs
-        target_weight: Target weight after warmup
-    
-    Returns:
-        weight: Warmup weight
-    """
     if epoch >= warmup_epochs:
         return target_weight
-    
     return target_weight * (epoch / warmup_epochs)

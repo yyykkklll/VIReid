@@ -4,10 +4,12 @@ import torch
 def weights_init_kaiming(m):
     if isinstance(m, nn.Linear):
         nn.init.kaiming_normal_(m.weight, a=0, mode="fan_out")
-        nn.init.constant_(m.bias, val=0.0)
+        # [FIX] 增加判断：只有当 bias 存在时才初始化
+        if m.bias is not None:
+            nn.init.constant_(m.bias, val=0.0)
     elif isinstance(m, nn.Conv2d):
         nn.init.kaiming_normal_(m.weight, a=0, mode="fan_in")
-        if m.bias:
+        if m.bias is not None:
             nn.init.constant_(m.bias, val=0.0)
     elif isinstance(m, nn.BatchNorm1d) or isinstance(m, nn.InstanceNorm1d):
         if m.affine:
@@ -17,11 +19,11 @@ def weights_init_kaiming(m):
 def weights_init(m):
     if isinstance(m, nn.Linear):
         nn.init.normal_(m.weight, std=1e-3)
-        if m.bias:
+        if m.bias is not None:
             nn.init.constant_(m.bias, val=0.0)
 
 class Normalize(nn.Module):
-    def __init__(self,power = 2):
+    def __init__(self, power=2):
         super(Normalize, self).__init__()
         self.power = power
 
@@ -63,14 +65,14 @@ class GeneralizedMeanPoolingP(GeneralizedMeanPooling):
         self.p = nn.Parameter(torch.ones(1) * norm)
 
 class Text_Classifier(nn.Module):
-    def __init__(self,args):
-        super(Text_Classifier, self, ).__init__()
+    def __init__(self, args):
+        super(Text_Classifier, self).__init__()
         self.num_classes = args.num_classes
         self.BN = nn.BatchNorm1d(1024)
         self.BN.apply(weights_init_kaiming)
 
         self.classifier = nn.Linear(1024, self.num_classes, bias=False)
-        self.classifier.apply(weights_init)
+        self.classifier.apply(weights_init_kaiming)
 
         self.l2_norm = Normalize(2)
 
@@ -81,6 +83,7 @@ class Text_Classifier(nn.Module):
             return cls_score
         else:
             self.l2_norm(bn_features)
+
 class Image_Classifier(nn.Module):
     '''
     **Output: x_score, x_l2**
@@ -88,13 +91,13 @@ class Image_Classifier(nn.Module):
     def __init__(self, args):
         super(Image_Classifier, self).__init__()
         self.num_classes = args.num_classes
-        self.classifier = nn.Linear(2048, args.num_classes, bias = False)
-        self.classifier.apply(weights_init)
+        # 这里定义了 bias=False
+        self.classifier = nn.Linear(2048, args.num_classes, bias=False)
+        # 使用修复后的 kaiming 初始化
+        self.classifier.apply(weights_init_kaiming)
 
         self.l2_norm = Normalize(2)
 
-    def forward(self,x_bn):
+    def forward(self, x_bn):
         x_score = self.classifier(x_bn)
         return x_score, self.l2_norm(x_bn)
-
-

@@ -9,6 +9,7 @@ Optimizations:
 5. Automatic device detection (no manual GPU selection needed)
 6. Fixed learning rate scheduler step timing
 7. Better checkpoint management
+8. BUG FIX: Force enable gradient if testing fails
 """
 
 import os
@@ -142,6 +143,8 @@ def main(args):
                 
                 except Exception as e:
                     logger(f"\n⚠️  Testing failed: {str(e)}")
+                    # FIX: 强制恢复梯度计算，防止后续训练 epoch 崩溃
+                    torch.set_grad_enabled(True)
                     logger("Continuing training...")
                 
                 logger("="*80)
@@ -223,6 +226,8 @@ def main(args):
             
             except Exception as e:
                 logger(f"\n⚠️  Testing failed: {str(e)}")
+                # FIX: 强制恢复梯度计算
+                torch.set_grad_enabled(True)
                 logger("Continuing training...")
             
             logger("="*80)
