@@ -45,6 +45,7 @@ htmlcov/
 
 # Logs
 *.log
+*.pth
 
 # Additional virtual envs
 .venv/
