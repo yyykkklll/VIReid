@@ -400,9 +400,11 @@ def _compute_phase2_loss(model, meter, bn_features, gap_features, rgb_features, 
     
     # ==================== Diffusion Bridge ====================
     if model.use_diffusion:
+        f_v_input = bn_features[:BATCH_SIZE] 
+        f_r_input = bn_features[CHUNK_SIZE : CHUNK_SIZE + BATCH_SIZE]
         diff_loss_dict, f_r_fake, f_v_fake, unc_v, unc_r = model.diffusion(
-            f_v=rgb_features[:BATCH_SIZE],
-            f_r=ir_features[:BATCH_SIZE],
+            f_v=f_v_input,  
+            f_r=f_r_input, 
             labels_v=rgb_ids[:BATCH_SIZE],
             labels_r=ir_ids[:BATCH_SIZE],
             mode='train'
@@ -420,8 +422,8 @@ def _compute_phase2_loss(model, meter, bn_features, gap_features, rgb_features, 
         # Memory bank update
         if epoch >= args.stage1_epoch:
             with torch.no_grad():
-                recon_loss_v = F.mse_loss(f_v_fake, rgb_features[:BATCH_SIZE], reduction='none').mean(dim=1)
-                recon_loss_r = F.mse_loss(f_r_fake, ir_features[:BATCH_SIZE], reduction='none').mean(dim=1)
+                recon_loss_v = F.mse_loss(f_v_fake, f_v_input, reduction='none').mean(dim=1)
+                recon_loss_r = F.mse_loss(f_r_fake, f_r_input, reduction='none').mean(dim=1)
                 
                 quality_v = 1.0 / (1.0 + recon_loss_v)
                 quality_r = 1.0 / (1.0 + recon_loss_r)
@@ -432,7 +434,7 @@ def _compute_phase2_loss(model, meter, bn_features, gap_features, rgb_features, 
                 dynamic_threshold = get_dynamic_threshold(epoch, args.stage1_epoch)
                 
                 model.diffusion.memory_bank.update(
-                    keys=rgb_features[:BATCH_SIZE].detach(),
+                    keys=f_v_input.detach(),
                     values=f_r_fake.detach(),
                     labels=rgb_ids[:BATCH_SIZE],
                     quality_scores=quality_v,
@@ -441,7 +443,7 @@ def _compute_phase2_loss(model, meter, bn_features, gap_features, rgb_features, 
                 )
                 
                 model.diffusion.memory_bank.update(
-                    keys=ir_features[:BATCH_SIZE].detach(),
+                    keys=f_r_input.detach(),
                     values=f_v_fake.detach(),
                     labels=ir_ids[:BATCH_SIZE],
                     quality_scores=quality_r,
@@ -456,14 +458,19 @@ def _compute_phase2_loss(model, meter, bn_features, gap_features, rgb_features, 
         if not torch.isnan(rel_v2r_raw).any():
             rel_v2r = rel_v2r_raw
         
-        # Fusion with CCPA reliability
-        if rel_mask_v is not None and use_ccpa:
+        ccpa_active = False
+        if use_ccpa and hasattr(cma, 'ccpa'):
+            ccpa_active = cma.ccpa.pseudo_ready and not cma.ccpa.use_fallback
+
+        if rel_mask_v is not None and ccpa_active:
             alpha = 0.5
             rel_v2r = alpha * rel_v2r + (1 - alpha) * rel_mask_v[:BATCH_SIZE]
             rel_v2r = 0.05 + 0.95 * torch.sigmoid(10 * (rel_v2r - 0.5))
+        else:
+            pass
     
     # ==================== CCPA Loss ====================
-    if use_ccpa and not is_warmup and rel_mask_v is not None:
+    if use_ccpa and not is_warmup and rel_mask_v is not None and ccpa_active:
         ce_none = nn.CrossEntropyLoss(reduction='none')
         loss_ccpa_v = (ce_none(r2i_cls[:BATCH_SIZE], ir_ids[:BATCH_SIZE]) * rel_mask_v[:BATCH_SIZE]).mean()
         loss_ccpa = loss_ccpa_v
@@ -488,8 +495,8 @@ def _compute_phase2_loss(model, meter, bn_features, gap_features, rgb_features, 
     # ==================== CMA Memory Alignment ====================
     if not is_warmup:
         cma.update_memory(bn_features[:CHUNK_SIZE], bn_features[CHUNK_SIZE:], rgb_ids, ir_ids)
-        cma.update_prototypes(rgb_features[:CHUNK_SIZE], rgb_ids, 'v')
-        cma.update_prototypes(ir_features, ir_ids, 'r')
+        cma.update_prototypes(bn_features[:CHUNK_SIZE], rgb_ids, 'v')
+        cma.update_prototypes(bn_features[CHUNK_SIZE:], ir_ids, 'r')   
         
         cma_loss = _compute_cma_loss(
             model, cma, dtd_r2r[:BATCH_SIZE], dtd_i2i[:BATCH_SIZE],

@@ -4,7 +4,7 @@
 # FIX: Adjusted Diffusion params to prevent backbone collapse
 
 # Path to your best Phase 1 checkpoint
-CHECKPOINT="/home/ykl/vireid/saved_sysu_resnet/save/models/checkpoint.pth"
+CHECKPOINT="/root/vireid/checkpoint.pth"
 
 # ==================== Configuration ====================
 DATASET="sysu"
@@ -19,7 +19,7 @@ LR=0.00035
 
 # ==================== CCPA Settings ====================
 # Delay CCPA start to let Diffusion warm up.
-CCPA_START_EPOCH=15
+CCPA_START_EPOCH=4
 USE_CCPA=true
 CCPA_WEIGHT=0.5
 CCPA_THRESHOLD_MODE="hybrid"

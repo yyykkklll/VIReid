@@ -67,7 +67,7 @@ class CCPA(nn.Module):
         raw_qual_v2r = F.cosine_similarity(pseudo_r, prototypes_r, dim=1)
         
         # 检查是否出现崩塌
-        if raw_qual_r2v.mean() < 0.1 or raw_qual_v2r.mean() < 0.1:
+        if (raw_qual_r2v.mean() < 0.05 or raw_qual_v2r.mean() < 0.05) and self.current_epoch > 5:
             print(f"⚠️ WARNING: CCPA Quality Collapse Detected!")
             print(f"   Raw V→R: {raw_qual_v2r.mean():.4f} | Raw R→V: {raw_qual_r2v.mean():.4f}")
             # 使用fallback机制
