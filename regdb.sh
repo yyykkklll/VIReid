@@ -1,44 +1,31 @@
 #!/bin/bash
-# sysu.sh
-# Optimized for PRUD Framework (High Weight, Smart Warmup)
+# regdb.sh
+# Optimized for PRUD (Faster Convergence for Small Dataset)
 
-# Clean up cache
 find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
 find . -type f -name "*.pyc" -delete 2>/dev/null || true
 
-# ==================== Configuration ====================
-DATASET="sysu"
+DATASET="regdb"
 DEVICE=0
+# RegDB doesn't use search-mode/gall-mode same as SYSU, but keeping args is safe
 SEARCH_MODE="all"
 GALL_MODE="single"
 DATA_PATH="./datasets/"
 
-# ==================== Training Settings ====================
-# [Phase 1] Standard Supervised Pre-training
-STAGE1_EPOCH=50
-
-# [Phase 2] Weakly Supervised Learning (PRUD)
-STAGE2_EPOCH=120
-
-# Global Learning Rate
+# Training Settings (Shortened for Small Dataset)
+STAGE1_EPOCH=40
+STAGE2_EPOCH=80
 LR=0.00035
 
-# ==================== PRUD / CCPA Settings ====================
-USE_CCPA=true  # Activates PRUD logic in current code
-
-# 🔧 [OPTIMIZED] Smart Warmup
-# Phase 1 ends at 50. Phase 2 starts at 51.
-# We let Diffusion warm up for 10 epochs (51-60). PRUD starts at 60.
-CCPA_START_EPOCH=60
-
-# 🔧 [OPTIMIZED] High Confidence Weight
-# PRUD has internal confidence gating, so we can use a higher weight (0.8)
-# to drive stronger learning from reliable prototypes.
-CCPA_WEIGHT=0.8 
+# PRUD Settings
+USE_CCPA=true
+# 🔧 Start earlier: Stage 1 (40) + 10 Warmup = 50
+CCPA_START_EPOCH=50
+CCPA_WEIGHT=0.8
 CCPA_THRESHOLD_MODE="hybrid"
 PSEUDO_MOMENTUM=0.90
 
-# ==================== Batch Settings ====================
+# Batch Settings
 BATCH_PIDNUM=12
 PID_NUMSAMPLE=4
 TRI_WEIGHT=1.0
@@ -46,46 +33,40 @@ WEAK_WEIGHT=0.5
 SIGMA=0.1
 TEMPERATURE=0.07
 
-# ==================== Diffusion Settings ====================
+# Diffusion Settings
 USE_DIFFUSION=true
 FEATURE_DIFFUSION_STEPS=5
 SEMANTIC_DIFFUSION_STEPS=10
 DIFFUSION_HIDDEN=1024
-
-# 🔴 [STABILITY FIX] 
-DIFFUSION_WEIGHT=0.1     # Low weight to protect backbone
-DIFFUSION_LR=0.0001      # Safe LR for diffusion convergence
-
-# Cross-Attention
+DIFFUSION_WEIGHT=0.1
+DIFFUSION_LR=0.0001
 CROSS_ATTN_HEADS=8
 CROSS_ATTN_DROPOUT=0.15
 
-# ==================== Reliability Gating ====================
+# Memory Bank
 USE_MEMORY_BANK=true
 MEMORY_SIZE_PER_CLASS=5
 RAGM_TEMPERATURE=0.12
 
-# ==================== Execute ====================
 echo "=========================================="
-echo "SYSU-MM01 FULL TRAINING (PRUD OPTIMIZED)"
-echo "  - Phase 1: 50 Epochs"
-echo "  - Phase 2: 120 Epochs"
-echo "  - PRUD Start: Epoch $CCPA_START_EPOCH (10 Epochs Warmup)"
-echo "  - PRUD Weight: $CCPA_WEIGHT"
+echo "RegDB FULL TRAINING (PRUD OPTIMIZED)"
+echo "  - Phase 1: 40 Epochs"
+echo "  - Phase 2: 80 Epochs"
+echo "  - PRUD Start: Epoch $CCPA_START_EPOCH"
+echo "  - Trial: 1"
 echo "=========================================="
 
 mkdir -p ./logs
 export TMPDIR=$(pwd)/local_tmp
-LOG_FILE="./logs/sysu_prud_$(date +%Y%m%d_%H%M%S).log"
+LOG_FILE="./logs/regdb_prud_$(date +%Y%m%d_%H%M%S).log"
 
 python main.py \
     --dataset $DATASET \
     --device $DEVICE \
     --arch resnet \
     --mode train \
+    --trial 1 \
     --debug wsl \
-    --search-mode $SEARCH_MODE \
-    --gall-mode $GALL_MODE \
     --data-path $DATA_PATH \
     \
     --lr $LR \

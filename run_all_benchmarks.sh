@@ -1,5 +1,6 @@
 #!/bin/bash
 # run_all_benchmarks.sh
+# Optimized for PRUD Framework (High Weight, Smart Warmup)
 
 # ==================== 全局设置 ====================
 DEVICE=0
@@ -25,14 +26,14 @@ print_header() {
     echo ""
 }
 
-# ==================== 任务 1: SYSU-MM01 ====================
+# ==================== 任务 1: SYSU-MM01 (大数据集) ====================
 clean_cache
 DATASET="sysu"
 print_header $DATASET
 
-LOG_FILE="$SAVE_DIR/${DATASET}_train_$(date +%Y%m%d_%H%M%S).log"
+LOG_FILE="$SAVE_DIR/${DATASET}_prud_$(date +%Y%m%d_%H%M%S).log"
 
-# SYSU 配置: 标准大数据集策略
+# 策略: 50轮预训练 + 10轮扩散热身 + 110轮PRUD强蒸馏
 python main.py \
     --dataset $DATASET \
     --data-path $DATA_PATH \
@@ -48,7 +49,7 @@ python main.py \
     \
     --use-diffusion \
     --feature-diffusion-steps 5 \
-    --semantic-diffusion-steps 10 \
+    --semantic-diffusion-steps 15 \
     --diffusion-hidden 1024 \
     --diffusion-weight 0.1 \
     --diffusion-lr 0.0001 \
@@ -57,22 +58,23 @@ python main.py \
     --memory-size-per-class 5 \
     \
     --use-cycle-consistency \
-    --ccpa-weight 0.5 \
-    --ccpa-start-epoch 65 \
+    --ccpa-weight 0.8 \
+    --ccpa-start-epoch 60 \
     --ccpa-threshold-mode hybrid \
+    --pseudo-momentum 0.9 \
     2>&1 | tee $LOG_FILE
 
 echo "✅ $DATASET Training Completed."
-sleep 10  # 休息一下让显存释放
+sleep 10  # 释放显存
 
-# ==================== 任务 2: LLCM ====================
+# ==================== 任务 2: LLCM (大数据集) ====================
 clean_cache
 DATASET="llcm"
 print_header $DATASET
 
-LOG_FILE="$SAVE_DIR/${DATASET}_train_$(date +%Y%m%d_%H%M%S).log"
+LOG_FILE="$SAVE_DIR/${DATASET}_prud_$(date +%Y%m%d_%H%M%S).log"
 
-# LLCM 配置: 与 SYSU 类似，LLCM 也是大数据集，使用相同的稳健参数
+# 策略: 同 SYSU，保持稳健的大数据集参数
 python main.py \
     --dataset $DATASET \
     --data-path $DATA_PATH \
@@ -88,7 +90,7 @@ python main.py \
     \
     --use-diffusion \
     --feature-diffusion-steps 5 \
-    --semantic-diffusion-steps 10 \
+    --semantic-diffusion-steps 15 \
     --diffusion-hidden 1024 \
     --diffusion-weight 0.1 \
     --diffusion-lr 0.0001 \
@@ -97,25 +99,24 @@ python main.py \
     --memory-size-per-class 5 \
     \
     --use-cycle-consistency \
-    --ccpa-weight 0.5 \
-    --ccpa-start-epoch 65 \
+    --ccpa-weight 0.8 \
+    --ccpa-start-epoch 60 \
     --ccpa-threshold-mode hybrid \
+    --pseudo-momentum 0.9 \
     2>&1 | tee $LOG_FILE
 
 echo "✅ $DATASET Training Completed."
 sleep 10
 
-# ==================== 任务 3: RegDB ====================
+# ==================== 任务 3: RegDB (小数据集) ====================
 clean_cache
 DATASET="regdb"
 print_header $DATASET
 
-LOG_FILE="$SAVE_DIR/${DATASET}_train_$(date +%Y%m%d_%H%M%S).log"
+LOG_FILE="$SAVE_DIR/${DATASET}_prud_$(date +%Y%m%d_%H%M%S).log"
 
-# RegDB 配置: 小数据集策略
-# 1. 总 Epoch 缩短 (40 + 80 = 120)
-# 2. CCPA 提前介入 (60)，因为收敛较快
-# 3. Batch Size 保持不变
+# 策略: 40轮预训练 + 10轮扩散热身 + 70轮PRUD强蒸馏
+# RegDB 收敛快，缩短周期
 python main.py \
     --dataset $DATASET \
     --data-path $DATA_PATH \
@@ -139,9 +140,10 @@ python main.py \
     --memory-size-per-class 5 \
     \
     --use-cycle-consistency \
-    --ccpa-weight 0.5 \
-    --ccpa-start-epoch 55 \
+    --ccpa-weight 0.8 \
+    --ccpa-start-epoch 50 \
     --ccpa-threshold-mode hybrid \
+    --pseudo-momentum 0.9 \
     2>&1 | tee $LOG_FILE
 
 echo "✅ $DATASET Training Completed."

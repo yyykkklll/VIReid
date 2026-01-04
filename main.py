@@ -20,7 +20,7 @@ def main(args):
     
     # Patience settings
     phase1_patience = 12
-    phase2_patience = 30
+    phase2_patience = 40
     max_patience = phase1_patience
     
     # Initialize logging (file-only, no terminal echo for verbose logs)

@@ -41,7 +41,7 @@ def get_terminal_width():
 
 
 def train(args, model: Model, dataset, epoch, cma: CMA, logger, enable_phase1=False):
-    """Main training function with integrated diagnostics"""
+    """Main training function with integrated diagnostics (PRUD Enabled)"""
     
     # ==================== Epoch Initialization ====================
     cma.set_epoch(epoch)
@@ -49,7 +49,7 @@ def train(args, model: Model, dataset, epoch, cma: CMA, logger, enable_phase1=Fa
         model.diffusion.set_epoch(epoch)
     
     # Phase 2 preparation
-    use_ccpa = (not enable_phase1 and args.use_cycle_consistency and epoch >= args.ccpa_start_epoch)
+    use_prud = (not enable_phase1 and args.use_cycle_consistency and epoch >= args.ccpa_start_epoch)
     match_info = None
     
     if not enable_phase1:
@@ -58,19 +58,19 @@ def train(args, model: Model, dataset, epoch, cma: CMA, logger, enable_phase1=Fa
             n_common = len(match_info['common_rgb'])
             n_specific = len(match_info['specific_rgb'])
             n_remain = len(match_info['remain_rgb'])
-            
-            # Log to file only
             logger(f"\n[Matching] Common: {n_common} | Specific: {n_specific} | Remain: {n_remain}")
     
-    if use_ccpa:
+    if use_prud:
         if epoch == args.ccpa_start_epoch:
-            msg = f"✓ CCPA Activated (Mode: {args.ccpa_threshold_mode})"
-            print(msg)  # Terminal
-            logger(msg)  # File
+            msg = f"✓ PRUD Activated (Prototype-Rectified Distillation)"
+            print(msg)
+            logger(msg)
         
         if cma.ragm_module is None:
             cma.set_ragm_module(model.ragm)
-        cma.prepare_cycle_matching(model.diffusion)
+            
+        # Prepare Rectified Prototypes using Diffusion
+        cma.prepare_rectified_prototypes(model.diffusion)
     
     # ==================== Training Loop ====================
     model.set_train()
@@ -82,20 +82,17 @@ def train(args, model: Model, dataset, epoch, cma: CMA, logger, enable_phase1=Fa
     
     phase_name = "Phase 1" if enable_phase1 else "Phase 2"
     
-    # Adaptive progress bar width (FIX: actually get terminal width)
     term_width = get_terminal_width()
-    # Reserve space for description and stats
     ncols = max(80, min(term_width - 5, 150))
     
-    # CRITICAL FIX: Use file=sys.stdout to ensure output to terminal
     pbar = tqdm(
         enumerate(zip(rgb_loader, ir_loader)),
         total=min(len(rgb_loader), len(ir_loader)),
         desc=f'Epoch {epoch+1:03d} {phase_name}',
         unit='batch',
         ncols=ncols,
-        file=sys.stdout,  # Explicitly use stdout
-        dynamic_ncols=True  # Allow dynamic width adjustment
+        file=sys.stdout,
+        dynamic_ncols=True
     )
     
     nan_counter = 0
@@ -137,18 +134,16 @@ def train(args, model: Model, dataset, epoch, cma: CMA, logger, enable_phase1=Fa
             )
             optimizer = model.optimizer_phase1
         else:
-            # CCPA reliability masks
-            rel_mask_v, rel_mask_r = None, None
-            if use_ccpa:
-                rel_mask_v, rel_mask_r, _, _ = cma.compute_cycle_consistent_matching(
-                    rgb_features, ir_features, rgb_ids, ir_ids
-                )
+            # Get Confidence Weights from PRUD
+            conf_v, conf_r = None, None
+            if use_prud:
+                conf_v, conf_r = cma.get_distillation_weights(rgb_ids, ir_ids)
             
             total_loss, nan_counter = _compute_phase2_loss(
                 model, meter, bn_features, gap_features, rgb_features, ir_features,
                 rgbcls_out, ircls_out, r2r_cls, i2i_cls, r2i_cls, i2r_cls,
                 rgb_ids, ir_ids, cma, match_info, epoch, args, nan_counter,
-                rel_mask_v, rel_mask_r, use_ccpa, BATCH_SIZE, CHUNK_SIZE
+                conf_v, conf_r, use_prud, BATCH_SIZE, CHUNK_SIZE
             )
             optimizer = model.optimizer_phase2
         
@@ -159,8 +154,7 @@ def train(args, model: Model, dataset, epoch, cma: CMA, logger, enable_phase1=Fa
         if torch.isnan(total_loss) or torch.isinf(total_loss):
             nan_counter += 1
             if nan_counter < 10:
-                warning_msg = f"⚠ WARNING: NaN loss (Count {nan_counter}). Skipping batch."
-                logger(warning_msg)  # File only
+                logger(f"⚠ WARNING: NaN loss (Count {nan_counter}). Skipping batch.")
                 continue
             else:
                 error_msg = "❌ ERROR: Too many NaN losses. Breaking."
@@ -171,11 +165,9 @@ def train(args, model: Model, dataset, epoch, cma: CMA, logger, enable_phase1=Fa
         optimizer.zero_grad()
         total_loss.backward()
 
-        # 分模块梯度裁剪（扩散模块使用更严格的限制）
         if model.use_diffusion:
             torch.nn.utils.clip_grad_norm_(model.diffusion.parameters(), max_norm=1.0)
 
-        # 其他模块使用标准裁剪
         backbone_params = list(model.model.parameters())
         if hasattr(model, 'classifier1'):
             backbone_params += list(model.classifier1.parameters())
@@ -184,89 +176,58 @@ def train(args, model: Model, dataset, epoch, cma: CMA, logger, enable_phase1=Fa
         grad_norm = torch.nn.utils.clip_grad_norm_(backbone_params, max_norm=5.0)
         optimizer.step()
 
-        # Update progress bar (only loss)
         pbar.set_postfix({'loss': f'{total_loss.item():.4f}'})
         
-        # ==================== Periodic Diagnostics (File Only) ====================
+        # ==================== Periodic Diagnostics ====================
         if not enable_phase1 and (iter_idx + 1) % 50 == 0:
             _log_diagnostics(
                 logger, model, cma, args, epoch, iter_idx,
-                grad_norm, optimizer, nan_counter, use_ccpa
+                grad_norm, optimizer, nan_counter, use_prud
             )
     
     pbar.close()
     
     # ==================== Epoch Summary ====================
-    _log_epoch_summary(logger, model, cma, args, meter, epoch, enable_phase1, use_ccpa)
+    _log_epoch_summary(logger, model, cma, args, meter, epoch, enable_phase1, use_prud)
     
     return meter.get_val(), meter.get_str()
 
 
-def _log_diagnostics(logger, model, cma, args, epoch, iter_idx, grad_norm, optimizer, nan_counter, use_ccpa):
-    """
-    Centralized diagnostics logging (FILE ONLY - no terminal output).
-    """
+def _log_diagnostics(logger, model, cma, args, epoch, iter_idx, grad_norm, optimizer, nan_counter, use_prud):
+    """Centralized diagnostics logging"""
     log_lines = []
     log_lines.append(f"\n{'='*80}")
     log_lines.append(f"🔍 Diagnostic Snapshot | Epoch {epoch+1} | Iteration {iter_idx+1}")
     log_lines.append(f"{'='*80}")
     
-    # ==================== Training Dynamics ====================
+    # Training Dynamics
     log_lines.append(f"\n📊 Training Dynamics:")
     log_lines.append(f"  ├─ Gradient Norm: {grad_norm:.4f}")
     log_lines.append(f"  ├─ Learning Rate: {optimizer.param_groups[0]['lr']:.2e}")
     log_lines.append(f"  └─ NaN Counter: {nan_counter}")
     
-    # ==================== Loss Weights ====================
-    current_diff_weight = get_diffusion_weight(epoch, args.stage1_epoch, 10, args.diffusion_weight)
-    current_threshold = get_dynamic_threshold(epoch, args.stage1_epoch)
-    
-    log_lines.append(f"\n⚖️ Loss Weights & Schedulers:")
-    log_lines.append(f"  ├─ Diffusion Weight: {current_diff_weight:.4f} (Target: {args.diffusion_weight:.4f})")
-    log_lines.append(f"  ├─ Memory Threshold: {current_threshold:.3f}")
-    
-    if use_ccpa:
-        log_lines.append(f"  └─ CCPA Weight: {args.ccpa_weight:.4f}")
-    
-    # ==================== RAGM Diagnostics ====================
+    # RAGM Diagnostics
     if hasattr(model, 'ragm'):
         ragm_diag = model.ragm.get_diagnostics()
         log_lines.append(f"\n{ragm_diag}")
     
-    # ==================== Prototype Guidance ====================
-    if model.use_diffusion and hasattr(model.diffusion, 'proto_guidance'):
-        proto_diag = model.diffusion.proto_guidance.get_diagnostics()
-        log_lines.append(f"\n{proto_diag}")
-    
-    # ==================== Diffusion Bridge ====================
+    # Diffusion Bridge
     if model.use_diffusion and hasattr(model.diffusion, 'get_detailed_diagnostics'):
         diffusion_diag = model.diffusion.get_detailed_diagnostics()
         log_lines.append(f"\n{diffusion_diag}")
     
-    # ==================== Memory Bank ====================
-    if model.use_diffusion and hasattr(model.diffusion, 'memory_bank'):
-        mem_diag = model.diffusion.memory_bank.get_detailed_diagnostics(current_threshold)
-        log_lines.append(f"\n{mem_diag}")
-    
-    # ==================== CCPA Status ====================
-    if use_ccpa and hasattr(cma, 'ccpa'):
-        ccpa_stats = cma.ccpa.get_pseudo_quality_info()
-        log_lines.append(f"\n🔄 CCPA (Cycle-Consistent Pseudo Assignment):")
-        log_lines.append(f"  ├─ Status: {'✓ Active' if ccpa_stats['pseudo_ready'] else '⏳ Preparing'}")
-        log_lines.append(f"  ├─ Proto Quality (V→R): {ccpa_stats['quality_v2r']:.4f}")
-        log_lines.append(f"  ├─ Proto Quality (R→V): {ccpa_stats['quality_r2v']:.4f}")
-        log_lines.append(f"  └─ Fallback Mode: {ccpa_stats['use_fallback']}")
+    # PRUD Status
+    if use_prud and hasattr(cma, 'prud'):
+        if hasattr(cma.prud, 'get_detailed_diagnostics'):
+            prud_diag = cma.prud.get_detailed_diagnostics()
+            log_lines.append(f"\n{prud_diag}")
     
     log_lines.append(f"{'='*80}\n")
-    
-    # Write to logger (FILE ONLY)
     logger('\n'.join(log_lines))
 
 
-def _log_epoch_summary(logger, model, cma, args, meter, epoch, enable_phase1, use_ccpa):
-    """
-    Epoch-level summary (FILE ONLY).
-    """
+def _log_epoch_summary(logger, model, cma, args, meter, epoch, enable_phase1, use_prud):
+    """Epoch-level summary"""
     avg_losses = meter.get_avg()
     lr = model.optimizer_phase1.param_groups[0]['lr'] if enable_phase1 else model.optimizer_phase2.param_groups[0]['lr']
     phase_tag = "P1" if enable_phase1 else "P2"
@@ -280,7 +241,7 @@ def _log_epoch_summary(logger, model, cma, args, meter, epoch, enable_phase1, us
     
     # Loss Breakdown
     loss_details = []
-    possible_keys = ['p1_id', 'p1_tri', 'p2_id', 'tri', 'diff', 'weight_reg', 'ccpa', 'cross', 'weak', 'cma']
+    possible_keys = ['p1_id', 'p1_tri', 'p2_id', 'tri', 'diff', 'weight_reg', 'prud', 'cross', 'weak', 'cma']
     for key in possible_keys:
         if key in avg_losses:
             loss_details.append(f"  - {key.upper()}: {avg_losses[key]:.4f}")
@@ -293,23 +254,13 @@ def _log_epoch_summary(logger, model, cma, args, meter, epoch, enable_phase1, us
     if not enable_phase1 and model.use_diffusion and hasattr(model.diffusion, 'memory_bank'):
         mem_stats = model.diffusion.memory_bank.get_statistics()
         curr_thresh = get_dynamic_threshold(epoch, args.stage1_epoch)
-        
         log_lines.append(f"\n💾 Memory Bank Summary (Threshold: {curr_thresh:.2f}):")
         log_lines.append(f"  ├─ Occupancy: Vis {mem_stats['occupied_classes_v']}/{args.num_classes} | IR {mem_stats['occupied_classes_r']}/{args.num_classes}")
         log_lines.append(f"  ├─ Avg Quality: Vis {mem_stats['avg_quality_v']:.3f} | IR {mem_stats['avg_quality_r']:.3f}")
-        log_lines.append(f"  ├─ Epoch Updates: Vis +{mem_stats['updates_v']} | IR +{mem_stats['updates_r']}")
-        log_lines.append(f"  └─ Rejected: Vis {mem_stats['rejected_v']} | IR {mem_stats['rejected_r']}")
-    
-    # CCPA Summary
-    if not enable_phase1 and use_ccpa and hasattr(cma, 'ccpa'):
-        ccpa_stats = cma.ccpa.get_pseudo_quality_info()
-        log_lines.append(f"\n🔄 CCPA Summary:")
-        log_lines.append(f"  ├─ Proto Quality: V→R {ccpa_stats['quality_v2r']:.3f} | R→V {ccpa_stats['quality_r2v']:.3f}")
-        log_lines.append(f"  └─ State: {'Ready' if ccpa_stats['pseudo_ready'] else 'Not Ready'} | Fallback: {ccpa_stats['use_fallback']}")
     
     log_lines.append(f"{'='*80}\n")
-    
     logger('\n'.join(log_lines))
+
 
 # ==================== Helper Functions ====================
 
@@ -318,9 +269,7 @@ def _prepare_matching(args, model, dataset, cma):
     cma.extract(args, model, dataset)
     r2i_pair, i2r_pair = cma.get_label()
     
-    # Compute association masks
     common_dict, specific_dict, remain_dict = {}, {}, {}
-    
     for r, i in r2i_pair.items():
         if i in i2r_pair and i2r_pair[i] == r:
             common_dict[r] = i
@@ -328,16 +277,14 @@ def _prepare_matching(args, model, dataset, cma):
             specific_dict[r] = i
         else:
             remain_dict[r] = i
-    
+            
     for i, r in i2r_pair.items():
-        if (r, i) in common_dict.items():
-            continue
+        if (r, i) in common_dict.items(): continue
         if r not in r2i_pair.values() and i not in r2i_pair:
             specific_dict[r] = i
         else:
             remain_dict[r] = i
-    
-    # Build masks
+            
     device = model.device
     num_classes = args.num_classes
     
@@ -345,15 +292,9 @@ def _prepare_matching(args, model, dataset, cma):
     specific_rm = torch.zeros((num_classes, num_classes), device=device)
     remain_rm = torch.zeros((num_classes, num_classes), device=device)
     
-    for r, i in common_dict.items():
-        common_rm[r, i] = 1
-    
-    for r, i in specific_dict.items():
-        specific_rm[r, i] = 1
-    
-    for r, i in remain_dict.items():
-        remain_rm[r, i] = 1
-    
+    for r, i in common_dict.items(): common_rm[r, i] = 1
+    for r, i in specific_dict.items(): specific_rm[r, i] = 1
+    for r, i in remain_dict.items(): remain_rm[r, i] = 1
     specific_rm += common_rm
     
     return {
@@ -372,7 +313,6 @@ def _compute_phase1_loss(model, meter, r2r_cls, i2i_cls, rgb_feat, ir_feat, rgb_
     """Standard supervised loss"""
     loss_id = model.pid_criterion(r2r_cls, rgb_ids) + model.pid_criterion(i2i_cls, ir_ids)
     loss_tri = (model.tri_criterion(rgb_feat, rgb_ids) + model.tri_criterion(ir_feat, ir_ids)) * args.tri_weight
-    
     meter.update({'p1_id': loss_id.data, 'p1_tri': loss_tri.data})
     return loss_id + loss_tri
 
@@ -380,7 +320,7 @@ def _compute_phase1_loss(model, meter, r2r_cls, i2i_cls, rgb_feat, ir_feat, rgb_
 def _compute_phase2_loss(model, meter, bn_features, gap_features, rgb_features, ir_features,
                         rgbcls_out, ircls_out, r2r_cls, i2i_cls, r2i_cls, i2r_cls,
                         rgb_ids, ir_ids, cma, match_info, epoch, args, nan_counter,
-                        rel_mask_v, rel_mask_r, use_ccpa, BATCH_SIZE, CHUNK_SIZE):
+                        conf_v, conf_r, use_prud, BATCH_SIZE, CHUNK_SIZE):
     
     if args.debug == 'baseline':
         return _compute_phase1_loss(model, meter, r2r_cls, i2i_cls, rgb_features, ir_features, rgb_ids, ir_ids, args), nan_counter
@@ -424,61 +364,42 @@ def _compute_phase2_loss(model, meter, bn_features, gap_features, rgb_features, 
             with torch.no_grad():
                 recon_loss_v = F.mse_loss(f_v_fake, f_v_input, reduction='none').mean(dim=1)
                 recon_loss_r = F.mse_loss(f_r_fake, f_r_input, reduction='none').mean(dim=1)
-                
-                quality_v = 1.0 / (1.0 + recon_loss_v)
-                quality_r = 1.0 / (1.0 + recon_loss_r)
-                
-                quality_v = torch.clamp(quality_v, 0.0, 1.0)
-                quality_r = torch.clamp(quality_r, 0.0, 1.0)
+                quality_v = torch.clamp(1.0 / (1.0 + recon_loss_v), 0.0, 1.0)
+                quality_r = torch.clamp(1.0 / (1.0 + recon_loss_r), 0.0, 1.0)
                 
                 dynamic_threshold = get_dynamic_threshold(epoch, args.stage1_epoch)
                 
                 model.diffusion.memory_bank.update(
-                    keys=f_v_input.detach(),
-                    values=f_r_fake.detach(),
-                    labels=rgb_ids[:BATCH_SIZE],
-                    quality_scores=quality_v,
-                    modality='v',
-                    threshold=dynamic_threshold
+                    keys=f_v_input.detach(), values=f_r_fake.detach(),
+                    labels=rgb_ids[:BATCH_SIZE], quality_scores=quality_v,
+                    modality='v', threshold=dynamic_threshold
                 )
-                
                 model.diffusion.memory_bank.update(
-                    keys=f_r_input.detach(),
-                    values=f_v_fake.detach(),
-                    labels=ir_ids[:BATCH_SIZE],
-                    quality_scores=quality_r,
-                    modality='r',
-                    threshold=dynamic_threshold
+                    keys=f_r_input.detach(), values=f_v_fake.detach(),
+                    labels=ir_ids[:BATCH_SIZE], quality_scores=quality_r,
+                    modality='r', threshold=dynamic_threshold
                 )
         
         # RAGM reliability prediction
-        _, rel_v2r_raw = model.ragm(f_r_fake.detach(), cma.get_prototypes('r'), uncertainty=unc_v)
-        _, _ = model.ragm(f_v_fake.detach(), cma.get_prototypes('v'), uncertainty=unc_r)
-        
+        # ✅ FIX: Clone prototypes to avoid in-place modification error during backward
+        _, rel_v2r_raw = model.ragm(
+            f_r_fake.detach(), 
+            cma.get_prototypes('r').clone().detach(), 
+            uncertainty=unc_v
+        )
         if not torch.isnan(rel_v2r_raw).any():
             rel_v2r = rel_v2r_raw
-        
-        ccpa_active = False
-        if use_ccpa and hasattr(cma, 'ccpa'):
-            ccpa_active = cma.ccpa.pseudo_ready and not cma.ccpa.use_fallback
 
-        if rel_mask_v is not None and ccpa_active:
-            alpha = 0.5
-            rel_v2r = alpha * rel_v2r + (1 - alpha) * rel_mask_v[:BATCH_SIZE]
-            rel_v2r = 0.05 + 0.95 * torch.sigmoid(10 * (rel_v2r - 0.5))
-        else:
-            pass
-    
-    # ==================== CCPA Loss ====================
-    if use_ccpa and not is_warmup and rel_mask_v is not None and ccpa_active:
+    # ==================== PRUD Loss (Replaces CCPA) ====================
+    if use_prud and not is_warmup and conf_v is not None:
         ce_none = nn.CrossEntropyLoss(reduction='none')
-        loss_ccpa_v = (ce_none(r2i_cls[:BATCH_SIZE], ir_ids[:BATCH_SIZE]) * rel_mask_v[:BATCH_SIZE]).mean()
-        loss_ccpa = loss_ccpa_v
-        
-        total_loss += args.ccpa_weight * loss_ccpa
-        meter.update({'ccpa': loss_ccpa.data})
+        loss_prud_v = (ce_none(r2i_cls[:BATCH_SIZE], rgb_ids[:BATCH_SIZE]) * conf_v[:BATCH_SIZE]).mean()
+        loss_prud_r = (ce_none(i2r_cls[:BATCH_SIZE], ir_ids[:BATCH_SIZE]) * conf_r[:BATCH_SIZE]).mean()
+        loss_prud = (loss_prud_v + loss_prud_r) / 2.0
+        total_loss += args.ccpa_weight * loss_prud
+        meter.update({'prud': loss_prud.data})
     
-    # ==================== Triplet Loss (Reliability-Weighted) ====================
+    # ==================== Triplet Loss ====================
     mask_rgb = torch.isin(rgb_ids[:BATCH_SIZE], match_info['common_rgb'])
     mask_ir = torch.isin(ir_ids, match_info['common_ir'])
     
@@ -493,11 +414,12 @@ def _compute_phase2_loss(model, meter, bn_features, gap_features, rgb_features, 
         meter.update({'tri': tri_loss.data})
     
     # ==================== CMA Memory Alignment ====================
+    # Always update prototypes (Now handled by cma.update_memory for PRUD source)
+    cma.update_prototypes(bn_features[:CHUNK_SIZE], rgb_ids, 'v')
+    cma.update_prototypes(bn_features[CHUNK_SIZE:], ir_ids, 'r')   
+    
     if not is_warmup:
         cma.update_memory(bn_features[:CHUNK_SIZE], bn_features[CHUNK_SIZE:], rgb_ids, ir_ids)
-        cma.update_prototypes(bn_features[:CHUNK_SIZE], rgb_ids, 'v')
-        cma.update_prototypes(bn_features[CHUNK_SIZE:], ir_ids, 'r')   
-        
         cma_loss = _compute_cma_loss(
             model, cma, dtd_r2r[:BATCH_SIZE], dtd_i2i[:BATCH_SIZE],
             r2i_cls[:BATCH_SIZE], i2r_cls[:BATCH_SIZE],
@@ -505,35 +427,21 @@ def _compute_phase2_loss(model, meter, bn_features, gap_features, rgb_features, 
             mask_rgb, mask_ir[:BATCH_SIZE],
             match_info['common_rm']
         )
-        
         if cma_loss is not None:
             total_loss += cma_loss
             meter.update({'cma': cma_loss.data})
     
-    # ==================== Weak Supervision Loss ====================
+    # ==================== Weak Supervision ====================
     if epoch >= args.stage1_epoch + 1:
         weak_loss = _compute_weak_loss(
             model, bn_features, rgb_ids[:BATCH_SIZE],
             match_info['remain_rgb'], match_info['remain_rm'],
             args.weak_weight, rel_v2r, BATCH_SIZE
         )
-        
         if weak_loss is not None:
             total_loss += weak_loss
             meter.update({'weak': weak_loss.data})
-    
-    # ==================== Cross-Modal Classification ====================
-    if model.enable_cls3:
-        idx_spec = torch.isin(rgb_ids[:BATCH_SIZE], match_info['specific_rgb'])
-        idx_spec = idx_spec & (~mask_rgb)
-        
-        if idx_spec.any():
-            r2c_cls = model.classifier3(bn_features)[0][:BATCH_SIZE]
-            target_dist = match_info['specific_rm'][rgb_ids[:BATCH_SIZE][idx_spec]]
-            loss_cross = model.pid_criterion(r2c_cls[idx_spec], target_dist)
-            total_loss += loss_cross
-            meter.update({'cross': loss_cross.data})
-    
+            
     return total_loss, nan_counter
 
 
@@ -545,25 +453,10 @@ def _compute_weighted_triplet(model, rgb_feats, ir_feats, rgb_ids, ir_ids,
     sel_rgb_id = rgb_ids[mask_rgb]
     sel_ir_id = ir_ids[mask_ir]
     
-    trans_rgb_lbl = torch.nonzero(common_rm[sel_rgb_id])[:, -1]
-    trans_ir_lbl = torch.nonzero(common_rm.T[sel_ir_id])[:, -1]
-    
-    match_rgb_f = torch.cat((sel_rgb_f, ir_feats), dim=0)
-    match_ir_f = torch.cat((rgb_feats, sel_ir_f), dim=0)
-    
-    match_rgb_l = torch.cat((trans_rgb_lbl, ir_ids), dim=0)
-    match_ir_l = torch.cat((rgb_ids, trans_ir_lbl), dim=0)
-    
-    w_rgb = None
-    if reliability is not None:
-        sel_rel = reliability[mask_rgb]
-        w_rgb = torch.cat((sel_rel, torch.ones_like(ir_ids, dtype=torch.float32)))
-    
     loss = weight * (
-        model.tri_criterion(match_rgb_f, match_rgb_l, weights=w_rgb) +
-        model.tri_criterion(match_ir_f, match_ir_l)
+        model.tri_criterion(sel_rgb_f, sel_rgb_id) +
+        model.tri_criterion(sel_ir_f, sel_ir_id)
     )
-    
     return loss
 
 

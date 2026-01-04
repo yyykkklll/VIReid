@@ -64,18 +64,10 @@ class Model(nn.Module):
             return
         
         from .feature_diffusion import HierarchicalDiffusionBridge
-        self.diffusion = HierarchicalDiffusionBridge(
-            feat_dim=2048,
-            hidden_dim=getattr(args, 'diffusion_hidden', 1024),
-            feature_steps=getattr(args, 'feature_diffusion_steps', 5),
-            semantic_steps=getattr(args, 'semantic_diffusion_steps', 10),
-            num_heads=getattr(args, 'cross_attn_heads', 4),
-            dropout=getattr(args, 'cross_attn_dropout', 0.1),
-            device=self.device,
-            use_memory=getattr(args, 'use_memory_bank', True),
-            memory_slots=getattr(args, 'memory_size_per_class', 5),
-            num_classes=args.num_classes
-        )
+        
+        # ✅ FIX: 直接传递 args，匹配 feature_diffusion.py 的定义
+        self.diffusion = HierarchicalDiffusionBridge(args)
+        
         self.diffusion_bridge = self.diffusion
         print(f"✓ Diffusion Bridge Initialized")
     
@@ -93,6 +85,7 @@ class Model(nn.Module):
         self.weak_criterion = Weak_loss()
     
     def forward(self, imgs_rgb=None, imgs_ir=None):
+        # 这里的调用是正确的，AGW接受 x1, x2 关键字参数
         if imgs_rgb is not None:
             _, feats = self.model(x1=imgs_rgb)
         elif imgs_ir is not None:
@@ -142,8 +135,6 @@ class Model(nn.Module):
         - Diffusion & New Classifier: 1.0x LR (Fast learning)
         """
         
-        # 🟢 关键修改：定义差异化学习率
-        # Phase 1 结束时 LR 已经衰减了 10 倍，所以这里 Backbone 应该保持低 LR
         reduced_lr = args.lr * 0.1 
         full_lr = args.lr 
         
@@ -156,8 +147,7 @@ class Model(nn.Module):
                 param_set.add(id(p))
                 params.append({'params': [p], 'lr': reduced_lr})
         
-        # 2. Classifier 1 & 2 -> Low LR (Scaled 2x relative to backbone base)
-        # Typically classifiers use 2x backbone LR. So here: 0.1 * 2 = 0.2x
+        # 2. Classifier 1 & 2 -> Low LR
         for p in self.classifier1.parameters():
             if id(p) not in param_set:
                 param_set.add(id(p))
@@ -175,13 +165,12 @@ class Model(nn.Module):
                     param_set.add(id(p))
                     params.append({'params': [p], 'lr': full_lr * 2})
         
-        # 4. Diffusion (New) -> High LR (Specific config)
+        # 4. Diffusion (New) -> High LR
         if self.use_diffusion:
             diff_lr = getattr(args, 'diffusion_lr', full_lr)
             for p in self.diffusion.parameters():
                 if id(p) not in param_set:
                     param_set.add(id(p))
-                    # 🟢 Explicitly set weight_decay=0.0 for Diffusion stability
                     params.append({'params': [p], 'lr': diff_lr, 'weight_decay': 0.0})
         
         # 5. RAGM -> Low LR
@@ -219,6 +208,7 @@ class Model(nn.Module):
             checkpoint['classifier3'] = self.classifier3.state_dict()
         
         if self.use_diffusion:
+            # 安全地处理 cma 弱引用，防止报错
             temp_cma = getattr(self.diffusion, 'cma', None)
             if temp_cma: self.diffusion.cma = None
             checkpoint['diffusion'] = self.diffusion.state_dict()
@@ -237,6 +227,10 @@ class Model(nn.Module):
         if model_path is None or model_path == 'default':
             model_path = os.path.join(self.args.save_path, 'models', 'checkpoint.pth')
         
+        if not os.path.exists(model_path):
+            print(f"⚠ WARNING: No checkpoint found at '{model_path}'")
+            return
+
         checkpoint = torch.load(model_path, map_location=self.device)
         
         # Load core components
@@ -244,7 +238,7 @@ class Model(nn.Module):
         self.classifier1.load_state_dict(checkpoint['classifier1'])
         self.classifier2.load_state_dict(checkpoint['classifier2'])
         
-        # Load Classifier3 (If resuming a Phase 2 model)
+        # Load Classifier3
         if 'classifier3' in checkpoint:
             if self.classifier3 is None:
                 class CArgs: num_classes = self.num_classes
@@ -256,7 +250,7 @@ class Model(nn.Module):
         if self.use_diffusion and 'diffusion' in checkpoint:
             self.diffusion.load_state_dict(checkpoint['diffusion'], strict=False)
         
-        # Load Optimizer (Phase 2)
+        # Load Optimizer
         if 'optimizer_phase2' in checkpoint:
             try:
                 self.configure_optimizer_phase2(self.args)

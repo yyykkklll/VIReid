@@ -1,9 +1,9 @@
 #!/bin/bash
 # sysu_phase2_start.sh
 # Start Phase 2 directly using pretrained Phase 1 weights
-# FIX: Adjusted Diffusion params to prevent backbone collapse
+# Optimized for PRUD (Prototype-Rectified Unidirectional Distillation)
 
-# Path to your best Phase 1 checkpoint
+# ⚠️ 确保你的 Phase 1 权重路径正确
 CHECKPOINT="/root/vireid/checkpoint.pth"
 
 # ==================== Configuration ====================
@@ -12,16 +12,20 @@ DEVICE=0
 DATA_PATH="./datasets/"
 
 # ==================== Phase 2 Settings ====================
-# Set Stage 1 to 0 to skip it
+# Set Stage 1 to 0 to skip it (直接进入第二阶段)
 STAGE1_EPOCH=0
 STAGE2_EPOCH=120
 LR=0.00035
 
-# ==================== CCPA Settings ====================
-# Delay CCPA start to let Diffusion warm up.
-CCPA_START_EPOCH=4
+# ==================== PRUD / CCPA Settings ====================
+CCPA_START_EPOCH=5 
+
 USE_CCPA=true
-CCPA_WEIGHT=0.5
+
+# 🔧 关键修改 2: 提高权重上限
+# PRUD 自带置信度衰减，所以我们可以设置更高的基础权重 (0.8)，让高质量的伪标签发挥更大作用。
+CCPA_WEIGHT=0.8
+
 CCPA_THRESHOLD_MODE="hybrid"
 PSEUDO_MOMENTUM=0.90
 
@@ -31,16 +35,16 @@ FEATURE_DIFFUSION_STEPS=5
 SEMANTIC_DIFFUSION_STEPS=10
 DIFFUSION_HIDDEN=1024
 
-# 🔴 [CRITICAL FIX] Lower weight to protect backbone, higher LR to learn fast
-DIFFUSION_WEIGHT=0.1    # 🔧 降至 0.1 (避免破坏主干特征)
-DIFFUSION_LR=0.0001      # 🔧 提至 0.0001 (加速扩散模块收敛)
+# 🔧 保持之前的修复 (保护 Backbone)
+DIFFUSION_WEIGHT=0.1     # 保持 0.1，防止扩散 Loss 压倒 ID Loss
+DIFFUSION_LR=0.0001      # 保持 0.0001，让扩散模块快速学习
 
 # ==================== Execute ====================
 echo "=========================================="
-echo "SYSU-MM01 DIRECT PHASE 2 START (FIXED)"
+echo "SYSU-MM01 DIRECT PHASE 2 START (PRUD OPTIMIZED)"
 echo "  - Loading weights from: $CHECKPOINT"
-echo "  - Diffusion Weight: $DIFFUSION_WEIGHT (Safe Mode)"
-echo "  - Diffusion LR: $DIFFUSION_LR"
+echo "  - Start Epoch: $CCPA_START_EPOCH"
+echo "  - PRUD Weight: $CCPA_WEIGHT"
 echo "=========================================="
 
 python main.py \

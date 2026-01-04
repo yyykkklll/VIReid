@@ -30,7 +30,6 @@ class DiffusionModule(nn.Module):
         
         # Debug statistics
         self.last_loss_stats = {}
-        self.last_sample_stats = {}
     
     def _init_diffusion_params(self):
         """Cosine noise schedule"""
@@ -42,420 +41,244 @@ class DiffusionModule(nn.Module):
         self.register_buffer('alphas', alphas)
         self.register_buffer('alphas_cumprod', alphas_cumprod)
         self.register_buffer('sqrt_alphas_cumprod', torch.sqrt(alphas_cumprod))
-        self.register_buffer('sqrt_one_minus_alphas_cumprod', torch.sqrt(1.0 - alphas_cumprod))
-        self.register_buffer('sqrt_recip_alphas', torch.sqrt(1.0 / alphas))
-        
-        alphas_cumprod_prev = torch.cat([alphas_cumprod[:1], alphas_cumprod[:-1]])
-        posterior_variance = betas * (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod)
-        self.register_buffer('posterior_variance', posterior_variance)
-    
-    def _cosine_beta_schedule(self, num_steps):
-        """Cosine schedule for stable few-step diffusion"""
-        s = 0.008
-        steps = num_steps + 1
-        x = torch.linspace(0, num_steps, steps)
-        alphas_cumprod = torch.cos(((x / num_steps) + s) / (1 + s) * np.pi * 0.5) ** 2
+        self.register_buffer('sqrt_one_minus_alphas_cumprod', torch.sqrt(1. - alphas_cumprod))
+
+    def _cosine_beta_schedule(self, timesteps, s=0.008):
+        steps = timesteps + 1
+        x = torch.linspace(0, timesteps, steps)
+        alphas_cumprod = torch.cos(((x / timesteps) + s) / (1 + s) * np.pi * 0.5) ** 2
         alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
         betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
-        return torch.clip(betas, 0.0001, 0.9999)
-    
-    def q_sample(self, x_start, t, noise=None):
-        """Forward diffusion: add noise"""
-        if noise is None:
-            noise = torch.randn_like(x_start)
-        
-        batch_size = x_start.size(0)
-        if t.dim() == 0:
-            t = t.unsqueeze(0).expand(batch_size)
-        elif t.size(0) != batch_size:
-            t = t[:batch_size]
-        
-        sqrt_alpha_t = self.sqrt_alphas_cumprod[t].view(batch_size, 1)
-        sqrt_one_minus_alpha_t = self.sqrt_one_minus_alphas_cumprod[t].view(batch_size, 1)
-        
-        return sqrt_alpha_t * x_start + sqrt_one_minus_alpha_t * noise
-    
-    def _heteroscedastic_loss(self, pred_noise, pred_log_var, target_noise):
-        # Clamp log_var to prevent extreme values
-        pred_log_var = torch.clamp(pred_log_var, min=-3, max=2)
-        
-        # Compute variance and precision
-        variance = torch.exp(pred_log_var)
-        precision = 1.0 / (variance + 1e-6)
-        
-        # MSE between predicted and target noise
-        mse = (pred_noise - target_noise) ** 2
-        
-        # Heteroscedastic loss (correct formula)
-        loss_hetero = 0.5 * (mse * precision + pred_log_var)
-        
-        # Variance regularization to prevent collapse
-        target_log_var = -0.5  # Encourage variance ~ 0.6
-        variance_reg = 0.1 * (pred_log_var - target_log_var) ** 2
-        
-        loss = loss_hetero + variance_reg
-        
-        return loss
-    
-    @torch.no_grad()
-    def sample(self, f_cond, prototype_guide=None, guide_weight=0.3):
+        return torch.clip(betas, 0, 0.999)
+
+    def compute_loss(self, x_start, condition):
         """
-        Single-pass sampling that returns both features and learned uncertainty.
+        x_start: Target features to reconstruct (e.g., IR features)
+        condition: Source features to condition on (e.g., RGB features)
         """
-        B = f_cond.size(0)
-        z_t = torch.randn(B, self.feat_dim, device=self.device)
+        B = x_start.size(0)
+        t = torch.randint(0, self.num_steps, (B,), device=self.device).long()
         
-        accumulated_uncertainty = 0.0
-        log_var_history = []
+        noise = torch.randn_like(x_start)
+        x_noisy = (
+            self.sqrt_alphas_cumprod[t].view(-1, 1) * x_start +
+            self.sqrt_one_minus_alphas_cumprod[t].view(-1, 1) * noise
+        )
         
-        for t in reversed(range(self.num_steps)):
-            t_batch = torch.full((B,), t, dtype=torch.long, device=self.device)
-            
-            model_out = self.denoiser(z_t, f_cond, t_batch)
-            pred_noise, pred_log_var = torch.chunk(model_out, 2, dim=1)
-            
-            pred_log_var = torch.clamp(pred_log_var, min=-3, max=2)
-            log_var_history.append(pred_log_var.mean().item())
-            
-            accumulated_uncertainty += torch.exp(pred_log_var).mean(dim=1)
-            
-            beta_t = self.betas[t_batch].view(B, 1)
-            sqrt_recip_alpha_t = self.sqrt_recip_alphas[t_batch].view(B, 1)
-            sqrt_one_minus_alpha_t = self.sqrt_one_minus_alphas_cumprod[t_batch].view(B, 1)
-            
-            mean = sqrt_recip_alpha_t * (z_t - beta_t / sqrt_one_minus_alpha_t * pred_noise)
-            
-            if t > 0:
-                variance = self.posterior_variance[t_batch].view(B, 1)
-                noise = torch.randn_like(z_t)
-                z_t = mean + torch.sqrt(variance) * noise
-            else:
-                z_t = mean
-            
-            if prototype_guide is not None:
-                proto_offset = prototype_guide - z_t
-                z_t = z_t + guide_weight * proto_offset
+        # forward(self, x_noisy, x_cond, t)
+        model_output = self.denoiser(x_noisy, condition, t)
         
-        avg_uncertainty = accumulated_uncertainty / self.num_steps
+        # Heteroscedastic Loss (Predict noise + uncertainty)
+        pred_noise, pred_log_var = torch.chunk(model_output, 2, dim=1)
         
-        # Store sampling statistics
-        self.last_sample_stats = {
-            'log_var_mean': np.mean(log_var_history),
-            'log_var_std': np.std(log_var_history),
-            'log_var_min': np.min(log_var_history),
-            'log_var_max': np.max(log_var_history),
-            'avg_uncertainty_mean': avg_uncertainty.mean().item(),
-            'avg_uncertainty_std': avg_uncertainty.std().item(),
-        }
+        # Loss calculation (NLL style)
+        mse = (noise - pred_noise) ** 2
+        loss = torch.mean(torch.exp(-pred_log_var) * mse + pred_log_var)
         
-        return F.normalize(z_t, dim=1), avg_uncertainty
-    
-    def compute_loss(self, f_cond, f_target):
-        """
-        Compute heteroscedastic loss with balanced regularization
-        """
-        if f_cond.size(0) != f_target.size(0):
-            min_batch = min(f_cond.size(0), f_target.size(0))
-            f_cond = f_cond[:min_batch]
-            f_target = f_target[:min_batch]
-        
-        B = f_cond.size(0)
-        # ✅ [FIX 1] 放大信号尺度，匹配高斯噪声 (sqrt(2048) ≈ 45)
-        # z_0 = F.normalize(f_target, dim=1) # ❌ Old
-        z_0 = F.normalize(f_target, dim=1) * np.sqrt(self.feat_dim) # ✅ Fixed
-        
-        t = torch.randint(0, self.num_steps, (B,), device=self.device)
-        noise = torch.randn_like(z_0)
-        z_t = self.q_sample(z_0, t, noise)
-        
-        model_out = self.denoiser(z_t, f_cond, t)
-        pred_noise, pred_log_var = torch.chunk(model_out, 2, dim=1)
-        
-        pred_log_var = torch.clamp(pred_log_var, min=-3, max=2)
-        
-        loss_per_pixel = self._heteroscedastic_loss(pred_noise, pred_log_var, noise)
-        loss_batch = loss_per_pixel.mean(dim=1)
-        
+        # Stats
         with torch.no_grad():
-            predicted_uncertainty = torch.exp(pred_log_var).mean(dim=1)
-            
-            # Store loss statistics
             self.last_loss_stats = {
-                'loss_mean': loss_batch.mean().item(),
-                'loss_std': loss_batch.std().item(),
+                'loss_mean': loss.item(),
+                'loss_std': loss.std().item() if B > 1 else 0.0,
                 'log_var_mean': pred_log_var.mean().item(),
-                'log_var_std': pred_log_var.std().item(),
-                'log_var_min': pred_log_var.min().item(),
-                'log_var_max': pred_log_var.max().item(),
-                'uncertainty_mean': predicted_uncertainty.mean().item(),
-                'uncertainty_std': predicted_uncertainty.std().item(),
-                'noise_mse': F.mse_loss(pred_noise, noise).item(),
+                'uncertainty_mean': torch.exp(pred_log_var).mean().item(),
             }
+            
+        return loss, pred_noise, pred_log_var
+
+    @torch.no_grad()
+    def sample(self, shape, condition):
+        B = shape[0]
+        img = torch.randn(shape, device=self.device)
         
-        return loss_batch.mean(), z_0, predicted_uncertainty
+        for i in reversed(range(0, self.num_steps)):
+            t = torch.full((B,), i, device=self.device, dtype=torch.long)
+            
+            model_output = self.denoiser(img, condition, t)
+            
+            pred_noise, pred_log_var = torch.chunk(model_output, 2, dim=1)
+            
+            # Reparameterization trick inverse
+            alpha = self.alphas[i]
+            alpha_cumprod = self.alphas_cumprod[i]
+            beta = self.betas[i]
+            
+            if i > 0:
+                noise = torch.randn_like(img)
+            else:
+                noise = torch.zeros_like(img)
+                
+            pred_mean = (1 / torch.sqrt(alpha)) * (
+                img - (beta / torch.sqrt(1 - alpha_cumprod)) * pred_noise
+            )
+            
+            std = torch.exp(0.5 * pred_log_var)
+            img = pred_mean + std * noise
+            
+        return img, pred_log_var
 
 
 # ==================== Hierarchical Diffusion Bridge ====================
 class HierarchicalDiffusionBridge(nn.Module):
-    def __init__(self, feat_dim=2048, hidden_dim=1024,
-                 feature_steps=5, semantic_steps=10,
-                 num_heads=4, dropout=0.1, device='cuda',
-                 use_memory=True, memory_slots=5,
-                 num_classes=206):
+    def __init__(self, args):
         super().__init__()
-        self.feat_dim = feat_dim
-        self.device = device
-        self.use_memory = use_memory
-        self.num_classes = num_classes
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
-        diff_args = {
-            'feat_dim': feat_dim, 'hidden_dim': hidden_dim,
-            'num_heads': num_heads, 'dropout': dropout, 'device': device
-        }
+        # Config
+        self.feat_dim = 2048
+        self.hidden_dim = getattr(args, 'diffusion_hidden', 1024)
+        self.feature_steps = getattr(args, 'feature_diffusion_steps', 5)
+        self.semantic_steps = getattr(args, 'semantic_diffusion_steps', 10)
         
+        # 1. Feature-level Diffusion
         self.feature_diffusion_v2r = DiffusionModule(
-            num_steps=feature_steps, num_res_blocks=2, **diff_args
+            feat_dim=self.feat_dim, hidden_dim=self.hidden_dim, 
+            num_steps=self.feature_steps, device=self.device
         )
         self.feature_diffusion_r2v = DiffusionModule(
-            num_steps=feature_steps, num_res_blocks=2, **diff_args
+            feat_dim=self.feat_dim, hidden_dim=self.hidden_dim, 
+            num_steps=self.feature_steps, device=self.device
         )
+        
+        # 2. Semantic-level Diffusion
         self.semantic_diffusion_v2r = DiffusionModule(
-            num_steps=semantic_steps, num_res_blocks=3, **diff_args
+            feat_dim=self.feat_dim, hidden_dim=self.hidden_dim, 
+            num_steps=self.semantic_steps, device=self.device
         )
         self.semantic_diffusion_r2v = DiffusionModule(
-            num_steps=semantic_steps, num_res_blocks=3, **diff_args
+            feat_dim=self.feat_dim, hidden_dim=self.hidden_dim, 
+            num_steps=self.semantic_steps, device=self.device
         )
         
-        if use_memory:
-            self.memory_bank = MemoryBank(
-                num_classes=num_classes, feat_dim=feat_dim,
-                slots_per_class=memory_slots, device=device
-            )
-        
-        self.proto_guidance = PrototypeGuidance(
-            num_classes=num_classes, feat_dim=feat_dim, device=device
+        # Memory Bank
+        self.memory_bank = MemoryBank(
+            num_classes=args.num_classes, 
+            feat_dim=self.feat_dim,
+            slots_per_class=getattr(args, 'memory_size_per_class', 5)
         )
         
-        self.fusion = nn.Sequential(
-            nn.Linear(feat_dim * 2, feat_dim),
-            nn.LayerNorm(feat_dim),
-            nn.ReLU(),
-            nn.Linear(feat_dim, feat_dim)
-        )
+        # Prototype Guidance Link
+        self.cma = None 
         
-        self.cma = None
         self.current_epoch = 0
-        self.register_buffer('denoiser_health_status', torch.tensor(1.0))
-    
-    def set_cma(self, cma_module):
-        self.cma = weakref.proxy(cma_module)
-        if self.use_memory:
-            self.memory_bank.sync_from_cma(cma_module.vis_memory, cma_module.ir_memory)
-    
+
     def set_epoch(self, epoch):
         self.current_epoch = epoch
-        self.proto_guidance.set_epoch(epoch)
-    
-    def forward(self, f_v, f_r, labels_v=None, labels_r=None, mode='train'):
+
+    def set_cma(self, cma_module):
+        self.cma = weakref.proxy(cma_module)
+
+    def forward(self, f_v, f_r, labels_v, labels_r, mode='train'):
         if mode == 'train':
             return self.compute_loss(f_v, f_r, labels_v, labels_r)
         else:
-            return self.generate(f_v, f_r, labels_v, labels_r)
-    
-    def compute_loss(self, f_v, f_r, labels_v=None, labels_r=None):
-        loss_v2r_feat, feat_v2r, unc_v2r = self.feature_diffusion_v2r.compute_loss(f_v, f_r)
-        loss_v2r_sem, sem_v2r, unc_v2r_sem = self.semantic_diffusion_v2r.compute_loss(f_v, f_r)
+            return self.generate(f_v=f_v, f_r=f_r, labels_v=labels_v, labels_r=labels_r)
+
+    def compute_loss(self, f_v, f_r, labels_v, labels_r):
+        """
+        Compute total diffusion loss (Cross-Modal Conditional)
+        V->R: Target=f_r, Condition=f_v
+        R->V: Target=f_v, Condition=f_r
+        """
         
-        loss_r2v_feat, feat_r2v, unc_r2v = self.feature_diffusion_r2v.compute_loss(f_r, f_v)
-        loss_r2v_sem, sem_r2v, unc_r2v_sem = self.semantic_diffusion_r2v.compute_loss(f_r, f_v)
+        # Feature Diffusion (Texture/Low-level)
+        l_v2r, _, unc_v2r = self.feature_diffusion_v2r.compute_loss(x_start=f_r, condition=f_v)
+        l_r2v, _, unc_r2v = self.feature_diffusion_r2v.compute_loss(x_start=f_v, condition=f_r)
         
+        # Semantic Diffusion (High-level)
+        l_sem_v2r, _, _ = self.semantic_diffusion_v2r.compute_loss(x_start=f_r, condition=f_v)
+        l_sem_r2v, _, _ = self.semantic_diffusion_r2v.compute_loss(x_start=f_v, condition=f_r)
+        
+        total_loss = l_v2r + l_r2v + 0.1 * (l_sem_v2r + l_sem_r2v)
+        
+        # Generate samples for downstream use (Consistency/Augmentation)
         with torch.no_grad():
-            uncertainty_v = (unc_v2r + unc_v2r_sem) / 2.0
-            uncertainty_r = (unc_r2v + unc_r2v_sem) / 2.0
-        
-        memory_loss = 0.0
-        if self.use_memory and labels_v is not None:
-            memory_loss = self._compute_memory_loss(f_v, feat_v2r, labels_v, 'v') + \
-                         self._compute_memory_loss(f_r, feat_r2v, labels_r, 'r')
-            memory_loss = memory_loss / 2
-        
-        proto_loss_v = torch.tensor(0.0, device=f_v.device)
-        proto_loss_r = torch.tensor(0.0, device=f_r.device)
-        
-        if self.cma is not None and labels_v is not None:
-            try:
-                proto_weight = self.proto_guidance.get_guidance_weight(self.current_epoch)
-                proto_loss_v = proto_weight * self.proto_guidance.compute_guidance_loss(
-                    sem_v2r, self.cma.get_prototypes('r'), labels_v
-                )
-                proto_loss_r = proto_weight * self.proto_guidance.compute_guidance_loss(
-                    sem_r2v, self.cma.get_prototypes('v'), labels_r
-                )
-            except ReferenceError:
-                pass
-        
-        # ✅ [FIX 2] 彻底删除权重惩罚
-        # ❌ 已移除：weight_reg = 0.0 ... weight_penalty = 1e-4 * weight_reg
-        
-        total_loss = (loss_v2r_feat + loss_r2v_feat +
-                    loss_v2r_sem + loss_r2v_sem +
-                    0.3 * memory_loss +
-                    proto_loss_v + proto_loss_r)
-                    # + weight_penalty) ❌ 移除这里
-        
+             # Generate V from R
+             f_v_fake, _ = self.feature_diffusion_r2v.sample(f_r.shape, condition=f_r)
+             # Generate R from V
+             f_r_fake, _ = self.feature_diffusion_v2r.sample(f_v.shape, condition=f_v)
+
         loss_dict = {
-            'v2r_feat_mse': loss_v2r_feat,
-            'r2v_feat_mse': loss_r2v_feat,
-            'v2r_sem_mse': loss_v2r_sem,
-            'r2v_sem_mse': loss_r2v_sem,
-            'memory_align': memory_loss,
-            'proto_align_v': proto_loss_v,
-            'proto_align_r': proto_loss_r,
-            'weight_reg': 0.0, # 保持 0.0 以避免报错
-            'total': total_loss
+            'total': total_loss,
+            'v2r': l_v2r.item(),
+            'r2v': l_r2v.item()
         }
         
-        f_r_fake, f_v_fake, _, _ = self.generate(f_v, f_r, labels_v, labels_r)
+        # ✅ FIX: Return per-sample uncertainty (Shape: [B])
+        # unc_v2r is log_var [B, D]. We take mean over D, then exp.
+        # RAGM expects [B] tensor to unsqueeze(1).
+        
+        # Uncertainty of "Generating V" (from R2V model)
+        uncertainty_v = torch.exp(unc_r2v).mean(dim=1) 
+        
+        # Uncertainty of "Generating R" (from V2R model)
+        uncertainty_r = torch.exp(unc_v2r).mean(dim=1)
+        
         return loss_dict, f_r_fake, f_v_fake, uncertainty_v, uncertainty_r
-    
-    def _compute_memory_loss(self, f_src, f_generated, labels, modality='v'):
-        """Align generated features with retrieved memories"""
-        retrieved_samples, weights = self.memory_bank.retrieve(
-            f_src, labels, modality=modality, top_k=3
-        )
-        
-        valid_mask = (weights > 0.1)
-        if valid_mask.sum() == 0:
-            return torch.tensor(0.0, device=f_src.device)
-        
-        return F.mse_loss(f_generated[valid_mask], retrieved_samples[valid_mask])
-    
+
     @torch.no_grad()
     def generate(self, f_v=None, f_r=None, labels_v=None, labels_r=None):
-        f_r_fake, f_v_fake = None, None
-        unc_v2r, unc_r2v = None, None
+        """
+        External generation call (e.g. for PRUD/CCPA)
+        """
+        cma_ref = getattr(self, 'cma', None)
         
-        guide_weight = self.proto_guidance.get_guidance_weight(self.current_epoch)
+        f_v_fake = None
+        f_r_fake = None
+        unc_v = None
+        unc_r = None
         
+        # ============================================
+        # 1. V->R Generation (Need Condition: f_v)
+        # ============================================
+        cond_v = None
         if f_v is not None:
-            proto_guide_r = None
-            if self.cma is not None and labels_v is not None:
-                try:
-                    proto_guide_r = self.cma.get_prototypes('r')[labels_v]
-                except ReferenceError:
-                    pass
-            
-            feat_r, unc_feat = self.feature_diffusion_v2r.sample(f_v)
-            sem_r, unc_sem = self.semantic_diffusion_v2r.sample(f_v, proto_guide_r, guide_weight)
-            
-            unc_v2r = (unc_feat + unc_sem) / 2.0
-            
-            memory_r = torch.zeros_like(feat_r)
-            valid_memory_mask = torch.zeros(len(f_v), dtype=torch.bool, device=f_v.device)
-            
-            if self.use_memory and labels_v is not None:
-                retrieved_r, weights_r = self.memory_bank.retrieve(f_v, labels_v, 'v', top_k=3)
-                memory_r = retrieved_r
-                valid_memory_mask = (weights_r > 0.1)
-            
-            f_r_fake = self.fusion(torch.cat([feat_r, sem_r], dim=1))
-            
-            if valid_memory_mask.any():
-                f_r_fake[valid_memory_mask] = (0.9 * f_r_fake[valid_memory_mask] +
-                                               0.1 * memory_r[valid_memory_mask])
+            cond_v = f_v
+        elif labels_v is not None and cma_ref is not None:
+            try:
+                # [B, 2048]
+                cond_v = cma_ref.get_prototypes('v')[labels_v]
+            except:
+                cond_v = None
         
+        if cond_v is not None:
+             f_r_fake, log_var_r = self.feature_diffusion_v2r.sample(cond_v.shape, condition=cond_v)
+             # ✅ FIX: Per-sample uncertainty
+             unc_r = torch.exp(log_var_r).mean(dim=1)
+
+        # ============================================
+        # 2. R->V Generation (Need Condition: f_r)
+        # ============================================
+        cond_r = None
         if f_r is not None:
-            proto_guide_v = None
-            if self.cma is not None and labels_r is not None:
-                try:
-                    proto_guide_v = self.cma.get_prototypes('v')[labels_r]
-                except ReferenceError:
-                    pass
+            cond_r = f_r
+        elif labels_r is not None and cma_ref is not None:
+            try:
+                cond_r = cma_ref.get_prototypes('r')[labels_r]
+            except:
+                cond_r = None
+
+        if cond_r is not None:
+             f_v_fake, log_var_v = self.feature_diffusion_r2v.sample(cond_r.shape, condition=cond_r)
+             # ✅ FIX: Per-sample uncertainty
+             unc_v = torch.exp(log_var_v).mean(dim=1)
             
-            feat_v, unc_feat_v = self.feature_diffusion_r2v.sample(f_r)
-            sem_v, unc_sem_v = self.semantic_diffusion_r2v.sample(f_r, proto_guide_v, guide_weight)
-            
-            unc_r2v = (unc_feat_v + unc_sem_v) / 2.0
-            
-            memory_v = torch.zeros_like(feat_v)
-            valid_memory_mask = torch.zeros(len(f_r), dtype=torch.bool, device=f_r.device)
-            
-            if self.use_memory and labels_r is not None:
-                retrieved_v, weights_v = self.memory_bank.retrieve(f_r, labels_r, 'r', top_k=3)
-                memory_v = retrieved_v
-                valid_memory_mask = (weights_v > 0.1)
-            
-            f_v_fake = self.fusion(torch.cat([feat_v, sem_v], dim=1))
-            
-            if valid_memory_mask.any():
-                f_v_fake[valid_memory_mask] = (0.9 * f_v_fake[valid_memory_mask] +
-                                               0.1 * memory_v[valid_memory_mask])
-        
-        return f_r_fake, f_v_fake, unc_v2r, unc_r2v
-    
-    def update_memory(self, f_v, f_r, labels_v, labels_r, f_r_fake, f_v_fake):
-        """Update memory bank with high-quality transformations"""
-        if not self.use_memory:
-            return
-        
-        quality_v2r = F.cosine_similarity(f_r_fake, f_r, dim=1)
-        quality_r2v = F.cosine_similarity(f_v_fake, f_v, dim=1)
-        
-        quality_v2r = F.relu(quality_v2r)
-        quality_r2v = F.relu(quality_r2v)
-        
-        threshold = 0.0
-        
-        self.memory_bank.update(f_v, f_r_fake, labels_v, quality_v2r, 'v', threshold)
-        self.memory_bank.update(f_r, f_v_fake, labels_r, quality_r2v, 'r', threshold)
-    
+        return f_r_fake, f_v_fake, unc_v, unc_r
+
     def get_detailed_diagnostics(self):
-        """
-        Comprehensive diagnostics for diffusion bridge.
-        Returns formatted string with all module states.
-        """
         lines = []
-        lines.append("🔬 Hierarchical Diffusion Bridge Diagnostics:")
+        lines.append(f"🔬 Hierarchical Diffusion Bridge Diagnostics:")
         lines.append(f"  ├─ Current Epoch: {self.current_epoch}")
-        lines.append(f"  │")
         
-        # Feature-level diffusion V2R
-        lines.append(f"  ├─ Feature Diffusion (V→R) [{self.feature_diffusion_v2r.num_steps} steps]:")
         if self.feature_diffusion_v2r.last_loss_stats:
             s = self.feature_diffusion_v2r.last_loss_stats
             lines.append(f"  │  ├─ Loss: {s['loss_mean']:.4f} ± {s['loss_std']:.4f}")
-            lines.append(f"  │  ├─ Noise MSE: {s['noise_mse']:.4f}")
-            lines.append(f"  │  ├─ Log-Var: {s['log_var_mean']:.3f} ± {s['log_var_std']:.3f} | Range: [{s['log_var_min']:.2f}, {s['log_var_max']:.2f}]")
-            lines.append(f"  │  └─ Uncertainty: {s['uncertainty_mean']:.4f} ± {s['uncertainty_std']:.4f}")
-        
-        lines.append(f"  │")
-        
-        # Semantic-level diffusion V2R
-        lines.append(f"  ├─ Semantic Diffusion (V→R) [{self.semantic_diffusion_v2r.num_steps} steps]:")
-        if self.semantic_diffusion_v2r.last_loss_stats:
-            s = self.semantic_diffusion_v2r.last_loss_stats
-            lines.append(f"  │  ├─ Loss: {s['loss_mean']:.4f} ± {s['loss_std']:.4f}")
-            lines.append(f"  │  ├─ Log-Var: {s['log_var_mean']:.3f} ± {s['log_var_std']:.3f}")
-            lines.append(f"  │  └─ Uncertainty: {s['uncertainty_mean']:.4f} ± {s['uncertainty_std']:.4f}")
-        
-        lines.append(f"  │")
-        
-        # Denoiser weight diagnostics
-        denoiser_stats = self.feature_diffusion_v2r.denoiser.get_weight_diagnostics()
-        lines.append(f"  ├─ Denoiser Network Weights:")
-        lines.append(f"  │  ├─ Output Layer Norm: {denoiser_stats['output_weight_norm']:.2f}")
-        lines.append(f"  │  ├─ Encoder Avg Norm: {denoiser_stats['encoder_avg_norm']:.2f} | Max: {denoiser_stats['encoder_max_norm']:.2f}")
-        lines.append(f"  │  └─ Decoder Avg Norm: {denoiser_stats['decoder_avg_norm']:.2f} | Max: {denoiser_stats['decoder_max_norm']:.2f}")
-        
-        lines.append(f"  │")
-        
-        # Fusion layer
-        fusion_weight_norm = torch.norm(self.fusion[0].weight).item()
-        lines.append(f"  └─ Fusion Layer Weight Norm: {fusion_weight_norm:.2f}")
-        
+            lines.append(f"  │  ├─ Uncertainty: {s['uncertainty_mean']:.4f}")
+
+        # Memory Bank Stats
+        if hasattr(self, 'memory_bank'):
+             mb_stats = self.memory_bank.get_statistics()
+             lines.append(f"  │")
+             lines.append(f"  └─ Memory Bank: {mb_stats['occupied_classes_v']} classes occupied")
+
         return '\n'.join(lines)
-
-
-# Aliases for backward compatibility
-BidirectionalDiffusionBridge = HierarchicalDiffusionBridge
-FeatureDiffusion = HierarchicalDiffusionBridge
