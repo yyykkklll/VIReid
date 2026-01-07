@@ -1,0 +1,60 @@
+# Ignore datasets directory
+datasets/LLCM
+datasets/RegDB
+datasets/SYSU-MM01
+pretrained/vit_base_patch16_224.bin
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+
+# IDE/editor settings
+.vscode/
+
+# macOS files
+.DS_Store
+
+# Virtual environments
+venv/
+.env/
+
+# IDE/editor settings (JetBrains)
+.idea/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Python tooling caches
+.tox/
+.nox/
+.pytype/
+.ruff_cache/
+.cache/
+
+# Coverage reports
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Logs
+*.log
+
+# Additional virtual envs
+.venv/
+.envrc
+
+# Windows system files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Jupyter
+.ipynb_checkpoints
