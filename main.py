@@ -47,6 +47,7 @@ def main(args):
         # Early Stopping Variables
         patience = args.patience
         best_epoch_phase1 = 0
+        start_epoch = getattr(model, 'resume_epoch', 0)
         best_epoch_phase2 = start_epoch
 
         if enable_phase1:
@@ -78,15 +79,18 @@ def main(args):
                 logger('=================================================')
                 
                 # Early Stopping Phase 1
-                if current_epoch - best_epoch_phase1 > patience:
+                current_patience = current_epoch - best_epoch_phase1
+                if current_patience > patience:
                     logger(f'Early stopping triggered in Phase 1 at epoch {current_epoch}. Best was {best_epoch_phase1}.')
                     break
+                else:
+                    print(f'Patience Phase 1: {current_patience}/{patience} (Best epoch: {best_epoch_phase1})')
 
         else:
              logger('Phase 1 skipped (resume mode or stage1_epoch=0). Loading checkpoint if provided.')
 
         enable_phase1 = False
-        start_epoch = model.resume_epoch
+        start_epoch = getattr(model, 'resume_epoch', 0)
         best_epoch_phase2 = start_epoch
         
         # If we loaded a Phase 1 model to start Phase 2, we might want to reset start_epoch if it's meant to be a fresh Phase 2 start
@@ -119,9 +123,12 @@ def main(args):
             logger('=================================================')
 
             # Early Stopping Phase 2
-            if current_epoch - best_epoch_phase2 > patience:
+            current_patience = current_epoch - best_epoch_phase2
+            if current_patience > patience:
                 logger(f'Early stopping triggered in Phase 2 at epoch {current_epoch}. Best was {best_epoch_phase2}.')
                 break
+            else:
+                print(f'Patience Phase 2: {current_patience}/{patience} (Best epoch: {best_epoch_phase2})')
 
         
     if args.mode == 'test':

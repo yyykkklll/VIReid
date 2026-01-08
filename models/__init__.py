@@ -38,6 +38,7 @@ class Model:
         self.milestones = args.milestones
         self.resume = args.resume
         self.args = args
+        self.resume_epoch = 0  # Initialize resume_epoch to 0
 
         self.model = _models[args.arch](args).to(self.device)
         self.classifier1 = Image_Classifier(args).to(self.device) # RGB classifier
