@@ -8,13 +8,14 @@ from utils import os_walk
 from .agw import AGW
 from .clip_model import CLIP
 from .optim import WarmupMultiStepLR
-from .loss import TripletLoss_WRT, Weak_loss, WeightedContrastiveLoss
+from .loss import TripletLoss_WRT, Weak_loss, WeightedContrastiveLoss, LabelSmoothingCrossEntropy
 _models = {
     "resnet": AGW,  # visual encoder AGW, no text encoder
     "clip-resnet": CLIP,  # resnet50 + transformer
     "vit": 0,  # visual encoder vit, no text encoder
     #"clip-vit": CLIP,  # both vit-b/16 + transformer
 }
+
 
 
 def create(args):
@@ -75,7 +76,7 @@ class Model:
         self.scheduler_phase2 = WarmupMultiStepLR(self.optimizer_phase2, self.milestones,
                                            gamma=0.1, warmup_factor=0.01, warmup_iters=10, mode='cls')
     def _init_criterion(self):
-        self.pid_criterion = torch.nn.CrossEntropyLoss()
+        self.pid_criterion = LabelSmoothingCrossEntropy(smoothing=0.1)
         self.tri_criterion = TripletLoss_WRT()
         self.weak_criterion = Weak_loss()
 

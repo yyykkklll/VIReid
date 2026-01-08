@@ -2,6 +2,7 @@
 # regdb.sh
 # VI-ReID Training Script (Sinkhorn + CMCL Optimized)
 # Dataset: RegDB
+# Full Pipeline: Enhanced Phase 1 (Label Smoothing + More Epochs) -> Stable Phase 2
 
 # Clean up cache
 find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
@@ -12,47 +13,46 @@ DATASET="regdb"
 ARCH="resnet"
 DEVICE=0
 TRIAL=1
-
-# Use local datasets directory
 DATA_PATH="./datasets/"
 SAVE_PATH="save_regdb_cmcl"
 
 # ==================== Training Settings ====================
-# [Phase 1] Standard Supervised Pre-training
-# RegDB default: 50
-STAGE1_EPOCH=50
+# [Phase 1] Enhanced Supervised Pre-training
+STAGE1_EPOCH=60
 
-# [Phase 2] Weakly Supervised Learning (Sinkhorn + CMCL)
-# RegDB default: 120
+# [Phase 2] Weakly Supervised Learning
 STAGE2_EPOCH=120
 
-# Learning Rate (Higher for RegDB usually)
+# Learning Rate
+# RegDB uses higher LR
 LR=0.00045
+MILESTONES="40 100"
 
-# Milestones for LR decay
-MILESTONES="50 70"
+# Early Stopping
+PATIENCE=15
 
 # ==================== Batch Settings ====================
-BATCH_PIDNUM=8  # RegDB might use smaller batch sometimes (e.g. 5), keeping 8 as per original code args or safe default
+BATCH_PIDNUM=8
 PID_NUMSAMPLE=4
 TRI_WEIGHT=0.25
 WEAK_WEIGHT=0.25
-SIGMA=0.8
+
+# [Phase 2 Stability]
+SIGMA=0.2
 TEMPERATURE=3
 
 # ==================== Execute ====================
 echo "=========================================="
-echo "RegDB TRAINING (Sinkhorn + CMCL) - Trial $TRIAL"
-echo "  - Total Epochs: $((STAGE1_EPOCH + STAGE2_EPOCH))"
-echo "  - Phase 1: 1 - $STAGE1_EPOCH"
-echo "  - Phase 2: $((STAGE1_EPOCH + 1)) - $((STAGE1_EPOCH + STAGE2_EPOCH))"
+echo "RegDB FULL TRAINING (ENHANCED) - Trial $TRIAL"
+echo "  - Phase 1: 60 Epochs"
+echo "  - Phase 2: 120 Epochs"
+echo "  - Patience: $PATIENCE"
 echo "=========================================="
 
 mkdir -p ./logs
 export TMPDIR=$(pwd)/local_tmp
 
-# Save log with timestamp
-LOG_FILE="./logs/regdb_trial${TRIAL}_train_$(date +%Y%m%d_%H%M%S).log"
+LOG_FILE="./logs/regdb_trial${TRIAL}_full_enhanced_$(date +%Y%m%d_%H%M%S).log"
 
 python main.py \
     --dataset $DATASET \
@@ -68,6 +68,7 @@ python main.py \
     --milestones $MILESTONES \
     --stage1-epoch $STAGE1_EPOCH \
     --stage2-epoch $STAGE2_EPOCH \
+    --patience $PATIENCE \
     \
     --batch-pidnum $BATCH_PIDNUM \
     --pid-numsample $PID_NUMSAMPLE \

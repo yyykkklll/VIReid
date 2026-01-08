@@ -1,6 +1,6 @@
 #!/bin/bash
 # sysu_phase2.sh
-# VI-ReID Training Script - Phase 2 ONLY
+# VI-ReID Training Script - Phase 2 ONLY (Optimized for Stability)
 # Skips Phase 1 and loads a pre-trained Phase 1 model
 
 # Clean up cache
@@ -17,44 +17,41 @@ DATA_PATH="./datasets/"
 SAVE_PATH="save_sysu_cmcl"
 
 # Path to the BEST Phase 1 Checkpoint
-# Adjust this path if your file is located elsewhere
 PHASE1_MODEL_PATH="./saved_sysu_resnet/save_sysu_cmcl/models/best_phase1.pth"
 
 # ==================== Training Settings ====================
-# [Phase 1] Skipped (Set to 0)
 STAGE1_EPOCH=0
-
-# [Phase 2] Weakly Supervised Learning
-# Total Epochs = STAGE2_EPOCH
-# Since we skip Phase 1, start_epoch will be determined by the loaded model (e.g. 20)
-# So it will run from 20 to 120.
+# Continue Phase 2 for enough epochs
 STAGE2_EPOCH=120
 
-# Learning Rate
-LR=0.0003
-MILESTONES="30 70"
+# [OPTIMIZATION 1] Lower Learning Rate for Phase 2
+# Previous 0.0003 caused severe oscillation. Lowering to 0.00015.
+LR=0.00015
+MILESTONES="40 80"
 
 # ==================== Batch Settings ====================
 BATCH_PIDNUM=8
 PID_NUMSAMPLE=4
 TRI_WEIGHT=0.25
 WEAK_WEIGHT=0.25
-SIGMA=0.8
+
+# [OPTIMIZATION 2] Stabilize Memory Bank Update
+# Previous sigma 0.8 (update 80% new) was too volatile.
+# Changing to 0.2 (update 20% new, keep 80% old) to smooth out features.
+SIGMA=0.2
 TEMPERATURE=3
 
 # ==================== Execute ====================
-echo "========================================== "
-echo "SYSU-MM01 TRAINING - PHASE 2 ONLY"
-echo "  - Loading Model: $PHASE1_MODEL_PATH"
-echo "  - Phase 1: Skipped"
-echo "  - Phase 2: Ends at Epoch $STAGE2_EPOCH"
+echo "=========================================="
+echo "SYSU-MM01 TRAINING - PHASE 2 (STABLE)"
+echo "  - LR: $LR (Reduced)"
+echo "  - Sigma: $SIGMA (Stabilized)"
 echo "========================================== "
 
 mkdir -p ./logs
 export TMPDIR=$(pwd)/local_tmp
 
-# Save log with timestamp
-LOG_FILE="./logs/sysu_phase2_train_$(date +%Y%m%d_%H%M%S).log"
+LOG_FILE="./logs/sysu_phase2_stable_$(date +%Y%m%d_%H%M%S).log"
 
 python main.py \
     --dataset $DATASET \

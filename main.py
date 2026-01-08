@@ -44,6 +44,11 @@ def main(args):
             enable_phase1 = False
             model.resume_model()
 
+        # Early Stopping Variables
+        patience = args.patience
+        best_epoch_phase1 = 0
+        best_epoch_phase2 = start_epoch
+
         if enable_phase1:
             logger('Time: {} | start phase1 from epoch 0'.format(time_now()))
             
@@ -62,6 +67,7 @@ def main(args):
                 if is_best_rank:
                     best_rank1 = cmc[0]
                     best_mAP = mAP # Just tracking
+                    best_epoch_phase1 = current_epoch
                     model.save_model(current_epoch, filename='best_phase1.pth')
                     
                 logger('Time: {} | phase 1 epoch {}; Setting: {}'.format(time_now(), current_epoch+1, args.save_path))
@@ -70,11 +76,18 @@ def main(args):
                 logger('R1:{:.4f};   R10:{:.4f};  R20:{:.4f};  mAP:{:.4f};  mINP:{:.4f}\n\
                        Best_R1: {:.4f};    Best mAP: {:.4f}'.format(cmc[0], cmc[9], cmc[19],mAP, mINP,best_rank1,best_mAP))
                 logger('=================================================')
+                
+                # Early Stopping Phase 1
+                if current_epoch - best_epoch_phase1 > patience:
+                    logger(f'Early stopping triggered in Phase 1 at epoch {current_epoch}. Best was {best_epoch_phase1}.')
+                    break
+
         else:
              logger('Phase 1 skipped (resume mode or stage1_epoch=0). Loading checkpoint if provided.')
 
         enable_phase1 = False
         start_epoch = model.resume_epoch
+        best_epoch_phase2 = start_epoch
         
         # If we loaded a Phase 1 model to start Phase 2, we might want to reset start_epoch if it's meant to be a fresh Phase 2 start
         # But usually we just continue global epochs. 
@@ -93,6 +106,7 @@ def main(args):
             if is_best_rank:
                 best_rank1 = cmc[0]
                 best_mAP = mAP
+                best_epoch_phase2 = current_epoch
                 model.save_model(current_epoch, filename='best_phase2.pth')
             
             logger('=================================================\nEpoch: {};Time: {};Setting: {}'
@@ -103,6 +117,12 @@ def main(args):
                    Best_R1: {:.4f};    Best mAP: {:.4f}'
                    .format(cmc[0], cmc[9], cmc[19],mAP, mINP,best_rank1,best_mAP))
             logger('=================================================')
+
+            # Early Stopping Phase 2
+            if current_epoch - best_epoch_phase2 > patience:
+                logger(f'Early stopping triggered in Phase 2 at epoch {current_epoch}. Best was {best_epoch_phase2}.')
+                break
+
         
     if args.mode == 'test':
         if args.model_path == 'default':
@@ -152,6 +172,7 @@ if __name__ == "__main__":
     parser.add_argument('--gall-mode', default='single',type=str,help='mutil or single shot')
     parser.add_argument('--test-mode', default='t2v',type=str,help='regdb and llcm test_mode')
     parser.add_argument('--model-path', default='default', type=str, help='load from checkpoint')
+    parser.add_argument('--patience', default=15, type=int, help='early stopping patience')
     args = parser.parse_args()
     args.save_path = './saved_'+args.dataset+'_{}'.format(args.arch)+'/'+args.save_path
     if args.dataset =='sysu':
