@@ -70,6 +70,24 @@ class Logger:
         with open(self.log_file, 'w') as f:
             pass
 
+class DebugLogger:
+    """
+    Writes to a log file without printing to console.
+    Used for detailed debugging information.
+    """
+    def __init__(self, log_file):
+        self.log_file = log_file
+        # Create/Clear the file
+        with open(self.log_file, 'w') as f:
+            f.write(f"Debug Log initialized at {time_now()}\n")
+
+    def __call__(self, input):
+        input = str(input)
+        timestamp = time_now()
+        with open(self.log_file, 'a') as f:
+            f.write(f"[{timestamp}] {input}\n")
+
+
 
 class MultiItemAverageMeter:
     def __init__(self):

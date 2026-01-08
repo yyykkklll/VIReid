@@ -8,32 +8,29 @@ import pickle
 from utils import fliplr
 class CMA(nn.Module):
     '''
-    Cross modal Match Aggregation
+    Cross modal Match Aggregation with Sinkhorn
     '''
     def __init__(self, args):
         super(CMA, self).__init__()
-        # self.inited = False
         self.device = torch.device(args.device)
         self.not_saved = True
-        # self.threshold = 0.8
         self.num_classes = args.num_classes
-        self.T = args.temperature # softmax temperature
-        self.sigma = args.sigma # momentum update factor
+        self.T = args.temperature 
+        self.sigma = args.sigma 
         # memory of visible and infrared modal
         self.register_buffer('vis_memory',torch.zeros(self.num_classes,2048))
         self.register_buffer('ir_memory',torch.zeros(self.num_classes,2048))
+        
+        # Sinkhorn params
+        self.epsilon = 0.05 # Smoothing parameter
+        self.sinkhorn_iters = 10
+        self.confidence_threshold = 0.0 # Return all or filter? Plan says 0.5 usually
 
     @torch.no_grad()
-    # def save(self,vis,ir,rgb_ids,ir_ids,rgb_idx,ir_idx,mode):
     def save(self,vis,ir,rgb_ids,ir_ids,rgb_idx,ir_idx,mode, rgb_features=None, ir_features=None):
-    # vis: vis sample(v2i scores or vis features) ir: ir sample
         self.mode = mode
         self.not_saved = False
-        if self.mode != 'scores' and self.mode != 'features':
-            raise ValueError('invalid mode!')
-        elif self.mode == 'scores': # predict scores
-            vis = torch.nn.functional.softmax(self.T*vis,dim=1)
-            ir = torch.nn.functional.softmax(self.T*ir,dim=1)
+        
         ###############################
         # save features in memory bank
         if rgb_features is not None and ir_features is not None:
@@ -48,7 +45,7 @@ class CMA(nn.Module):
                 # Select RGB features for the current label
                 rgb_mask = (rgb_ids == label)
                 ir_mask = (ir_ids == label)
-                # .any() check True in bool tensor
+                
                 if rgb_mask.any():
                     rgb_selected = rgb_features[rgb_mask]
                     self.vis_memory[label] = rgb_selected.mean(dim=0)
@@ -57,6 +54,8 @@ class CMA(nn.Module):
                     ir_selected = ir_features[ir_mask]
                     self.ir_memory[label] = ir_selected.mean(dim=0)
         ################################
+        
+        # We store these just in case, but we mainly use memory bank for Sinkhorn
         vis = vis.detach().cpu().numpy()
         ir = ir.detach().cpu().numpy()
         rgb_ids, ir_ids = rgb_ids.cpu(), ir_ids.cpu()
@@ -78,69 +77,101 @@ class CMA(nn.Module):
             selected_ir = ir_feats[ir_mask].mean(dim=0)
             self.ir_memory[i] = (1-self.sigma)*self.ir_memory[i] + self.sigma * selected_ir
 
-    def get_label(self, epoch=None):
-        if self.not_saved:# pass if 
-            pass
+    def get_label(self, epoch=None, debug_logger=None):
+        if self.not_saved:
+            if debug_logger:
+                debug_logger("CMA.get_label: Features not saved yet. Returning empty.")
+            return []
         else:
-            print('get match labels')
-            if self.mode == 'features':
-                dists = np.matmul(self.vis, self.ir.T)
-                v2i_dict, i2v_dict = self._get_label(dists,'dist')
+            print('Calculating Global Optimal Assignment (Sinkhorn)...')
+            if debug_logger:
+                debug_logger(f"CMA.get_label: Starting Sinkhorn Matching for Epoch {epoch}")
+            return self._sinkhorn_matching(debug_logger)
 
-            elif self.mode == 'scores':
-                v2i_dict, _ = self._get_label(self.vis,'rgb')
-                i2v_dict, _ = self._get_label(self.ir,'ir')
-                self.v2i = v2i_dict
-                self.i2v = i2v_dict
-            return v2i_dict, i2v_dict
-    # TODO
-    def _get_label(self,dists,mode):
-        sample_rate = 1
-        dists_shape = dists.shape
-        sorted_1d = np.argsort(dists, axis=None)[::-1]# flat to 1d and sort
-        sorted_2d = np.unravel_index(sorted_1d, dists_shape)# sort index return to 2d, like ([0,1,2],[1,2,0])
-        idx1, idx2 = sorted_2d[0], sorted_2d[1]# sorted idx of dim0 and dim1
-        dists = dists[idx1, idx2]
-        idx_length = int(np.ceil(sample_rate*dists.shape[0]/self.num_classes))
-        dists = dists[:idx_length]
-
-        if mode=='dist': # multiply the instance features of the two modalities
-            convert_label = [(i,j) for i,j in zip(np.array(self.rgb_ids)[idx1[:idx_length]],\
-                                            np.array(self.ir_ids)[idx2[:idx_length]])]
+    def _sinkhorn_matching(self, debug_logger=None):
+        # 1. Compute Cost Matrix
+        # Using 1 - Cosine Similarity
+        # vis_memory: (N, D), ir_memory: (N, D)
+        # Normalize first
+        vis_norm = torch.nn.functional.normalize(self.vis_memory, p=2, dim=1)
+        ir_norm = torch.nn.functional.normalize(self.ir_memory, p=2, dim=1)
+        
+        # Cosine Similarity: (N, N)
+        sim_matrix = torch.matmul(vis_norm, ir_norm.t())
+        
+        # Cost = 1 - Sim (or Euclidean, but 1-Sim is standard for cosine)
+        # Using Euclidean might be better for Sinkhorn if features are not normalized, 
+        # but here they are.
+        cost_matrix = 1.0 - sim_matrix
+        
+        if debug_logger:
+            debug_logger(f"Sinkhorn Cost Matrix Stats: Min={cost_matrix.min().item():.4f}, Max={cost_matrix.max().item():.4f}, Mean={cost_matrix.mean().item():.4f}")
+        
+        # 2. Sinkhorn Algorithm
+        # P = exp(-C / epsilon)
+        P = torch.exp(-cost_matrix / self.epsilon)
+        
+        # Iterative Normalization
+        for i in range(self.sinkhorn_iters):
+            # Row normalization (RGB needs to match someone)
+            P = P / (P.sum(dim=1, keepdim=True) + 1e-8)
+            # Column normalization (IR needs to receive someone)
+            P = P / (P.sum(dim=0, keepdim=True) + 1e-8)
             
-        elif mode=='rgb': # classify score of RGB (v2i)
-            convert_label = [(i,j) for i,j in zip(np.array(self.rgb_ids)[idx1[:idx_length]],\
-                                                  idx2[:idx_length])]
+        # P is now a doubly stochastic matrix (or close to it)
+        # P_ij is probability that RGB_i matches IR_j
+        
+        if debug_logger:
+            debug_logger(f"Sinkhorn P Matrix Stats (Final): Min={P.min().item():.6f}, Max={P.max().item():.6f}, Mean={P.mean().item():.6f}")
 
-        elif mode=='ir': # classify score of IR (v2i)
-            convert_label = [(i,j) for i,j in zip(np.array(self.ir_ids)[idx1[:idx_length]],\
-                                                  idx2[:idx_length])]
-        else:
-            raise AttributeError('invalid mode!')
-        convert_label_cnt = Counter(convert_label)
-        convert_label_cnt_sorted = sorted(convert_label_cnt.items(),key = lambda x:x[1],reverse = True)
-        length = len(convert_label_cnt_sorted)
-        lambda_cm=0.1
-        in_rgb_label=[]
-        in_ir_label=[]
-        v2i = OrderedDict()
-        i2v = OrderedDict()
-
-        length_ratio = 1
-        for i in range(int(length*length_ratio)):
-            key = convert_label_cnt_sorted[i][0] 
-            value = convert_label_cnt_sorted[i][1]
-            # if key[0] == -1 or key[1] == -1:
-            #     continue
-            if key[0] in in_rgb_label or key[1] in in_ir_label:
-                continue
-            in_rgb_label.append(key[0])
-            in_ir_label.append(key[1])
-            v2i[key[0]] = key[1]
-            i2v[key[1]] = key[0]
-            # v2i[key[0]][key[1]] = 1
+        # 3. Generate Match List (Optimized: Cycle Consistency + Non-linear Weighting)
+        match_list = []
+        rows, cols = P.shape
+        
+        # RGB -> IR Best Matches
+        # max_probs_r2i: (N_rgb,), indices_r2i: (N_rgb,)
+        max_probs_r2i, indices_r2i = torch.max(P, dim=1)
+        
+        # IR -> RGB Best Matches (for Cycle Consistency)
+        # max_probs_i2r: (N_ir,), indices_i2r: (N_ir,)
+        max_probs_i2r, indices_i2r = torch.max(P, dim=0)
+        
+        min_threshold = 1e-4
+        count_reliable = 0
+        count_weak = 0
+        
+        for r in range(rows):
+            c = indices_r2i[r].item()
+            score = max_probs_r2i[r].item()
             
-        return v2i, i2v # only v2i/i2v is used in scores mode
+            if score > min_threshold:
+                # Check Cycle Consistency: Does IR column 'c' also pick RGB row 'r' as best?
+                is_cycle_consistent = (indices_i2r[c].item() == r)
+                
+                final_weight = score
+                if is_cycle_consistent:
+                    # Reliable match: Keep linear weight (or boost slightly?)
+                    # score is enough.
+                    count_reliable += 1
+                else:
+                    # Weak/One-way match: Penalize heavily
+                    # Square the score to suppress low-confidence noise
+                    # e.g., 0.3 -> 0.09, 0.8 -> 0.64
+                    final_weight = score ** 2
+                    count_weak += 1
+                
+                match_list.append((r, c, final_weight))
+
+        if debug_logger:
+            debug_logger(f"Sinkhorn Strategy: Cycle Consistency + Square Penalty. Total: {len(match_list)}")
+            debug_logger(f"Reliable (Cycle): {count_reliable}, Weak (One-way): {count_weak}")
+            if len(match_list) > 0:
+                weights = [m[2] for m in match_list]
+                debug_logger(f"Weight Stats: Min={min(weights):.4f}, Max={max(weights):.4f}, Mean={sum(weights)/len(weights):.4f}")
+
+        print(f"Sinkhorn matches: {len(match_list)} (Reliable: {count_reliable}, Weak: {count_weak})")
+        return match_list
+
 
     def extract(self, args, model, dataset):
         '''
@@ -155,7 +186,7 @@ class CMA(nn.Module):
             ir_features, ir_labels, ir_gt, i2r_cls, ir_idx = self._extract_feature(model, ir_loader,'ir')
 
         # # //match by cls and save features to memory bank
-        self.save(r2i_cls, i2r_cls, rgb_labels, ir_labels, rgb_idx,\
+        self.save(r2i_cls, i2r_cls, rgb_labels, ir_labels, rgb_idx,
                  ir_idx, 'scores', rgb_features, ir_features)
         
     def _extract_feature(self, model, loader, modal):

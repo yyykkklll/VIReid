@@ -73,3 +73,26 @@ class Weak_loss(nn.Module):
         mask = (scores < label_probs).int()    
         criterion = lambda x: -((1. - x + eps).log() * mask).sum(1).mean()
         return criterion(scores)
+
+class WeightedContrastiveLoss(nn.Module):
+    def __init__(self, margin=0.5):
+        super(WeightedContrastiveLoss, self).__init__()
+        self.margin = margin
+        self.ranking_loss = nn.MarginRankingLoss(margin=margin, reduction='none')
+
+    def forward(self, x1, x2, weights):
+        """
+        x1: feat 1 (N, D)
+        x2: feat 2 (N, D)
+        weights: (N,) confidence scores. Higher means more likely positive.
+        
+        We treat these as positive pairs weighted by confidence.
+        Standard Contrastive Loss for positive pair: D(x1, x2)^2
+        Here we can use: weight * D(x1, x2)^2
+        
+        Or if we consider them as "soft" positives, maybe we just want to minimize distance proportional to weight.
+        Let's use Euclidean distance squared weighted.
+        """
+        dist_sq = torch.sum(torch.pow(x1 - x2, 2), dim=1)
+        loss = weights * dist_sq
+        return loss.mean()

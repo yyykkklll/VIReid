@@ -8,7 +8,7 @@ from utils import os_walk
 from .agw import AGW
 from .clip_model import CLIP
 from .optim import WarmupMultiStepLR
-from .loss import TripletLoss_WRT, Weak_loss
+from .loss import TripletLoss_WRT, Weak_loss, WeightedContrastiveLoss
 _models = {
     "resnet": AGW,  # visual encoder AGW, no text encoder
     "clip-resnet": CLIP,  # resnet50 + transformer
@@ -77,7 +77,7 @@ class Model:
     def _init_criterion(self):
         self.pid_criterion = torch.nn.CrossEntropyLoss()
         self.tri_criterion = TripletLoss_WRT()
-        self.weak_criterion = Weak_loss(method='log')
+        self.weak_criterion = Weak_loss()
 
     def set_train(self):
         self.model.train()
@@ -91,42 +91,41 @@ class Model:
         self.classifier2.eval()
         self.classifier3.eval()
 
-    def save_model(self, save_epoch, is_best):
-        if is_best:
-            model_file_path = os.path.join(self.save_path, 'model_{}.pth'.format(save_epoch))
-            root, _, files = os_walk(self.save_path)
-            for file in files:
-                if '.pth' not in file:
-                    files.remove(file)
-                file_iters = int(file.replace('.pth', '').split('_')[1])
-                if file_iters <= save_epoch: 
-                    remove_file_path = os.path.join(root, 'model_{}.pth'.format(file_iters))
-                    os.remove(remove_file_path)
-
-            all_state_dict = {'backbone': self.model.state_dict(),
-                               'classifier1': self.classifier1.state_dict(),
-                               'classifier2': self.classifier2.state_dict(),
-                               'classifier3': self.classifier3.state_dict()}
+    def save_model(self, save_epoch, filename):
+        if not os.path.exists(self.save_path):
+            os.makedirs(self.save_path)
             
-            torch.save(all_state_dict, model_file_path)        
+        model_file_path = os.path.join(self.save_path, filename)
         
+        all_state_dict = {'backbone': self.model.state_dict(),
+                            'classifier1': self.classifier1.state_dict(),
+                            'classifier2': self.classifier2.state_dict(),
+                            'classifier3': self.classifier3.state_dict(),
+                            'epoch': save_epoch}
+        
+        torch.save(all_state_dict, model_file_path)
+        print(f'Saved model to {model_file_path}')
+
     def resume_model(self, specified_model=None):
         '''
         # load the weights from existed file
         model_epoch: the epoch of the model to load(optional)
         '''
         if specified_model is None:
-            root, _, files = os_walk(self.save_path)
+            # Check for best_phase2.pth then best_phase1.pth
+            phase2_path = os.path.join(self.save_path, 'best_phase2.pth')
+            phase1_path = os.path.join(self.save_path, 'best_phase1.pth')
+            
+            model_path = None
+            if os.path.exists(phase2_path):
+                model_path = phase2_path
+            elif os.path.exists(phase1_path):
+                model_path = phase1_path
+            
             self.resume_epoch = 0
-            if len(files) > 0:
-                indexes = []
-                for file in files:
-                    indexes.append(int(file.replace('.pth', '').split('_')[-1]))
-                indexes = sorted(list(set(indexes)), reverse=False)
-                model_path = os.path.join(self.save_path, 'model_{}.pth'.format(indexes[-1]))
-                
+            if model_path is not None:
                 if self.resume or self.mode == 'test':
-                    loaded_dict = torch.load(model_path,map_location=self.device)
+                    loaded_dict = torch.load(model_path, map_location=self.device)
                     self.model.load_state_dict(loaded_dict['backbone'], strict=False)
                     self.classifier1.load_state_dict(loaded_dict['classifier1'], strict=False)
                     self.classifier2.load_state_dict(loaded_dict['classifier2'], strict=False)
@@ -134,19 +133,25 @@ class Model:
                         self.classifier3.load_state_dict(loaded_dict['classifier3'], strict=False)
                     except:
                         pass
-                    start_epoch = indexes[-1]
-                    self.resume_epoch = start_epoch
+                    
+                    if 'epoch' in loaded_dict:
+                        self.resume_epoch = loaded_dict['epoch']
+                    else:
+                        # Fallback if epoch not in dict (unlikely with new save)
+                        print("Warning: 'epoch' not found in checkpoint. Starting from 0.")
+                        self.resume_epoch = 0
+
                     print(f'load {model_path}')
                 else:
-                    os.remove(model_path)
-                    print('existed model files removed!')
+                    # If not resume/test, we don't delete files anymore as they are best checkpoints
+                    print('Not resuming, starting from scratch.')
             else:
                 print('valid model file not existed!')
             print(f'from {self.resume_epoch} epoch training')
 
         else:
             model_path = specified_model
-            loaded_dict = torch.load(model_path,map_location=self.device)
+            loaded_dict = torch.load(model_path, map_location=self.device)
             self.model.load_state_dict(loaded_dict['backbone'], strict=False)
             self.classifier1.load_state_dict(loaded_dict['classifier1'], strict=False)
             self.classifier2.load_state_dict(loaded_dict['classifier2'], strict=False)
@@ -155,9 +160,10 @@ class Model:
             except:
                 pass
             
-            # match = re.search(r'\d+', specified_model)
-            # self.resume_epoch = int(match.group())
+            if 'epoch' in loaded_dict:
+                 self.resume_epoch = loaded_dict['epoch']
+            else:
+                 self.resume_epoch = 0
             
-            self.resume_epoch = 0
             print(f'load {model_path}')
             print(f'from {self.resume_epoch} epoch training')
