@@ -1,7 +1,7 @@
 #!/bin/bash
 # sysu_phase2.sh
-# VI-ReID Training Script - Phase 2 ONLY (Optimized for Stability)
-# Skips Phase 1 and loads a pre-trained Phase 1 model
+# Load Phase 1 model and start Phase 2 directly
+# Useful for debugging Phase 2 collapse or continuing training
 
 # Clean up cache
 find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
@@ -10,58 +10,48 @@ find . -type f -name "*.pyc" -delete 2>/dev/null || true
 # ==================== Configuration ====================
 DATASET="sysu"
 ARCH="resnet"
-DEVICE=0
 SEARCH_MODE="all"
 GALL_MODE="single"
 DATA_PATH="./datasets/"
-SAVE_PATH="save_sysu_cmcl"
-
-# Path to the BEST Phase 1 Checkpoint
-PHASE1_MODEL_PATH="./saved_sysu_resnet/save_sysu_cmcl/models/best_phase1.pth"
+# Using a specific log folder for Phase 2 debugging
+SAVE_PATH="sysu_phase2_debug"
 
 # ==================== Training Settings ====================
-STAGE1_EPOCH=0
-# Continue Phase 2 for enough epochs
-STAGE2_EPOCH=120
+# We skip Phase 1 effectively by loading the model, 
+# but we keep variables consistent.
+STAGE1_EPOCH=0 
+STAGE2_EPOCH=140
 
-# [OPTIMIZATION 1] Lower Learning Rate for Phase 2
-# Previous 0.0003 caused severe oscillation. Lowering to 0.00015.
-LR=0.00015
-MILESTONES="40 80"
+# Learning Rate & Milestones
+LR=0.0003
+MILESTONES="40 100"
 
 # ==================== Batch Settings ====================
 BATCH_PIDNUM=8
 PID_NUMSAMPLE=4
 TRI_WEIGHT=0.25
 WEAK_WEIGHT=0.25
+PATIENCE=15
 
-# [OPTIMIZATION 2] Stabilize Memory Bank Update
-# Previous sigma 0.8 (update 80% new) was too volatile.
-# Changing to 0.2 (update 20% new, keep 80% old) to smooth out features.
-SIGMA=0.2
-TEMPERATURE=3
+# ==================== Model Loading ====================
+# Path to the pre-trained Phase 1 model
+MODEL_PATH="./best_phase1.pth"
 
 # ==================== Execute ====================
-echo "=========================================="
-echo "SYSU-MM01 TRAINING - PHASE 2 (STABLE)"
-echo "  - LR: $LR (Reduced)"
-echo "  - Sigma: $SIGMA (Stabilized)"
 echo "========================================== "
-
-mkdir -p ./logs
-export TMPDIR=$(pwd)/local_tmp
-
-LOG_FILE="./logs/sysu_phase2_stable_$(date +%Y%m%d_%H%M%S).log"
+echo "SYSU-MM01 PHASE 2 TRAINING"
+echo "  - Loading from: $MODEL_PATH"
+echo "  - Save Path: $SAVE_PATH"
+echo "========================================== "
 
 python main.py \
     --dataset $DATASET \
     --arch $ARCH \
-    --device $DEVICE \
     --mode train \
     --debug wsl \
     --data-path $DATA_PATH \
     --save-path $SAVE_PATH \
-    --model-path $PHASE1_MODEL_PATH \
+    --model-path $MODEL_PATH \
     \
     --lr $LR \
     --milestones $MILESTONES \
@@ -73,9 +63,7 @@ python main.py \
     \
     --tri-weight $TRI_WEIGHT \
     --weak-weight $WEAK_WEIGHT \
-    --sigma $SIGMA \
-    -T $TEMPERATURE \
+    --patience $PATIENCE \
     \
     --search-mode $SEARCH_MODE \
-    --gall-mode $GALL_MODE \
-    2>&1 | tee $LOG_FILE
+    --gall-mode $GALL_MODE

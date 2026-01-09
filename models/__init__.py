@@ -8,14 +8,13 @@ from utils import os_walk
 from .agw import AGW
 from .clip_model import CLIP
 from .optim import WarmupMultiStepLR
-from .loss import TripletLoss_WRT, Weak_loss, WeightedContrastiveLoss, LabelSmoothingCrossEntropy
+from .loss import TripletLoss_WRT, Weak_loss
 _models = {
     "resnet": AGW,  # visual encoder AGW, no text encoder
     "clip-resnet": CLIP,  # resnet50 + transformer
     "vit": 0,  # visual encoder vit, no text encoder
     #"clip-vit": CLIP,  # both vit-b/16 + transformer
 }
-
 
 
 def create(args):
@@ -31,14 +30,13 @@ def create(args):
 class Model:
     def __init__(self, args):
         self.mode = args.mode
-        self.device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-        self.save_path = os.path.join(args.save_path, "models/")
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.save_path = os.path.join(args.save_path, "model/")
         self.lr = args.lr
         self.weight_decay = args.weight_decay
         self.milestones = args.milestones
         self.resume = args.resume
         self.args = args
-        self.resume_epoch = 0  # Initialize resume_epoch to 0
 
         self.model = _models[args.arch](args).to(self.device)
         self.classifier1 = Image_Classifier(args).to(self.device) # RGB classifier
@@ -77,7 +75,7 @@ class Model:
         self.scheduler_phase2 = WarmupMultiStepLR(self.optimizer_phase2, self.milestones,
                                            gamma=0.1, warmup_factor=0.01, warmup_iters=10, mode='cls')
     def _init_criterion(self):
-        self.pid_criterion = LabelSmoothingCrossEntropy(smoothing=0.1)
+        self.pid_criterion = torch.nn.CrossEntropyLoss()
         self.tri_criterion = TripletLoss_WRT()
         self.weak_criterion = Weak_loss()
 
@@ -93,28 +91,24 @@ class Model:
         self.classifier2.eval()
         self.classifier3.eval()
 
-    def save_model(self, save_epoch, filename):
-        if not os.path.exists(self.save_path):
-            os.makedirs(self.save_path)
+    def save_model(self, save_epoch, is_best, phase=2):
+        if is_best:
+            model_file_path = os.path.join(self.save_path, 'best_phase{}.pth'.format(phase))
             
-        model_file_path = os.path.join(self.save_path, filename)
+            all_state_dict = {'backbone': self.model.state_dict(),
+                               'classifier1': self.classifier1.state_dict(),
+                               'classifier2': self.classifier2.state_dict(),
+                               'classifier3': self.classifier3.state_dict()}
+            
+            torch.save(all_state_dict, model_file_path)        
         
-        all_state_dict = {'backbone': self.model.state_dict(),
-                            'classifier1': self.classifier1.state_dict(),
-                            'classifier2': self.classifier2.state_dict(),
-                            'classifier3': self.classifier3.state_dict(),
-                            'epoch': save_epoch}
-        
-        torch.save(all_state_dict, model_file_path)
-        print(f'Saved model to {model_file_path}')
-
     def resume_model(self, specified_model=None):
         '''
         # load the weights from existed file
         model_epoch: the epoch of the model to load(optional)
         '''
         if specified_model is None:
-            # Check for best_phase2.pth then best_phase1.pth
+            # Try to find best_phase2.pth first, then best_phase1.pth
             phase2_path = os.path.join(self.save_path, 'best_phase2.pth')
             phase1_path = os.path.join(self.save_path, 'best_phase1.pth')
             
@@ -126,34 +120,22 @@ class Model:
             
             self.resume_epoch = 0
             if model_path is not None:
-                if self.resume or self.mode == 'test':
-                    loaded_dict = torch.load(model_path, map_location=self.device)
-                    self.model.load_state_dict(loaded_dict['backbone'], strict=False)
-                    self.classifier1.load_state_dict(loaded_dict['classifier1'], strict=False)
-                    self.classifier2.load_state_dict(loaded_dict['classifier2'], strict=False)
-                    try:
-                        self.classifier3.load_state_dict(loaded_dict['classifier3'], strict=False)
-                    except:
-                        pass
-                    
-                    if 'epoch' in loaded_dict:
-                        self.resume_epoch = loaded_dict['epoch']
-                    else:
-                        # Fallback if epoch not in dict (unlikely with new save)
-                        print("Warning: 'epoch' not found in checkpoint. Starting from 0.")
-                        self.resume_epoch = 0
-
-                    print(f'load {model_path}')
-                else:
-                    # If not resume/test, we don't delete files anymore as they are best checkpoints
-                    print('Not resuming, starting from scratch.')
+                loaded_dict = torch.load(model_path,map_location=self.device)
+                self.model.load_state_dict(loaded_dict['backbone'], strict=False)
+                self.classifier1.load_state_dict(loaded_dict['classifier1'], strict=False)
+                self.classifier2.load_state_dict(loaded_dict['classifier2'], strict=False)
+                try:
+                    self.classifier3.load_state_dict(loaded_dict['classifier3'], strict=False)
+                except:
+                    pass
+                print(f'load {model_path}')
             else:
                 print('valid model file not existed!')
             print(f'from {self.resume_epoch} epoch training')
 
         else:
             model_path = specified_model
-            loaded_dict = torch.load(model_path, map_location=self.device)
+            loaded_dict = torch.load(model_path,map_location=self.device)
             self.model.load_state_dict(loaded_dict['backbone'], strict=False)
             self.classifier1.load_state_dict(loaded_dict['classifier1'], strict=False)
             self.classifier2.load_state_dict(loaded_dict['classifier2'], strict=False)
@@ -162,10 +144,9 @@ class Model:
             except:
                 pass
             
-            if 'epoch' in loaded_dict:
-                 self.resume_epoch = loaded_dict['epoch']
-            else:
-                 self.resume_epoch = 0
+            # match = re.search(r'\d+', specified_model)
+            # self.resume_epoch = int(match.group())
             
+            self.resume_epoch = 0
             print(f'load {model_path}')
             print(f'from {self.resume_epoch} epoch training')

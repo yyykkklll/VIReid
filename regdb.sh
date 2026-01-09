@@ -1,8 +1,7 @@
 #!/bin/bash
 # regdb.sh
-# VI-ReID Training Script (Sinkhorn + CMCL Optimized)
-# Dataset: RegDB
-# Full Pipeline: Enhanced Phase 1 (Label Smoothing + More Epochs) -> Stable Phase 2
+# VI-ReID Training Script for RegDB
+# Template based on demo.sh
 
 # Clean up cache
 find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
@@ -11,70 +10,57 @@ find . -type f -name "*.pyc" -delete 2>/dev/null || true
 # ==================== Configuration ====================
 DATASET="regdb"
 ARCH="resnet"
-DEVICE=0
-TRIAL=1
+SEARCH_MODE="all" 
+GALL_MODE="single" 
 DATA_PATH="./datasets/"
-SAVE_PATH="save_regdb_cmcl"
+SAVE_PATH="regdb_log"
+TRIAL=1
 
 # ==================== Training Settings ====================
-# [Phase 1] Enhanced Supervised Pre-training
+# [Phase 1] Warm-up
+# Optimization: Increased from 50 to 60
 STAGE1_EPOCH=60
 
-# [Phase 2] Weakly Supervised Learning
+# [Phase 2] Main Training
+# RegDB usually converges faster/differently, usually 120 is fine.
 STAGE2_EPOCH=120
 
-# Learning Rate
-# RegDB uses higher LR
-LR=0.00045
-MILESTONES="40 100"
-
-# Early Stopping
-PATIENCE=15
+# Learning Rate & Milestones
+LR=0.00045 # Higher LR for RegDB as per original config
+MILESTONES="50 70"
 
 # ==================== Batch Settings ====================
 BATCH_PIDNUM=8
 PID_NUMSAMPLE=4
 TRI_WEIGHT=0.25
-WEAK_WEIGHT=0.25
-
-# [Phase 2 Stability]
-SIGMA=0.2
-TEMPERATURE=3
+WEAK_WEIGHT=0.25 
+PATIENCE=15
 
 # ==================== Execute ====================
 echo "=========================================="
-echo "RegDB FULL TRAINING (ENHANCED) - Trial $TRIAL"
-echo "  - Phase 1: 60 Epochs"
-echo "  - Phase 2: 120 Epochs"
-echo "  - Patience: $PATIENCE"
+echo "RegDB TRAINING (Optimized) - Trial $TRIAL"
+echo "  - Phase 1: $STAGE1_EPOCH Epochs"
+echo "  - Phase 2: End at $STAGE2_EPOCH Epochs"
 echo "=========================================="
-
-mkdir -p ./logs
-export TMPDIR=$(pwd)/local_tmp
-
-LOG_FILE="./logs/regdb_trial${TRIAL}_full_enhanced_$(date +%Y%m%d_%H%M%S).log"
 
 python main.py \
     --dataset $DATASET \
     --arch $ARCH \
-    --device $DEVICE \
     --mode train \
     --debug wsl \
-    --trial $TRIAL \
     --data-path $DATA_PATH \
     --save-path $SAVE_PATH \
+    --trial $TRIAL \
     \
     --lr $LR \
     --milestones $MILESTONES \
     --stage1-epoch $STAGE1_EPOCH \
     --stage2-epoch $STAGE2_EPOCH \
-    --patience $PATIENCE \
     \
     --batch-pidnum $BATCH_PIDNUM \
     --pid-numsample $PID_NUMSAMPLE \
     \
     --tri-weight $TRI_WEIGHT \
     --weak-weight $WEAK_WEIGHT \
-    --sigma $SIGMA \
-    -T $TEMPERATURE \
-    2>&1 | tee $LOG_FILE
+    --patience $PATIENCE \
+    --test-mode t2v

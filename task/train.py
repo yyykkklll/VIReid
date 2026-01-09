@@ -5,45 +5,84 @@ import time
 import numpy as np
 import random
 import copy
-from collections import OrderedDict, defaultdict
+from collections import OrderedDict
 from wsl import CMA
 from utils import MultiItemAverageMeter, infoEntropy,pha_unwrapping
 from models import Model
-from models.loss import WeightedContrastiveLoss
 from tqdm import tqdm
+import sys
 
 def train(args, model: Model, dataset, *arg):
     epoch = arg[0]
     cma:CMA = arg[1]
     logger = arg[2]
     enable_phase1 = arg[3]
-    debug_logger = arg[4] if len(arg) > 4 else None
-
-    rgb_to_ir_map = defaultdict(list)
 
     # //get feature for match
     if 'wsl' in args.debug or not enable_phase1:
         cma.extract(args, model, dataset)        
-        
-        # New Sinkhorn Logic
-        match_list = cma.get_label(epoch, debug_logger)
-        # match_list: [(rgb_label, ir_label, score), ...]
-        
-        if match_list:
-            for r, i, s in match_list:
-                rgb_to_ir_map[r].append((i, s))
-                # Since Sinkhorn is symmetric in principle (doubly stochastic), 
-                # we can also add ir->rgb map if needed, but we iterate rgb in batch.
-        elif not enable_phase1:
-             if debug_logger:
-                 debug_logger(f"WARNING: No matches found from Sinkhorn for Epoch {epoch} Phase 2!")
+        rgb_labeling_dict, ir_labeling_dict = \
+            dataset.train_rgb.relabel_dict, dataset.train_ir.relabel_dict
+        r2i_pair_dict, i2r_pair_dict = cma.get_label(epoch, logger)
+        common_dict, specific_dict, remain_dict = {},{},{}
+        i2r_specific_dict, r2i_specific_dict, r2i_remain_dict, i2r_remain_dict = {},{},{},{}
+        for r,i in r2i_pair_dict.items():
+            if i in i2r_pair_dict.keys() and i2r_pair_dict[i] == r:
+                common_dict[r] = i
+            elif r not in i2r_pair_dict.values() and i not in i2r_pair_dict.keys():
+                r2i_specific_dict[r] = i
+                specific_dict[r] = i
+            else:
+                r2i_remain_dict[r] = i
+                remain_dict[r] = i
+        for i,r in i2r_pair_dict.items():
+            if (r,i) in common_dict.items():
+                continue
+            elif r not in r2i_pair_dict.values() and i not in r2i_pair_dict.keys():
+                i2r_specific_dict[i] = r
+                specific_dict[r] = i
+            else:
+                i2r_remain_dict[i] = r
+                remain_dict[r] = i
+
+        all_rm = torch.zeros((args.num_classes,args.num_classes)).to(model.device) # all corresponding pairs
+        common_rm = all_rm.clone() # common corresponding pairs
+        specific_rm = all_rm.clone() # specific corresponding pairs
+        remain_rm = all_rm.clone() # remain corresponding pairs
+        r2i_rm = all_rm.clone() # r2i corresponding pairs
+        i2r_rm = all_rm.clone() # i2r corresponding pairs
+        for r, i in common_dict.items(): 
+            common_rm[r,i] += 1
+        for r, i in specific_dict.items():
+            specific_rm[r,i] += 1
+        for r, i in r2i_pair_dict.items():
+            r2i_rm[r,i] += 1
+        for i, r in i2r_pair_dict.items():
+            i2r_rm[i,r] += 1
+        for r, i in remain_dict.items():
+            remain_rm[r,i] += 1
+
+        specific_rm = specific_rm + common_rm
+        matched_rgb, matched_ir = list(r2i_pair_dict.keys()), list(i2r_pair_dict.keys())
+        common_matched_rgb, common_matched_ir = list(common_dict.keys()), list(common_dict.values())
+        specific_matched_rgb, specific_matched_ir = list(specific_dict.keys()), list(specific_dict.values())
+        remain_matched_rgb, remain_matched_ir = list(remain_dict.keys()), list(remain_dict.values())
+        all_matched_rgb = list(set(common_matched_rgb + specific_matched_rgb + remain_matched_rgb))
+        all_matched_ir = list(set(common_matched_ir + specific_matched_ir + remain_matched_ir))
+        matched_rgb = torch.tensor(matched_rgb).to(model.device)
+        matched_ir = torch.tensor(matched_ir).to(model.device)
+        common_matched_rgb = torch.tensor(common_matched_rgb).to(model.device)
+        common_matched_ir = torch.tensor(common_matched_ir).to(model.device)
+        specific_matched_rgb = torch.tensor(specific_matched_rgb).to(model.device)
+        specific_matched_ir = torch.tensor(specific_matched_ir).to(model.device)
+
+        remain_matched_rgb = torch.tensor(remain_matched_rgb).to(model.device)
+        remain_matched_ir = torch.tensor(remain_matched_ir).to(model.device)
+        all_matched_rgb = torch.tensor(all_matched_rgb).to(model.device)
+        all_matched_ir = torch.tensor(all_matched_ir).to(model.device)
 
         if not model.enable_cls3:
             model.enable_cls3 = True
-            
-    # Initialize Weighted Loss
-    cmcl_criterion = WeightedContrastiveLoss(margin=0.5).to(model.device)
-
     # ======================================================
     model.set_train()
     meter = MultiItemAverageMeter()
@@ -51,14 +90,16 @@ def train(args, model: Model, dataset, *arg):
     rgb_loader, ir_loader = dataset.get_train_loader()
 
     nan_batch_counter = 0
-    # 创建进度条
+    # 创建进度条，自适应终端宽度
     total_batches = min(len(rgb_loader), len(ir_loader))
-    phase_name = "Phase1" if enable_phase1 else "Phase2"
-    progress_bar = tqdm(zip(rgb_loader, ir_loader), total=total_batches, 
-                       desc=f'Epoch {epoch} [{phase_name}]',
-                       leave=False)
-    
-    for batch_idx, ((rgb_imgs, ca_imgs, color_info), (ir_imgs, aug_imgs,ir_info)) in enumerate(progress_bar):
+    progress_bar = tqdm(
+        zip(rgb_loader, ir_loader), 
+        total=total_batches,
+        desc=f"Epoch {epoch}",
+        ncols=None,  # 自适应终端宽度
+        file=sys.stdout
+    )
+    for (rgb_imgs, ca_imgs, color_info), (ir_imgs, aug_imgs,ir_info) in progress_bar:
         if enable_phase1:
             model.optimizer_phase1.zero_grad()
         else:
@@ -81,11 +122,8 @@ def train(args, model: Model, dataset, *arg):
         ircls_out, _l2_features = model.classifier2(bn_features)
 
         rgb_features, ir_features = gap_features[:2*bt], gap_features[2*bt:]
-        r2r_cls, i2i_cls, r2i_cls,i2r_cls \
-              = rgbcls_out[:2*bt], ircls_out[2*bt:], ircls_out[:2*bt], rgbcls_out[2*bt:]
-        
-        total_loss = 0
-        
+        r2r_cls, i2i_cls, r2i_cls,i2r_cls =\
+              rgbcls_out[:2*bt], ircls_out[2*bt:], ircls_out[:2*bt], rgbcls_out[2*bt:]
         if 'wsl' in args.debug:
             if enable_phase1:
                 r2r_id_loss = model.pid_criterion(r2r_cls, rgb_ids)
@@ -98,112 +136,161 @@ def train(args, model: Model, dataset, *arg):
                             'r2r_tri_loss':r2r_tri_loss.data,
                             'i2i_tri_loss':i2i_tri_loss.data})
             else:
-                # Phase 2: CMCL + Intra-modal Baseline
-                # 1. Intra-modal Loss (Baseline stability)
-                r2r_id_loss = model.pid_criterion(r2r_cls, rgb_ids)
-                i2i_id_loss = model.pid_criterion(i2i_cls, ir_ids)
-                meter.update({'r2r_id_loss':r2r_id_loss.data, 'i2i_id_loss':i2i_id_loss.data})
-                total_loss += (r2r_id_loss + i2i_id_loss)
-                
-                # 2. CMCL: Reliability-Aware Loss
-                cmcl_loss_val = torch.tensor(0.0, device=model.device)
-                valid_pairs = 0
-                
-                # Iterate over RGB samples in batch
-                # rgb_ids has 2*bt elements (original + augmented)
-                # rgb_features has 2*bt elements
-                
-                # We can optimize this loop
-                unique_rgb_ids = torch.unique(rgb_ids)
-                
-                for r_id_tensor in unique_rgb_ids:
-                    r_id = r_id_tensor.item()
-                    if r_id in rgb_to_ir_map:
-                        matches = rgb_to_ir_map[r_id]
-                        
-                        # Find indices in current RGB batch
-                        rgb_indices = (rgb_ids == r_id).nonzero(as_tuple=True)[0]
-                        
-                        for target_ir_label, score in matches:
-                            # Find indices in current IR batch
-                            ir_indices = (ir_ids == target_ir_label).nonzero(as_tuple=True)[0]
-                            
-                            if len(ir_indices) > 0:
-                                # Found matches in batch
-                                # Form pairs: all rgb instances of r_id vs all ir instances of target_ir_label
-                                
-                                # rgb_indices: (N_rgb,)
-                                # ir_indices: (N_ir,)
-                                
-                                # Gather features
-                                curr_rgb_feats = rgb_features[rgb_indices] # (N_rgb, D)
-                                curr_ir_feats = ir_features[ir_indices] # (N_ir, D)
-                                
-                                # Expand to pairs (N_rgb * N_ir, D)
-                                curr_rgb_expanded = curr_rgb_feats.unsqueeze(1).repeat(1, len(ir_indices), 1).view(-1, curr_rgb_feats.size(1))
-                                curr_ir_expanded = curr_ir_feats.unsqueeze(0).repeat(len(rgb_indices), 1, 1).view(-1, curr_ir_feats.size(1))
-                                
-                                scores = torch.tensor([score] * curr_rgb_expanded.size(0), device=model.device)
-                                
-                                loss = cmcl_criterion(curr_rgb_expanded, curr_ir_expanded, scores)
-                                cmcl_loss_val += loss * len(rgb_indices) * len(ir_indices) # Weighted by number of pairs? Or mean? 
-                                # WeightedContrastiveLoss returns mean. We accumulate and re-average later.
-                                # Actually better to just accumulate the sum of weighted distances
-                                
-                                valid_pairs += 1
-
-                if valid_pairs > 0:
-                     # Since we simply summed means, this might be rough. 
-                     # But it captures the gradient.
-                    cmcl_loss_val = cmcl_loss_val / valid_pairs
-                    meter.update({'cmcl_loss': cmcl_loss_val.data})
-                    total_loss += cmcl_loss_val
-                
-                if debug_logger and (batch_idx % 50 == 0):
-                    log_msg = f"Epoch {epoch} Batch {batch_idx}: Valid CMCL Pairs={valid_pairs}"
-                    if valid_pairs > 0:
-                        log_msg += f", CMCL Loss={cmcl_loss_val.item():.4f}"
-                    debug_logger(log_msg)
-
-        elif args.debug == 'baseline':
-                r2r_id_loss = model.pid_criterion(r2r_cls, rgb_ids)
-                i2i_id_loss = model.pid_criterion(i2i_cls, ir_ids)
-                r2r_tri_loss = args.tri_weight * model.tri_criterion(rgb_features, rgb_ids)
-                i2i_tri_loss = args.tri_weight * model.tri_criterion(ir_features, ir_ids)
-                total_loss = r2r_id_loss + i2i_id_loss + r2r_tri_loss + i2i_tri_loss
+                r2c_cls = model.classifier3(bn_features)[0][:2*bt]
+                i2c_cls = model.classifier3(bn_features)[0][2*bt:]
+                dtd_features = bn_features.detach()
+                dtd_rgbcls_out = model.classifier1(dtd_features)[0]
+                dtd_ircls_out = model.classifier2(dtd_features)[0]
+                dtd_r2r_cls, dtd_i2r_cls = dtd_rgbcls_out[:2*bt], dtd_rgbcls_out[2*bt:]
+                dtd_r2i_cls, dtd_i2i_cls = dtd_ircls_out[:2*bt], dtd_ircls_out[2*bt:]
+                r2r_id_loss = model.pid_criterion(dtd_r2r_cls, rgb_ids)
+                i2i_id_loss = model.pid_criterion(dtd_i2i_cls, ir_ids)
                 meter.update({'r2r_id_loss':r2r_id_loss.data,
-                            'i2i_id_loss':i2i_id_loss.data,
-                            'r2r_tri_loss':r2r_tri_loss.data,
-                            'i2i_tri_loss':i2i_tri_loss.data})
-        
-        elif args.debug == 'sl':
-            # //supervised learning
-            rgb_gts = torch.cat((rgb_gts,rgb_gts)).to(model.device)
-            ir_gts = torch.cat((ir_gts,ir_gts)).to(model.device)
-            gts = torch.cat((rgb_gts,ir_gts))
+                            'i2i_id_loss':i2i_id_loss.data})
+                total_loss = r2r_id_loss + i2i_id_loss
+                common_rgb_indices = torch.isin(rgb_ids, common_matched_rgb)
+                common_ir_indices = torch.isin(ir_ids, common_matched_ir)
+                ###############################################################
+                if args.debug == 'wsl':
+                    tri_rgb_indices = torch.isin(rgb_ids, common_matched_rgb)
+                    tri_ir_indices = torch.isin(ir_ids, common_matched_ir)
+                    selected_tri_rgb_ids = rgb_ids[tri_rgb_indices]
+                    selected_tri_ir_ids = ir_ids[tri_ir_indices]
+                    translated_tri_rgb_label = torch.nonzero(common_rm[selected_tri_rgb_ids])[:,-1]
+                    translated_tri_ir_label = torch.nonzero(common_rm.T[selected_tri_ir_ids])[:,-1]
+                
+                    selected_tri_rgb_features = rgb_features[tri_rgb_indices]
+                    selected_tri_ir_features = ir_features[tri_ir_indices]
+                    matched_tri_rgb_features = torch.cat((selected_tri_rgb_features,ir_features),dim=0)
+                    matched_tri_ir_features = torch.cat((rgb_features,selected_tri_ir_features),dim=0)
+                    matched_tri_rgb_labels = torch.cat((translated_tri_rgb_label,ir_ids),dim=0)
+                    matched_tri_ir_labels = torch.cat((rgb_ids,translated_tri_ir_label),dim=0)
+                    tri_loss_rgb = args.tri_weight * model.tri_criterion(matched_tri_rgb_features, matched_tri_rgb_labels)
+                    tri_loss_ir = args.tri_weight * model.tri_criterion(matched_tri_ir_features, matched_tri_ir_labels)
+                    meter.update({'tri_loss_rgb':tri_loss_rgb.data,
+                                'tri_loss_ir':tri_loss_ir.data})
+                    total_loss += tri_loss_rgb + tri_loss_ir
 
-            id_loss = model.pid_criterion(rgbcls_out, gts)
-            tri_loss = model.tri_criterion(gap_features, gts)
-            total_loss = id_loss + args.tri_weight*tri_loss
-            meter.update({'id_loss': id_loss.data,
-                            'tri_loss': tri_loss.data})
+                    selected_common_rgb_ids = rgb_ids[common_rgb_indices]
+                    selected_common_ir_ids = ir_ids[common_ir_indices]
+                    translated_cmo_rgb_label = torch.nonzero(common_rm[selected_common_rgb_ids])[:,-1]
+                    translated_cmo_ir_label = torch.nonzero(common_rm.T[selected_common_ir_ids])[:,-1]
+                    cma.update(bn_features[:2*bt], bn_features[2*bt:], rgb_ids, ir_ids)
+                    r2i_entropy = infoEntropy(r2i_cls)
+                    i2r_entropy = infoEntropy(i2r_cls)
+                    w_r2i = r2i_entropy/(r2i_entropy+i2r_entropy)
+                    w_i2r = i2r_entropy/(r2i_entropy+i2r_entropy)
+                    selected_rgb_memory = cma.vis_memory[translated_cmo_ir_label].detach()
+                    selected_ir_memory = cma.ir_memory[translated_cmo_rgb_label].detach()
+                    mem_r2i_cls,_ = model.classifier2(selected_rgb_memory)
+                    mem_i2r_cls,_ = model.classifier1(selected_ir_memory)
+                    cmo_criterion = torch.nn.MSELoss()
 
-        else:
-            raise RuntimeError('Debug mode {} not found!'.format(args.debug))
-    
-        total_loss.backward()
+                    if (selected_tri_ir_ids.shape[0]!=0):
+                        r2i_cmo_loss = w_r2i * cmo_criterion(dtd_i2i_cls[common_ir_indices],mem_r2i_cls)
+                        if torch.isnan(r2i_cmo_loss).any():
+                            nan_batch_counter+=1
+                        else:
+                            meter.update({'r2i_cmo_loss':r2i_cmo_loss.data})
+                            total_loss += r2i_cmo_loss
+                            if logger and nan_batch_counter == 0 and epoch % 5 == 0:
+                                logger.debug(f"Batch Debug | R2I CMO Loss: {r2i_cmo_loss.item():.4f}")
+
+                    if (selected_tri_rgb_ids.shape[0]!=0):
+                        i2r_cmo_loss = w_i2r * cmo_criterion(dtd_r2r_cls[common_rgb_indices],mem_i2r_cls)
+                        if torch.isnan(i2r_cmo_loss).any():
+                            nan_batch_counter+=1
+                        else:
+                            meter.update({'i2r_cmo_loss':i2r_cmo_loss.data})
+                            total_loss += i2r_cmo_loss
+                            if logger and nan_batch_counter == 0 and epoch % 5 == 0:
+                                logger.debug(f"Batch Debug | I2R CMO Loss: {i2r_cmo_loss.item():.4f}")
+
+                if epoch >= 30:
+                    remain_rgb_indices = torch.isin(rgb_ids, remain_matched_rgb)
+                    remain_ir_indices = torch.isin(ir_ids, remain_matched_ir)
+                    remain_rgb_ids = rgb_ids[remain_rgb_indices]
+                    remain_ir_ids = ir_ids[remain_ir_indices]
+                    remain_r2c_cls = r2c_cls[remain_rgb_indices]
+                    remain_i2c_cls = i2c_cls[remain_ir_indices]
+                    if (remain_rgb_indices.shape[0]>0):
+                        weak_r2c_loss = args.weak_weight*model.weak_criterion(remain_r2c_cls, remain_rm[remain_rgb_ids])
+                        if torch.isnan(weak_r2c_loss).any():
+                            nan_batch_counter+=1
+                        else:
+                            meter.update({'weak_r2c_loss':weak_r2c_loss.data})
+                            total_loss += weak_r2c_loss
         if enable_phase1:
+            total_loss.backward()
             model.optimizer_phase1.step()
-        else:
+        else:                
+            if args.debug == 'wsl':# //use modal specific pseudo labels
+                specific_rgb_indices = torch.isin(rgb_ids, specific_matched_rgb)
+                specific_ir_indices = torch.isin(ir_ids, specific_matched_ir)
+                rgb_indices = specific_rgb_indices ^ common_rgb_indices
+                ir_indices = specific_ir_indices ^ common_ir_indices
+
+                selected_ir_ids = ir_ids[ir_indices]
+                selected_rgb_ids = rgb_ids[rgb_indices]
+                selected_i2c_cls = i2c_cls[ir_indices]
+                selected_r2c_cls = r2c_cls[rgb_indices]
+
+                if (selected_rgb_ids.shape[0]>0):
+                    rgb_cross_loss = model.pid_criterion(selected_r2c_cls, specific_rm[selected_rgb_ids])
+                    if torch.isnan(rgb_cross_loss).any():
+                        nan_batch_counter+=1
+                    else:
+                        meter.update({'rgb_cross_loss':rgb_cross_loss.data})
+                        total_loss += rgb_cross_loss * args.weak_weight
+                
+                # [DEBUG] Log pseudo-label selection
+                if logger and epoch % 5 == 0 and nan_batch_counter == 0: # Log periodically
+                     logger.debug(f'Epoch {epoch} | Phase 2 | Pseudo-labels: RGB Selected {selected_rgb_ids.shape[0]}/{rgb_indices.sum()}, IR Selected {selected_ir_ids.shape[0]}/{ir_indices.sum()}')
+
+                ir_cross_loss = model.pid_criterion(i2c_cls, ir_ids)
+                meter.update({'ir_cross_loss':ir_cross_loss.data})
+                total_loss+= ir_cross_loss * args.weak_weight
+                    
+            elif args.debug == 'baseline':
+                    r2r_id_loss = model.pid_criterion(r2r_cls, rgb_ids)
+                    i2i_id_loss = model.pid_criterion(i2i_cls, ir_ids)
+                    r2r_tri_loss = args.tri_weight * model.tri_criterion(rgb_features, rgb_ids)
+                    i2i_tri_loss = args.tri_weight * model.tri_criterion(ir_features, ir_ids)
+                    total_loss = r2r_id_loss + i2i_id_loss + r2r_tri_loss + i2i_tri_loss
+                    meter.update({'r2r_id_loss':r2r_id_loss.data,
+                                'i2i_id_loss':i2i_id_loss.data,
+                                'r2r_tri_loss':r2r_tri_loss.data,
+                                'i2i_tri_loss':i2i_tri_loss.data})
+            
+            elif args.debug == 'sl':
+                # //supervised learning
+                rgb_gts = torch.cat((rgb_gts,rgb_gts)).to(model.device)
+                ir_gts = torch.cat((ir_gts,ir_gts)).to(model.device)
+                gts = torch.cat((rgb_gts,ir_gts))
+
+                id_loss = model.pid_criterion(rgbcls_out, gts)
+                tri_loss = model.tri_criterion(gap_features, gts)
+                total_loss = id_loss + args.tri_weight*tri_loss
+                meter.update({'id_loss': id_loss.data,
+                                'tri_loss': tri_loss.data})
+
+            else:
+                raise RuntimeError('Debug mode {} not found!'.format(args.debug))
+        
+            total_loss.backward()
+            
+            # [DEBUG] Log Gradient Norm and Clip
+            if not enable_phase1:
+                 total_norm = torch.nn.utils.clip_grad_norm_(model.model.parameters(), max_norm=10.0)
+                 if logger and epoch % 5 == 0 and nan_batch_counter == 0:
+                     logger.debug(f'Epoch {epoch} | Phase 2 | Grad Norm: {total_norm:.4f}')
+
             model.optimizer_phase2.step()
         
-        # 更新进度条显示当前损失
-        if hasattr(progress_bar, 'set_postfix'):
-            progress_bar.set_postfix({'loss': f'{total_loss.item():.4f}'})
+        # 更新进度条（不显示损失信息）
+        progress_bar.update(1)
     
-    # 关闭进度条
     progress_bar.close()
-    
     return meter.get_val(), meter.get_str()
 
 def relabel(select_ids, source_labels, target_labels):

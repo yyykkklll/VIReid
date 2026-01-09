@@ -9,7 +9,7 @@ import datasets
 import models
 from task import train, test
 from wsl import CMA
-from utils import time_now, makedir, Logger, MultiItemAverageMeter, set_seed, save_checkpoint, DebugLogger
+from utils import time_now, makedir, Logger, MultiItemAverageMeter, set_seed, save_checkpoint
 
 warnings.filterwarnings("ignore")
 
@@ -17,12 +17,10 @@ def main(args):
     best_rank1 = 0
     best_mAP = 0
     log_path = os.path.join(args.save_path, "log/")
-    model_path = os.path.join(args.save_path, "models/")
+    model_path = os.path.join(args.save_path, "model/")
     makedir(log_path)
     makedir(model_path)
-    logger = Logger(os.path.join(log_path, "log.txt"))
-    debug_logger = DebugLogger(os.path.join(log_path, "debug.log")) # Initialize Debug Logger
-    
+    logger = Logger(os.path.join(log_path, "log.txt"), os.path.join(log_path, "debug.txt"))
     if not args.resume and args.mode == 'train':
         logger.clear()
     logger(args)
@@ -44,92 +42,63 @@ def main(args):
             enable_phase1 = False
             model.resume_model()
 
-        # Early Stopping Variables
-        patience = args.patience
-        best_epoch_phase1 = 0
-        start_epoch = getattr(model, 'resume_epoch', 0)
-        best_epoch_phase2 = start_epoch
-
         if enable_phase1:
             logger('Time: {} | start phase1 from epoch 0'.format(time_now()))
-            
-            # Reset best metrics for Phase 1
-            best_rank1 = 0.0
-            best_mAP = 0.0
-            
             for current_epoch in range(0, args.stage1_epoch):
                 model.scheduler_phase1.step(current_epoch)
-                # Pass debug_logger to train
-                _, result = train(args, model, dataset, current_epoch,cma,logger,enable_phase1, debug_logger)
+                _, result = train(args, model, dataset, current_epoch,cma,logger,enable_phase1)
                 cmc, mAP, mINP = test(args, model, dataset,current_epoch) 
                 
-                # Check and save best Phase 1 model
                 is_best_rank = (cmc[0] >= best_rank1)
+                best_rank1 = max(cmc[0], best_rank1)
+                best_mAP = max(mAP, best_mAP)
+                
                 if is_best_rank:
-                    best_rank1 = cmc[0]
-                    best_mAP = mAP # Just tracking
-                    best_epoch_phase1 = current_epoch
-                    model.save_model(current_epoch, filename='best_phase1.pth')
-                    
+                    model.save_model(current_epoch, is_best_rank, phase=1)
+
                 logger('Time: {} | phase 1 epoch {}; Setting: {}'.format(time_now(), current_epoch+1, args.save_path))
                 logger(f'e_lr: {model.scheduler_phase1.get_lr()[0]}')
                 logger(result)
                 logger('R1:{:.4f};   R10:{:.4f};  R20:{:.4f};  mAP:{:.4f};  mINP:{:.4f}\n\
-                       Best_R1: {:.4f};    Best mAP: {:.4f}'.format(cmc[0], cmc[9], cmc[19],mAP, mINP,best_rank1,best_mAP))
+                       Best_R1: {:.4f};    Best mAP: {:.4f}'\
+                       .format(cmc[0], cmc[9], cmc[19],mAP, mINP,best_rank1,best_mAP))
                 logger('=================================================')
                 
-                # Early Stopping Phase 1
-                current_patience = current_epoch - best_epoch_phase1
-                if current_patience > patience:
-                    logger(f'Early stopping triggered in Phase 1 at epoch {current_epoch}. Best was {best_epoch_phase1}.')
-                    break
-                else:
-                    print(f'Patience Phase 1: {current_patience}/{patience} (Best epoch: {best_epoch_phase1})')
-
-        else:
-             logger('Phase 1 skipped (resume mode or stage1_epoch=0). Loading checkpoint if provided.')
-
         enable_phase1 = False
-        start_epoch = getattr(model, 'resume_epoch', 0)
-        best_epoch_phase2 = start_epoch
-        
-        # If we loaded a Phase 1 model to start Phase 2, we might want to reset start_epoch if it's meant to be a fresh Phase 2 start
-        # But usually we just continue global epochs. 
-        # If user provides --stage1-epoch 0, enable_phase1 is False (via logic above if resume/model_path used).
-        
+        start_epoch = model.resume_epoch
+        # Reset best metrics for Phase 2 to ensure we capture the best of this phase
+        best_rank1 = 0
+        best_mAP = 0
         logger('Time: {} | start phase2 from epoch {}'.format(time_now(), start_epoch))
-        
+        patience_count = 0
         for current_epoch in range(start_epoch, args.stage2_epoch):
             model.scheduler_phase2.step(current_epoch)
-            # Pass debug_logger to train
-            _, result = train(args, model, dataset, current_epoch,cma,logger,enable_phase1, debug_logger)
+            _, result = train(args, model, dataset, current_epoch,cma,logger,enable_phase1)
 
             cmc, mAP, mINP = test(args, model, dataset,current_epoch) 
             is_best_rank = (cmc[0] >= best_rank1)
-            
-            if is_best_rank:
-                best_rank1 = cmc[0]
-                best_mAP = mAP
-                best_epoch_phase2 = current_epoch
-                model.save_model(current_epoch, filename='best_phase2.pth')
-            
-            logger('=================================================\nEpoch: {};Time: {};Setting: {}'
+            is_best_mAP = (mAP >= best_mAP)
+            best_rank1 = max(cmc[0], best_rank1)
+            best_mAP = max(mAP, best_mAP)
+            model.save_model(current_epoch, is_best_rank, phase=2)
+            logger('=================================================\nEpoch: {};Time: {};Setting: {}'\
                    .format(current_epoch, time_now(), args.save_path))
             logger(f'e_lr: {model.scheduler_phase2.get_lr()[0]}')
             logger(result)
             logger('R1:{:.4f};   R10:{:.4f};  R20:{:.4f};  mAP:{:.4f};  mINP:{:.4f}\n\
-                   Best_R1: {:.4f};    Best mAP: {:.4f}'
+                   Best_R1: {:.4f};    Best mAP: {:.4f}'\
                    .format(cmc[0], cmc[9], cmc[19],mAP, mINP,best_rank1,best_mAP))
             logger('=================================================')
 
-            # Early Stopping Phase 2
-            current_patience = current_epoch - best_epoch_phase2
-            if current_patience > patience:
-                logger(f'Early stopping triggered in Phase 2 at epoch {current_epoch}. Best was {best_epoch_phase2}.')
-                break
+            if is_best_rank:
+                patience_count = 0
+                logger(f'New Best Rank-1: {best_rank1:.4f}! Patience reset to 0/{args.patience}')
             else:
-                print(f'Patience Phase 2: {current_patience}/{patience} (Best epoch: {best_epoch_phase2})')
-
+                patience_count += 1
+                logger(f'Validation metric did not improve. Patience: {patience_count}/{args.patience}')
+                if patience_count >= args.patience:
+                    logger('Early stopping triggered! Best Rank-1: {:.4f}'.format(best_rank1))
+                    break
         
     if args.mode == 'test':
         if args.model_path == 'default':
@@ -139,7 +108,7 @@ def main(args):
         cmc, mAP, mINP = test(args, model, dataset)
         logger('Time: {}; Test on Dataset: {}'.format(time_now(), args.dataset))
         logger('R1:{:.4f};   R10:{:.4f};  R20:{:.4f};  mAP:{:.4f};  mINP:{:.4f}\n\
-               Best_R1: {:.4f};    Best mAP: {:.4f}'
+               Best_R1: {:.4f};    Best mAP: {:.4f}'\
                .format(cmc[0], cmc[9], cmc[19],mAP, mINP,best_rank1,best_mAP))
         
 if __name__ == "__main__":
@@ -148,7 +117,7 @@ if __name__ == "__main__":
     parser.add_argument("--arch", default="resnet", type=str, help="sysu:clip-resnet, llcm:resnet, regdb:resnet")
     parser.add_argument('--mode', default='train', help='train or test')
 
-    parser.add_argument("--data-path", default="./datasets", type=str, help="dataset path")
+    parser.add_argument("--data-path", default="../../VIREID_Dataset/", type=str, help="dataset path")
     parser.add_argument("--save-path", default="save/", type=str, help="log and model save path")
 
     parser.add_argument('--lr', default=0.0003, type=float, help='learning rate 0.0003 for sysu(s) and llcm(l), 0.00045 for regdb(r)')
@@ -169,7 +138,6 @@ if __name__ == "__main__":
     
     parser.add_argument('--sigma', default=0.8, type=float, help='momentum update factor')
     parser.add_argument('-T', '--temperature', default=3, type=float, help='Temperature parameter of softmax')
-    parser.add_argument("--device", default=0, type=int, help="gpu")
     parser.add_argument('--stage1-epoch' ,default=20, type=int,help='s:20, l:80, r:50')
     parser.add_argument('--stage2-epoch' ,default=120, type=int,help='CMCL total epoch')
     parser.add_argument('--resume', default= 0, type = int, help='resume or not')
@@ -181,14 +149,16 @@ if __name__ == "__main__":
     parser.add_argument('--model-path', default='default', type=str, help='load from checkpoint')
     parser.add_argument('--patience', default=15, type=int, help='early stopping patience')
     args = parser.parse_args()
-    args.save_path = './saved_'+args.dataset+'_{}'.format(args.arch)+'/'+args.save_path
     if args.dataset =='sysu':
         args.num_classes = 395
+        args.save_path = 'sysu_log'
     elif args.dataset =='regdb':
         args.num_classes = 206
-        args.save_path += f'_{args.trial}'
+        args.save_path = f'regdb_log_{args.trial}'
     elif args.dataset == 'llcm':
         args.num_classes = 713
+        args.save_path = 'llcm_log'
+    
     set_seed(args.seed)
     setproctitle.setproctitle(args.save_path)
     main(args)

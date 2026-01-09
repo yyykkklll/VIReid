@@ -57,8 +57,9 @@ def infoEntropy(input):
     return output
 
 class Logger:
-    def __init__(self, log_file):
+    def __init__(self, log_file, debug_file=None):
         self.log_file = log_file
+        self.debug_file = debug_file
 
     def __call__(self, input):
         input = str(input)
@@ -66,27 +67,21 @@ class Logger:
             f.writelines(input+'\n')
         print(input)
 
+    def debug(self, input):
+        input = str(input)
+        if self.debug_file:
+            with open(self.debug_file, 'a') as f:
+                f.writelines(input + '\n')
+        else:
+            with open(self.log_file, 'a') as f:
+                f.writelines('[DEBUG] ' + input + '\n')
+
     def clear(self):
         with open(self.log_file, 'w') as f:
             pass
-
-class DebugLogger:
-    """
-    Writes to a log file without printing to console.
-    Used for detailed debugging information.
-    """
-    def __init__(self, log_file):
-        self.log_file = log_file
-        # Create/Clear the file
-        with open(self.log_file, 'w') as f:
-            f.write(f"Debug Log initialized at {time_now()}\n")
-
-    def __call__(self, input):
-        input = str(input)
-        timestamp = time_now()
-        with open(self.log_file, 'a') as f:
-            f.write(f"[{timestamp}] {input}\n")
-
+        if self.debug_file:
+            with open(self.debug_file, 'w') as f:
+                pass
 
 
 class MultiItemAverageMeter:
